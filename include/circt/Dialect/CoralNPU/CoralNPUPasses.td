@@ -1,0 +1,44 @@
+//===- CoralNPUPasses.td - CoralNPU pass definitions ----------*- tablegen -*-===//
+
+#ifndef CORALNPU_PASSES_TD
+#define CORALNPU_PASSES_TD
+
+include "mlir/Pass/PassBase.td"
+
+def TosaToCoralNPU : Pass<"tosa-to-coralnpu"> {
+  let summary = "Lower TOSA operations to CoralNPU dialect";
+  let description = [{
+    Converts TOSA ML operations (conv2d, matmul, add, etc.) into CoralNPU
+    scalar, vector, and matrix operations suitable for the NPU hardware.
+  }];
+  let dependentDialects = ["circt::coralnpu::CoralNPUDialect"];
+}
+
+def CoralNPUStripmine : Pass<"coralnpu-stripmine"> {
+  let summary = "Apply stripmine scheduling to vector operations";
+  let description = [{
+    Analyzes vector operations and determines optimal stripmine factors
+    based on hardware parallelism (128-bit SIMD × 4-way stripmine).
+  }];
+  let dependentDialects = ["circt::coralnpu::CoralNPUDialect"];
+}
+
+def CoralNPULegalize : Pass<"coralnpu-legalize"> {
+  let summary = "Legalize CoralNPU operations for instruction selection";
+  let description = [{
+    Lowers unsupported operations, validates constraints, and prepares
+    the IR for register allocation and code emission.
+  }];
+  let dependentDialects = ["circt::coralnpu::CoralNPUDialect"];
+}
+
+def CoralNPUEmitAssembly : Pass<"emit-coralnpu-assembly"> {
+  let summary = "Emit Coral NPU assembly from legalized IR";
+  let description = [{
+    Translates legalized CoralNPU dialect operations into textual
+    Coral NPU assembly instructions ready for assembling into ELF.
+  }];
+  let dependentDialects = ["circt::coralnpu::CoralNPUDialect"];
+}
+
+#endif // CORALNPU_PASSES_TD
