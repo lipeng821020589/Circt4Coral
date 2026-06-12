@@ -37,6 +37,11 @@ def CoralNPU_Dialect : Dialect {
   }];
   let cppNamespace = "::circt::coralnpu";
   let dependentDialects = ["hw::HWDialect"];
+  let useDefaultTypePrinterParser = 1;
+  let extraClassDeclaration = [{
+    void registerTypes();
+    void registerAttributes();
+  }];
 }
 
 //===----------------------------------------------------------------------===//
@@ -72,6 +77,8 @@ def CoralNPU_LMUL : I32EnumAttr<"LMUL", "Vector Length Multiplier", [
   CoralNPU_LMUL_M2,  CoralNPU_LMUL_M4,  CoralNPU_LMUL_M8
 ]>;
 
+include "circt/Dialect/CoralNPU/CoralNPUTypes.td"
+include "circt/Dialect/CoralNPU/CoralNPUAttributes.td"
 include "circt/Dialect/CoralNPU/CoralNPUOps.td"
 
 #endif // CORALNPU_TD

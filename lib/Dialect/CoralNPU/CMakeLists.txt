@@ -3,12 +3,13 @@
 add_circt_dialect_library(CIRCTCoralNPU
   CoralNPUDialect.cpp
   CoralNPUOps.cpp
+  CoralNPUTypes.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${CIRCT_MAIN_INCLUDE_DIR}/circt/Dialect/CoralNPU
 
   DEPENDS
-  MLIRCoralNPUEnumsIncGen
+  MLIRCoralNPUAttrDefsIncGen
 
   LINK_COMPONENTS
   Support
@@ -19,7 +20,5 @@ add_circt_dialect_library(CIRCTCoralNPU
   MLIRInferTypeOpInterface
   MLIRSideEffectInterfaces
 )
-
-add_dependencies(circt-headers MLIRCoralNPUEnumsIncGen)
 
 add_subdirectory(Transforms)
