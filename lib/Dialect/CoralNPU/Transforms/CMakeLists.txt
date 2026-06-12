@@ -4,6 +4,7 @@ add_circt_dialect_library(CIRCTCoralNPUTransforms
   TosaToCoralNPU.cpp
   CoralNPUStripmine.cpp
   CoralNPULegalize.cpp
+  CoralNPURegAlloc.cpp
   CoralNPUEmitAssembly.cpp
 
   ADDITIONAL_HEADER_DIRS

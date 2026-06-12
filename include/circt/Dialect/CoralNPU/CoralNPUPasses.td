@@ -32,6 +32,16 @@ def CoralNPULegalize : Pass<"coralnpu-legalize"> {
   let dependentDialects = ["circt::coralnpu::CoralNPUDialect"];
 }
 
+def CoralNPURegAlloc : Pass<"coralnpu-regalloc"> {
+  let summary = "Register allocation for Coral NPU hardware";
+  let description = [{
+    Maps virtual SSA values to physical Coral NPU registers:
+    x0..x31 scalar, v0..v63 vector, acc[8][8] accumulator matrix.
+    Annotates operations with register assignments for assembly emission.
+  }];
+  let dependentDialects = ["circt::coralnpu::CoralNPUDialect"];
+}
+
 def CoralNPUEmitAssembly : Pass<"emit-coralnpu-assembly"> {
   let summary = "Emit Coral NPU assembly from legalized IR";
   let description = [{
