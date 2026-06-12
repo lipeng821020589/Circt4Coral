@@ -16,6 +16,7 @@ add_circt_dialect_library(CIRCTCoralNPUTransforms
   CIRCTCoralNPU
   MLIRIR
   MLIRPass
+  MLIRTosaDialect
   MLIRTransforms
   MLIRSupport
 )
