@@ -26,22 +26,82 @@ static void emitInstruction(mlir::Operation *op, llvm::raw_ostream &os) {
     os << "sub";
   else if (auto mulOp = mlir::dyn_cast<ScalarMulOp>(op))
     os << "mul";
+  else if (auto divOp = mlir::dyn_cast<ScalarDivOp>(op))
+    os << "div";
+  else if (auto andOp = mlir::dyn_cast<ScalarAndOp>(op))
+    os << "and";
+  else if (auto orOp = mlir::dyn_cast<ScalarOrOp>(op))
+    os << "or";
+  else if (auto xorOp = mlir::dyn_cast<ScalarXorOp>(op))
+    os << "xor";
+  else if (auto sllOp = mlir::dyn_cast<ScalarSllOp>(op))
+    os << "sll";
+  else if (auto srlOp = mlir::dyn_cast<ScalarSrlOp>(op))
+    os << "srl";
+  else if (auto sraOp = mlir::dyn_cast<ScalarSraOp>(op))
+    os << "sra";
+  else if (auto sltOp = mlir::dyn_cast<ScalarSltOp>(op))
+    os << "slt";
+  else if (auto sltuOp = mlir::dyn_cast<ScalarSltuOp>(op))
+    os << "sltu";
   else if (auto liOp = mlir::dyn_cast<ScalarLiOp>(op))
     os << "li    x?, " << liOp.getValue();
   else if (auto vaddOp = mlir::dyn_cast<VAddOp>(op)) {
     os << "vadd.vv";
     if (vaddOp.getStripmine() > 1)
       os << "  # stripmine=" << vaddOp.getStripmine();
+  } else if (auto vsubOp = mlir::dyn_cast<VSubOp>(op)) {
+    os << "vsub.vv";
+    if (vsubOp.getStripmine() > 1)
+      os << "  # stripmine=" << vsubOp.getStripmine();
+  } else if (auto vmulOp = mlir::dyn_cast<VMulOp>(op)) {
+    os << "vmul.vv";
+    if (vmulOp.getStripmine() > 1)
+      os << "  # stripmine=" << vmulOp.getStripmine();
+  } else if (auto vwaddOp = mlir::dyn_cast<VWAddOp>(op)) {
+    os << "vwadd.vv";
+    if (vwaddOp.getStripmine() > 1)
+      os << "  # stripmine=" << vwaddOp.getStripmine();
   } else if (auto vdotOp = mlir::dyn_cast<VDotOp>(op)) {
     os << "vdot.vv";
     if (vdotOp.getStripmine() > 1)
       os << "  # stripmine=" << vdotOp.getStripmine();
-  } else if (mlir::isa<VLE8Op>(op))
+  } else if (auto vredsumOp = mlir::dyn_cast<VRedSumOp>(op))
+    os << "vredsum.vs";
+  else if (mlir::isa<VLE8Op>(op))
     os << "vle8.v";
+  else if (mlir::isa<VLE16Op>(op))
+    os << "vle16.v";
+  else if (mlir::isa<VLE32Op>(op))
+    os << "vle32.v";
   else if (mlir::isa<VSE8Op>(op))
     os << "vse8.v";
+  else if (mlir::isa<VSE16Op>(op))
+    os << "vse16.v";
+  else if (mlir::isa<VSE32Op>(op))
+    os << "vse32.v";
   else if (mlir::isa<OuterProductOp>(op))
     os << "outer_product";
+  else if (mlir::isa<AConvOp>(op))
+    os << "aconv";
+  else if (mlir::isa<AccReadOp>(op))
+    os << "accread";
+  else if (mlir::isa<ScalarLwOp>(op))
+    os << "lw";
+  else if (mlir::isa<ScalarSwOp>(op))
+    os << "sw";
+  else if (mlir::isa<DmaLoadOp>(op))
+    os << "dma_load";
+  else if (mlir::isa<DmaStoreOp>(op))
+    os << "dma_store";
+  else if (mlir::isa<BeqOp>(op))
+    os << "beq    .L?.L?";
+  else if (mlir::isa<BneOp>(op))
+    os << "bne    .L?.L?";
+  else if (mlir::isa<JalOp>(op))
+    os << "jal    .L?";
+  else if (mlir::isa<JalrOp>(op))
+    os << "jalr";
   else if (mlir::isa<BranchOp>(op))
     os << "j       .L?";
   else if (mlir::isa<ReturnOp>(op))
