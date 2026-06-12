@@ -19,33 +19,52 @@ namespace coralnpu {
 namespace {
 
 static void emitInstruction(mlir::Operation *op, llvm::raw_ostream &os) {
+  // Helper: read xreg annotation from an op
+  auto getXReg = [&](mlir::Operation *o, llvm::StringRef attrName) -> std::string {
+    if (auto attr = o->getDiscardableAttr(attrName))
+      return "x" + std::to_string(mlir::cast<mlir::IntegerAttr>(attr).getInt());
+    return "x?";
+  };
+
   os << "  ";
   if (auto addOp = mlir::dyn_cast<ScalarAddOp>(op))
-    os << "add";
+    os << "add    " << getXReg(op, "xreg_out_0") << ", "
+       << getXReg(op, "xreg_0") << ", " << getXReg(op, "xreg_1");
   else if (auto subOp = mlir::dyn_cast<ScalarSubOp>(op))
-    os << "sub";
+    os << "sub    " << getXReg(op, "xreg_out_0") << ", "
+       << getXReg(op, "xreg_0") << ", " << getXReg(op, "xreg_1");
   else if (auto mulOp = mlir::dyn_cast<ScalarMulOp>(op))
-    os << "mul";
+    os << "mul    " << getXReg(op, "xreg_out_0") << ", "
+       << getXReg(op, "xreg_0") << ", " << getXReg(op, "xreg_1");
   else if (auto divOp = mlir::dyn_cast<ScalarDivOp>(op))
-    os << "div";
+    os << "div    " << getXReg(op, "xreg_out_0") << ", "
+       << getXReg(op, "xreg_0") << ", " << getXReg(op, "xreg_1");
   else if (auto andOp = mlir::dyn_cast<ScalarAndOp>(op))
-    os << "and";
+    os << "and    " << getXReg(op, "xreg_out_0") << ", "
+       << getXReg(op, "xreg_0") << ", " << getXReg(op, "xreg_1");
   else if (auto orOp = mlir::dyn_cast<ScalarOrOp>(op))
-    os << "or";
+    os << "or     " << getXReg(op, "xreg_out_0") << ", "
+       << getXReg(op, "xreg_0") << ", " << getXReg(op, "xreg_1");
   else if (auto xorOp = mlir::dyn_cast<ScalarXorOp>(op))
-    os << "xor";
+    os << "xor    " << getXReg(op, "xreg_out_0") << ", "
+       << getXReg(op, "xreg_0") << ", " << getXReg(op, "xreg_1");
   else if (auto sllOp = mlir::dyn_cast<ScalarSllOp>(op))
-    os << "sll";
+    os << "sll    " << getXReg(op, "xreg_out_0") << ", "
+       << getXReg(op, "xreg_0") << ", " << getXReg(op, "xreg_1");
   else if (auto srlOp = mlir::dyn_cast<ScalarSrlOp>(op))
-    os << "srl";
+    os << "srl    " << getXReg(op, "xreg_out_0") << ", "
+       << getXReg(op, "xreg_0") << ", " << getXReg(op, "xreg_1");
   else if (auto sraOp = mlir::dyn_cast<ScalarSraOp>(op))
-    os << "sra";
+    os << "sra    " << getXReg(op, "xreg_out_0") << ", "
+       << getXReg(op, "xreg_0") << ", " << getXReg(op, "xreg_1");
   else if (auto sltOp = mlir::dyn_cast<ScalarSltOp>(op))
-    os << "slt";
+    os << "slt    " << getXReg(op, "xreg_out_0") << ", "
+       << getXReg(op, "xreg_0") << ", " << getXReg(op, "xreg_1");
   else if (auto sltuOp = mlir::dyn_cast<ScalarSltuOp>(op))
-    os << "sltu";
+    os << "sltu   " << getXReg(op, "xreg_out_0") << ", "
+       << getXReg(op, "xreg_0") << ", " << getXReg(op, "xreg_1");
   else if (auto liOp = mlir::dyn_cast<ScalarLiOp>(op))
-    os << "li    x?, " << liOp.getValue();
+    os << "li     " << getXReg(op, "xreg_out_0") << ", " << liOp.getValue();
   else if (auto vaddOp = mlir::dyn_cast<VAddOp>(op)) {
     os << "vadd.vv";
     if (vaddOp.getStripmine() > 1)
@@ -85,11 +104,11 @@ static void emitInstruction(mlir::Operation *op, llvm::raw_ostream &os) {
   else if (mlir::isa<AConvOp>(op))
     os << "aconv";
   else if (mlir::isa<AccReadOp>(op))
-    os << "accread";
-  else if (mlir::isa<ScalarLwOp>(op))
-    os << "lw";
-  else if (mlir::isa<ScalarSwOp>(op))
-    os << "sw";
+    os << "accread  " << getXReg(op, "xreg_out_0") << ", acc";
+  else if (auto lwOp = mlir::dyn_cast<ScalarLwOp>(op))
+    os << "lw     " << getXReg(op, "xreg_out_0") << ", " << getXReg(op, "xreg_0") << "(tcm)";
+  else if (auto swOp = mlir::dyn_cast<ScalarSwOp>(op))
+    os << "sw     " << getXReg(op, "xreg_0") << ", " << getXReg(op, "xreg_1") << "(tcm)";
   else if (mlir::isa<DmaLoadOp>(op))
     os << "dma_load";
   else if (mlir::isa<DmaStoreOp>(op))
