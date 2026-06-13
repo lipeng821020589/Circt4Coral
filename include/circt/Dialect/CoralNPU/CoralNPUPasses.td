@@ -69,6 +69,20 @@ def CoralNPUFormalVerify : Pass<"coralnpu-formal-verify"> {
                            "circt::verif::VerifDialect"];
 }
 
+def LoopToCoralNPU : Pass<"loop-to-coralnpu"> {
+  let summary = "HLS: lower affine/scf loops to CoralNPU vector ops";
+  let description = [{
+    High-Level Synthesis pass that converts sequential loop nests
+    into Coral NPU SIMD vector operations. Demonstrates the C-to-NPU
+    compilation path:
+      affine.for / scf.for → coralnpu.vsetvl + vadd/vsub/vmul
+  }];
+  let dependentDialects = ["circt::coralnpu::CoralNPUDialect",
+                           "mlir::affine::AffineDialect",
+                           "mlir::scf::SCFDialect",
+                           "mlir::arith::ArithDialect"];
+}
+
 def CoralNPUEmitAssembly : Pass<"emit-coralnpu-assembly"> {
   let summary = "Emit Coral NPU assembly from legalized IR";
   let description = [{
