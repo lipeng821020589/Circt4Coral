@@ -36,11 +36,17 @@
 #include "mlir/Transforms/Passes.h"
 #include "llvm/Support/PrettyStackTrace.h"
 
-// Defined in the test directory, no public header.
 namespace circt {
 namespace test {
 void registerAnalysisTestPasses();
 } // namespace test
+} // namespace circt
+
+// Coral NPU export translation.
+namespace circt {
+namespace coralnpu {
+void registerExportCoralNPUTranslation();
+} // namespace coralnpu
 } // namespace circt
 
 int main(int argc, char **argv) {
@@ -67,6 +73,7 @@ int main(int argc, char **argv) {
 
   circt::registerAllDialects(registry);
   circt::registerAllPasses();
+  circt::coralnpu::registerExportCoralNPUTranslation();
 
   mlir::func::registerInlinerExtension(registry);
   mlir::LLVM::registerInlinerInterface(registry);
