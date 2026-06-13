@@ -8,6 +8,7 @@ add_circt_dialect_library(CIRCTCoralNPUTransforms
   CoralNPUEmitAssembly.cpp
   ExportCoralNPU.cpp
   CheckCoralNPUHW.cpp
+  CoralNPUFormalVerify.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${CIRCT_MAIN_INCLUDE_DIR}/circt/Dialect/CoralNPU
@@ -22,6 +23,7 @@ add_circt_dialect_library(CIRCTCoralNPUTransforms
   LINK_LIBS PUBLIC
   CIRCTCoralNPU
   CIRCTHW
+  CIRCTVerif
   MLIRIR
   MLIRPass
   MLIRTosaDialect

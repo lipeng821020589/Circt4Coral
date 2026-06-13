@@ -54,6 +54,21 @@ def CheckCoralNPUHW : Pass<"check-coralnpu-hw"> {
                            "circt::hw::HWDialect"];
 }
 
+def CoralNPUFormalVerify : Pass<"coralnpu-formal-verify"> {
+  let summary = "Generate formal verification properties for Coral NPU";
+  let description = [{
+    Generates formal verification properties using CIRCT Verif dialect:
+    - MAC outer-product correctness (equiv to scalar reference)
+    - AXI4 handshake protocol assertions
+    - Register file integrity (x0 zero-check)
+    - Stripmine data stability
+
+    Run with --verif-bmc for bounded model checking.
+  }];
+  let dependentDialects = ["circt::coralnpu::CoralNPUDialect",
+                           "circt::verif::VerifDialect"];
+}
+
 def CoralNPUEmitAssembly : Pass<"emit-coralnpu-assembly"> {
   let summary = "Emit Coral NPU assembly from legalized IR";
   let description = [{
