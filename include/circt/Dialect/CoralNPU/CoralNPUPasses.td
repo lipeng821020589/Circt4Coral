@@ -42,6 +42,18 @@ def CoralNPURegAlloc : Pass<"coralnpu-regalloc"> {
   let dependentDialects = ["circt::coralnpu::CoralNPUDialect"];
 }
 
+def CheckCoralNPUHW : Pass<"check-coralnpu-hw"> {
+  let summary = "Coral NPU hardware verification";
+  let description = [{
+    Verifies Coral NPU microarchitecture constraints:
+    - AXI4 protocol compliance (handshake, burst alignment)
+    - Pipeline depth analysis
+    - Clock/reset domain crossing detection
+  }];
+  let dependentDialects = ["circt::coralnpu::CoralNPUDialect",
+                           "circt::hw::HWDialect"];
+}
+
 def CoralNPUEmitAssembly : Pass<"emit-coralnpu-assembly"> {
   let summary = "Emit Coral NPU assembly from legalized IR";
   let description = [{
