@@ -123,7 +123,7 @@ def ScalarLiOp : CoralNPU_Op<"li", [Pure]> {
 // Vector configuration
 //===----------------------------------------------------------------------===//
 
-def VSetVLOp : CoralNPU_Op<"vsetvl", [Pure]> {
+def VSetVLOp : CoralNPU_Op<"vsetvl", []> {
   let summary = "Configure vector length and type (SEW, LMUL)";
   let description = [{
     Sets the vector configuration for subsequent SIMD operations.
@@ -138,42 +138,42 @@ def VSetVLOp : CoralNPU_Op<"vsetvl", [Pure]> {
 // Vector memory operations
 //===----------------------------------------------------------------------===//
 
-def VLE8Op : CoralNPU_Op<"vle8", [Pure]> {
+def VLE8Op : CoralNPU_Op<"vle8", []> {
   let summary = "Vector load of 8-bit elements from memory";
   let arguments = (ins I32:$addr, I32:$n);
   let results = (outs AnyTypeOf<[I32, I64]>:$result); // simplified: result carries packed i8 data in i32/i64
   let assemblyFormat = "$addr `,` $n attr-dict `:` type($result)";
 }
 
-def VLE32Op : CoralNPU_Op<"vle32", [Pure]> {
+def VLE32Op : CoralNPU_Op<"vle32", []> {
   let summary = "Vector load of 32-bit elements from memory";
   let arguments = (ins I32:$addr, I32:$n);
   let results = (outs I32:$result);
   let assemblyFormat = "$addr `,` $n attr-dict `:` type($result)";
 }
 
-def VSE8Op : CoralNPU_Op<"vse8", [Pure]> {
+def VSE8Op : CoralNPU_Op<"vse8", []> {
   let summary = "Vector store of 8-bit elements to memory";
   let arguments = (ins AnyTypeOf<[I32, I64]>:$value, I32:$addr, I32:$n);
   let results = (outs);
   let assemblyFormat = "$value `,` $addr `,` $n attr-dict `:` type($value)";
 }
 
-def VSE32Op : CoralNPU_Op<"vse32", [Pure]> {
+def VSE32Op : CoralNPU_Op<"vse32", []> {
   let summary = "Vector store of 32-bit elements to memory";
   let arguments = (ins I32:$value, I32:$addr, I32:$n);
   let results = (outs);
   let assemblyFormat = "$value `,` $addr `,` $n attr-dict `:` type($value)";
 }
 
-def VLE16Op : CoralNPU_Op<"vle16", [Pure]> {
+def VLE16Op : CoralNPU_Op<"vle16", []> {
   let summary = "Vector load of 16-bit elements from memory";
   let arguments = (ins I32:$addr, I32:$n);
   let results = (outs I32:$result);
   let assemblyFormat = "$addr `,` $n attr-dict `:` type($result)";
 }
 
-def VSE16Op : CoralNPU_Op<"vse16", [Pure]> {
+def VSE16Op : CoralNPU_Op<"vse16", []> {
   let summary = "Vector store of 16-bit elements to memory";
   let arguments = (ins I32:$value, I32:$addr, I32:$n);
   let results = (outs);
@@ -296,14 +296,14 @@ def AccReadOp : CoralNPU_Op<"accread", [Pure]> {
 // Scalar memory operations
 //===----------------------------------------------------------------------===//
 
-def ScalarLwOp : CoralNPU_Op<"lw", [Pure]> {
+def ScalarLwOp : CoralNPU_Op<"lw", []> {
   let summary = "Load 32-bit word from TCM";
   let arguments = (ins I32:$addr);
   let results = (outs I32:$result);
   let assemblyFormat = "$addr attr-dict `:` type($result)";
 }
 
-def ScalarSwOp : CoralNPU_Op<"sw", [Pure]> {
+def ScalarSwOp : CoralNPU_Op<"sw", []> {
   let summary = "Store 32-bit word to TCM";
   let arguments = (ins I32:$value, I32:$addr);
   let results = (outs);
@@ -312,7 +312,7 @@ def ScalarSwOp : CoralNPU_Op<"sw", [Pure]> {
 
 // --- DMA operations ---
 
-def DmaLoadOp : CoralNPU_Op<"dma_load", [Pure]> {
+def DmaLoadOp : CoralNPU_Op<"dma_load", []> {
   let summary = "DMA load from AXI to TCM";
   let description = [{
     Initiates a DMA transfer from external AXI memory to the tightly-coupled
@@ -324,7 +324,7 @@ def DmaLoadOp : CoralNPU_Op<"dma_load", [Pure]> {
   let assemblyFormat = "$src `,` $dst `,` $size attr-dict";
 }
 
-def DmaStoreOp : CoralNPU_Op<"dma_store", [Pure]> {
+def DmaStoreOp : CoralNPU_Op<"dma_store", []> {
   let summary = "DMA store from TCM to AXI";
   let description = [{
     Initiates a DMA transfer from the tightly-coupled memory (TCM) to

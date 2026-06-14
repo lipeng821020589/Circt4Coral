@@ -489,6 +489,14 @@ struct CoralNPUEmitAssemblyPass
     unsigned nInsn = 0;
     getOperation()->walk([&](mlir::Operation *op) {
       if (op->getDialect() && op->getDialect()->getNamespace() == "coralnpu") {
+        // If this is a vector op, ensure a vsetvli was emitted before it
+        // (vsetvlo may have been DCE'd in upstream passes)
+        if (mlir::isa<VAddOp, VSubOp, VMulOp, VWAddOp, VDotOp,
+                      VLE8Op, VLE16Op, VLE32Op, VSE8Op, VSE16Op, VSE32Op,
+                      VRedSumOp>(op)) {
+          llvm::outs() << "vsetivli x0, 16, e32, m1, ta, ma  # auto vsetvl\n";
+          nInsn++;
+        }
         emitInstruction(op, llvm::outs());
         nInsn++;
       }

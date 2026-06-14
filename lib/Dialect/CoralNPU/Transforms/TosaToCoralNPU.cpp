@@ -26,6 +26,7 @@
 
 #include "circt/Dialect/CoralNPU/CoralNPUPasses.h"
 #include "circt/Dialect/CoralNPU/CoralNPUOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Tosa/IR/TosaOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -356,6 +357,38 @@ struct TosaMaxPool2dLowering : public mlir::OpRewritePattern<mlir::tosa::MaxPool
 };
 
 //===----------------------------------------------------------------------===//
+// func.return → coralnpu.return
+//===----------------------------------------------------------------------===//
+
+struct FuncReturnToCoralNPUReturn
+    : public mlir::OpRewritePattern<mlir::func::ReturnOp> {
+  using mlir::OpRewritePattern<mlir::func::ReturnOp>::OpRewritePattern;
+
+  mlir::LogicalResult matchAndRewrite(mlir::func::ReturnOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    // If the function returns a tensor, extract the first element as an i32
+    // carrier (shallow lowering; the CoralNPU pipeline doesn't model tensors).
+    if (op.getNumOperands() == 0) {
+      rewriter.replaceOpWithNewOp<ReturnOp>(op, std::nullopt);
+      return mlir::success();
+    }
+    auto val = op.getOperand(0);
+    auto elemTy = val.getType();
+    if (auto tt = mlir::dyn_cast<mlir::TensorType>(elemTy)) {
+      // Reinterpret the tensor as an i32 (carrier) for the CoralNPU layer.
+      auto i32Ty = mlir::IntegerType::get(op.getContext(), 32);
+      auto carrier = rewriter.create<mlir::tensor::CastOp>(
+          loc, mlir::RankedTensorType::get(tt.getShape(), i32Ty), val);
+      rewriter.replaceOpWithNewOp<ReturnOp>(op, carrier.getResult());
+    } else {
+      rewriter.replaceOpWithNewOp<ReturnOp>(op, val);
+    }
+    return mlir::success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Pass definition
 //===----------------------------------------------------------------------===//
 
@@ -377,10 +410,20 @@ struct TosaToCoralNPUPass
     // Padding / pooling
     patterns.add<TosaPadLowering, TosaAvgPool2dLowering,
                  TosaMaxPool2dLowering>(ctx);
+    // Return lowering (func.return -> coralnpu.return)
+    patterns.add<FuncReturnToCoralNPUReturn>(ctx);
 
-    if (mlir::failed(
-            mlir::applyPatternsGreedily(getOperation(), std::move(patterns))))
-      signalPassFailure();
+    // Walk manually so we don't run DCE (which removes side-effect ops
+    // like coralnpu.vsetvl that are still semantically required).
+    auto *op = getOperation();
+    op->walk([&](mlir::Operation *funcOp) {
+      if (!mlir::isa<mlir::func::FuncOp>(funcOp)) return;
+      // Apply patterns via partial conversion
+      if (mlir::failed(mlir::applyPatternsGreedily(
+              funcOp, std::move(patterns)))) {
+        signalPassFailure();
+      }
+    });
   }
 };
 
