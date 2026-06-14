@@ -1,0 +1,64 @@
+# circt4coral standalone compiler - Docker教学镜像
+# 
+# 这个镜像让任何人在 5 分钟内跑通 MLIR → CoralNPU RISC-V 汇编 → spike 仿真
+# 不需要安装 LLVM/MLIR，不需要孤儿构建，一行命令完成。
+#
+# 镜像大小：~1.5GB（包含 circt4coral 211MB + spike 500MB + RISC-V 工具链 200MB + dtc）
+
+FROM ubuntu:22.04
+
+LABEL maintainer="peng <lipeng821020589@users.noreply.github.com>"
+LABEL description="circt4coral: TOSA/Mlir → google-coral/coralnpu RISC-V assembly"
+LABEL version="0.1.0"
+
+# 防止 apt 交互
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV TZ=Asia/Shanghai
+
+# 系统依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl wget git build-essential \
+    device-tree-compiler python3 python3-pip \
+    libstdc++6 libgcc-s1 zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+
+# RISC-V 工具链 (官方 apt 包)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc-riscv64-unknown-elf \
+    binutils-riscv64-unknown-elf \
+    picolibc-riscv64-unknown-elf \
+    && rm -rf /var/lib/apt/lists/*
+
+# spike RISC-V ISA simulator (RVV enabled)
+ARG SPIKE_VERSION=1.1.1-dev
+WORKDIR /opt
+RUN git clone --depth 1 --branch master https://github.com/riscv-software-src/riscv-isa-sim.git spike-src \
+    && cd spike-src \
+    && mkdir -p build && cd build \
+    && ../configure --prefix=/usr/local --with-isa=rv32imf_v_zvl128b_zicsr_zifencei \
+    && make -j$(nproc) \
+    && make install \
+    && cd /opt && rm -rf spike-src
+
+# circt4coral 编译器 (prebuilt binary)
+# 镜像构建者需从 https://github.com/lipeng821020589/circt4coral/releases 下载
+COPY circt4coral /usr/local/bin/circt4coral
+RUN chmod +x /usr/local/bin/circt4coral
+
+# 示例代码
+WORKDIR /workspace
+COPY examples /workspace/examples
+COPY tests /workspace/tests
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD circt4coral --help 2>&1 | grep -q "CoralNPU" || exit 1
+
+# 默认 entrypoint：跑 e2e 测试
+ENTRYPOINT ["bash", "-c"]
+CMD ["echo '=== circt4coral Docker 教学镜像 ===' && \
+     echo '运行: circt4coral input.mlir --emit-asm' && \
+     echo '或跑测试: bash /workspace/tests/ci.sh' && \
+     bash"]
