@@ -36,7 +36,7 @@ def CoralNPU_Dialect : Dialect {
     Verilator simulation environment.
   }];
   let cppNamespace = "::circt::coralnpu";
-  let dependentDialects = ["hw::HWDialect"];
+  let dependentDialects = [];
   let useDefaultTypePrinterParser = 1;
   let extraClassDeclaration = [{
     void registerTypes();

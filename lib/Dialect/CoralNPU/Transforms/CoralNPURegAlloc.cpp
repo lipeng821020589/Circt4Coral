@@ -331,13 +331,13 @@ struct CoralNPURegAllocPass
         ++spilled;
     }
 
-    llvm::outs() << "; Register allocation (linear-scan):\n";
-    llvm::outs() << ";   Scalars used: " << result.scalarsUsed << " / "
-                 << kNumScalarRegs << "\n";
-    llvm::outs() << ";   Vectors used: " << result.vectorsUsed << " / "
-                 << kNumVectorRegs << "\n";
-    llvm::outs() << ";   Intervals: " << intervals.size()
-                 << ", Spilled: " << spilled << "\n\n";
+    // llvm::outs() << "; Register allocation (linear-scan):\n";
+    // llvm::outs() << ";   Scalars used: " << result.scalarsUsed << " / "
+                 // << kNumScalarRegs << "\n";
+    // llvm::outs() << ";   Vectors used: " << result.vectorsUsed << " / "
+                 // << kNumVectorRegs << "\n";
+    // llvm::outs() << ";   Intervals: " << intervals.size()
+                 // << ", Spilled: " << spilled << "\n\n";
   }
 };
 

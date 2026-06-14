@@ -7,7 +7,7 @@
 #include "circt/Dialect/CoralNPU/CoralNPUDialect.h"
 #include "circt/Dialect/CoralNPU/CoralNPUOps.h"
 #include "circt/Dialect/CoralNPU/CoralNPUTypes.h"
-#include "circt/Dialect/HW/HWDialect.h"
+
 #include "mlir/IR/DialectImplementation.h"
 
 using namespace circt;

@@ -51,7 +51,7 @@ def CheckCoralNPUHW : Pass<"check-coralnpu-hw"> {
     - Clock/reset domain crossing detection
   }];
   let dependentDialects = ["circt::coralnpu::CoralNPUDialect",
-                           "circt::hw::HWDialect"];
+                           ];
 }
 
 def CoralNPUFormalVerify : Pass<"coralnpu-formal-verify"> {

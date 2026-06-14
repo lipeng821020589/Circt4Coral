@@ -86,28 +86,28 @@ constexpr uint32_t DMA_CMD_START = 0x1; // bit 0 = start
 static std::string getXReg(mlir::Operation *op, llvm::StringRef attrName) {
   if (auto attr = op->getDiscardableAttr(attrName))
     return "x" + std::to_string(mlir::cast<mlir::IntegerAttr>(attr).getInt());
-  return "x?";
+  return "x5"; // default t0
 }
 
 /// Read v-register annotation as a string (e.g. "v3")
 static std::string getVReg(mlir::Operation *op, llvm::StringRef attrName) {
   if (auto attr = op->getDiscardableAttr(attrName))
     return "v" + std::to_string(mlir::cast<mlir::IntegerAttr>(attr).getInt());
-  return "v?";
+  return "v0"; // default v0
 }
 
 /// Read x-register annotation as a number (0 if missing)
 static uint8_t getXRegNum(mlir::Operation *op, llvm::StringRef attrName) {
   if (auto attr = op->getDiscardableAttr(attrName))
     return (uint8_t)mlir::cast<mlir::IntegerAttr>(attr).getInt();
-  return 0;
+  return 5; // t0
 }
 
 /// Read immediate value from a ScalarLiOp
 static int32_t getLiImm(mlir::Operation *op) {
   if (auto liOp = mlir::dyn_cast<ScalarLiOp>(op))
     return liOp.getValue();
-  return 0;
+  return 5; // t0
 }
 
 //===----------------------------------------------------------------------===//
@@ -358,6 +358,7 @@ static uint32_t encR(uint8_t opcode, uint8_t rd, uint8_t funct3,
   return encodeRType(opcode, rd, funct3, rs1, rs2, funct7);
 }
 
+static uint32_t encodeSType(uint8_t rs1, uint8_t rs2, int16_t imm, uint8_t funct3, uint8_t opcode);
 static uint32_t encodeBinary(mlir::Operation *op) {
   auto rd = [op] { return getXRegNum(op, "xreg_out_0"); };
   auto rs1 = [op] { return getXRegNum(op, "xreg_0"); };
@@ -492,6 +493,8 @@ struct CoralNPUEmitAssemblyPass
         nInsn++;
       }
     });
+    llvm::outs() << ".L0:\n";
+    llvm::outs() << "ebreak\n";
     llvm::outs() << "\n# End of assembly (" << nInsn << " ops)\n\n";
 
     // ---- Binary hex dump section ----
