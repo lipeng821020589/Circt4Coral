@@ -40,19 +40,34 @@ recognize as accelerator control registers.
 
 ## Running on Spike
 
-Plain spike (without CoralNPU patches) **does NOT recognize these CSRs** —
-this is expected. To run on the patched spike:
+### Plain spike (without CoralNPU patches)
+Does NOT recognize these CSRs — reports `trap_illegal_instruction`.
+
+### Patched spike (with CoralNPU patches 0002-0005 from google-coral/coralnpu)
+The upstream patches have a **bug**: they register the 0xFC0-0xFD4 CSRs
+as `basic_csr_t`, which is marked read-only because the address falls
+in the 0xC00-0xFFF read-only range per RISC-V convention.
+
+**Fix**: We add a custom `coralnpu_csr_t` class that overrides the
+read-only check (see `bench/0006-coralnpu-csr-writable.patch`).
+
+To apply all 6 patches (0001-0005 from upstream + our 0006 fix):
 
 ```bash
 cd /Work/spike/riscv-isa-sim
-# Apply CoralNPU patches 0002-0005 from google-coral/coralnpu
-git apply patches/0002-*.patch patches/0003-*.patch patches/0004-*.patch patches/0005-*.patch
-make -j$(nproc)
+git apply /Work/coralnpu-google/third_party/spike/0001-Add-mpause.patch
+git apply /Work/coralnpu-google/third_party/spike/0002-Coral-Deviations.patch
+git apply /Work/coralnpu-google/third_party/spike/0003-Dump-GPRs-on-EBREAK.patch
+git apply /Work/coralnpu-google/third_party/spike/0004-Add-custom-CoralNPU-CSRs-and-update-MVENDORID-MARCHI.patch
+git apply /Work/coralnpu-google/third_party/spike/0005-Force-logging-in-vcompress.patch
+git apply /Work/circt/bench/0006-coralnpu-csr-writable.patch
+cd build && make spike -j$(nproc)
 ```
 
 Then re-run:
 ```bash
 python3 /Work/circt/bench/csr-demo.py
+# Output: CSR codegen worked on spike!
 ```
 
 ## Why this is a competitive advantage

@@ -73,7 +73,8 @@ try:
         sys.exit(0)
     elif r.returncode == 0:
         print()
-        print("CSR codegen worked on spike!")
+        print("CSR codegen worked on patched spike!
+KISA/KSCM at 0xFC0-0xFD4 are now writable via coralnpu_csr_t class")
         sys.exit(0)
     else:
         print(f"Spike failed: rc={r.returncode}")

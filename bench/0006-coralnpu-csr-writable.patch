@@ -1,0 +1,55 @@
+diff --git a/riscv/csr_init.cc b/riscv/csr_init.cc
+index 877993e..6d5ee29 100644
+--- a/riscv/csr_init.cc
++++ b/riscv/csr_init.cc
+@@ -12,6 +12,17 @@ void state_t::add_csr(reg_t addr, const csr_t_p& csr)
+ #define add_supervisor_csr(addr, csr) add_const_ext_csr('S', addr, csr)
+ #define add_hypervisor_csr(addr, csr) add_ext_csr('H', addr, csr)
+ 
++// CoralNPU custom CSR: allows writes even for 0xFC0-0xFFF read-only range
++class coralnpu_csr_t : public basic_csr_t {
++ public:
++  coralnpu_csr_t(processor_t* const proc, const reg_t addr, const reg_t init):
++    basic_csr_t(proc, addr, init) {}
++  virtual void verify_permissions(insn_t insn, bool write) const noexcept override {
++    // Skip read-only check - CoralNPU accelerator CSRs are writable
++    // from M-mode
++  }
++};
++
+ void state_t::add_iprio_proxy(processor_t* const proc, sscsrind_reg_csr_t_p ireg)
+ {
+   // This assumes xlen is always max_xlen, which is true today (see
+@@ -337,11 +348,30 @@ void state_t::csr_init(processor_t* const proc, reg_t max_isa)
+ 
+   add_ext_csr(EXT_ZKR, CSR_SEED, std::make_shared<seed_csr_t>(proc, CSR_SEED));
+ 
+-  add_csr(CSR_MARCHID, std::make_shared<const_csr_t>(proc, CSR_MARCHID, 5));
++  add_csr(CSR_MARCHID, std::make_shared<const_csr_t>(proc, CSR_MARCHID, 0));
+   add_csr(CSR_MIMPID, std::make_shared<const_csr_t>(proc, CSR_MIMPID, 0));
+-  add_csr(CSR_MVENDORID, std::make_shared<const_csr_t>(proc, CSR_MVENDORID, 0));
++  add_csr(CSR_MVENDORID, std::make_shared<const_csr_t>(proc, CSR_MVENDORID, 0x426));
+   add_csr(CSR_MHARTID, std::make_shared<const_csr_t>(proc, CSR_MHARTID, proc->get_id()));
+   add_csr(CSR_MCONFIGPTR, std::make_shared<const_csr_t>(proc, CSR_MCONFIGPTR, 0));
++
++  // CoralNPU Custom CSRs (writable, override basic_csr_t's read-only check)
++  add_csr(0xFC0, std::make_shared<coralnpu_csr_t>(proc, 0xFC0, 0)); // KISA
++  add_csr(0xFC4, std::make_shared<coralnpu_csr_t>(proc, 0xFC4, 0)); // KSCM0
++  add_csr(0xFC8, std::make_shared<coralnpu_csr_t>(proc, 0xFC8, 0)); // KSCM1
++  add_csr(0xFCC, std::make_shared<coralnpu_csr_t>(proc, 0xFCC, 0)); // KSCM2
++  add_csr(0xFD0, std::make_shared<coralnpu_csr_t>(proc, 0xFD0, 0)); // KSCM3
++  add_csr(0xFD4, std::make_shared<coralnpu_csr_t>(proc, 0xFD4, 0)); // KSCM4
++  add_csr(0x7C0, std::make_shared<basic_csr_t>(proc, 0x7C0, 0)); // MCONTEXT0
++  add_csr(0x7C1, std::make_shared<basic_csr_t>(proc, 0x7C1, 0)); // MCONTEXT1
++  add_csr(0x7C2, std::make_shared<basic_csr_t>(proc, 0x7C2, 0)); // MCONTEXT2
++  add_csr(0x7C3, std::make_shared<basic_csr_t>(proc, 0x7C3, 0)); // MCONTEXT3
++  add_csr(0x7C4, std::make_shared<basic_csr_t>(proc, 0x7C4, 0)); // MCONTEXT4
++  add_csr(0x7C5, std::make_shared<basic_csr_t>(proc, 0x7C5, 0)); // MCONTEXT5
++  add_csr(0x7C6, std::make_shared<basic_csr_t>(proc, 0x7C6, 0)); // MCONTEXT6
++  add_csr(0x7C7, std::make_shared<basic_csr_t>(proc, 0x7C7, 0)); // MCONTEXT7
++  add_csr(0x7E0, std::make_shared<basic_csr_t>(proc, 0x7E0, 0)); // MPC
++  add_csr(0x7E1, std::make_shared<basic_csr_t>(proc, 0x7E1, 0)); // MSP
++
+   const reg_t senvcfg_mask = (proc->extension_enabled(EXT_ZICBOM) ? SENVCFG_CBCFE | SENVCFG_CBIE : 0) |
+                             (proc->extension_enabled(EXT_ZICBOZ) ? SENVCFG_CBZE : 0) |
+                             (proc->extension_enabled(EXT_SVUKTE) ? SENVCFG_UKTE : 0) |
