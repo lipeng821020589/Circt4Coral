@@ -29,6 +29,7 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tosa/IR/TosaOps.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Pass/PassRegistry.h"
@@ -70,6 +71,7 @@ int main(int argc, char **argv) {
   registry.insert<mlir::vector::VectorDialect>();
   registry.insert<mlir::index::IndexDialect>();
   registry.insert<mlir::tosa::TosaDialect>();
+  registry.insert<mlir::tensor::TensorDialect>();
 
   circt::registerAllDialects(registry);
   circt::registerAllPasses();
