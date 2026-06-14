@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""circt4coral e2e CI test - 7 tests.
+"""circt4coral e2e CI test - 9 tests.
 
 Uses real CoralNPU MLIR dialect (not hand-written asm) to validate end-to-end:
   MLIR → circt4coral --emit-asm → RISC-V asm → GAS → LD → spike+CoralNPU
@@ -12,6 +12,8 @@ Tests:
   5. lw_sw:     scalar lw/sw memory access
   6. dma:       coralnpu.dma_load/dma_store
   7. branch:    coralnpu.beq + bne + return
+  8. tosa_add:  TOSA add lowering → vle8 + vadd + vse8
+  9. tosa_mul:  TOSA mul lowering → vle8 + vmul + vse8
 
 Usage:
   python3 circt4coral-ci-test.py [--circt4coral PATH] [--spike PATH]
@@ -207,6 +209,19 @@ func.func @branch(%arg0: i32) -> i32 {
   coralnpu.return %zero : i32
 ^ne:
   coralnpu.return %one : i32
+}
+""",
+    "tosa_add": """\
+func.func @tosa_add_test(%arg0: tensor<4x4xi32>, %arg1: tensor<4x4xi32>) -> tensor<4x4xi32> {
+  %0 = tosa.add %arg0, %arg1 : (tensor<4x4xi32>, tensor<4x4xi32>) -> tensor<4x4xi32>
+  return %0 : tensor<4x4xi32>
+}
+""",
+    "tosa_mul": """\
+func.func @tosa_mul_test(%arg0: tensor<4x4xi32>, %arg1: tensor<4x4xi32>) -> tensor<4x4xi32> {
+  %shift = arith.constant dense<0> : tensor<1xi8>
+  %0 = tosa.mul %arg0, %arg1, %shift : (tensor<4x4xi32>, tensor<4x4xi32>, tensor<1xi8>) -> tensor<4x4xi32>
+  return %0 : tensor<4x4xi32>
 }
 """,
 }
