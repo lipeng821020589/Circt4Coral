@@ -104,13 +104,6 @@ static uint8_t getXRegNum(mlir::Operation *op, llvm::StringRef attrName) {
   return 5; // t0
 }
 
-/// Read immediate value from a ScalarLiOp
-static int32_t getLiImm(mlir::Operation *op) {
-  if (auto liOp = mlir::dyn_cast<ScalarLiOp>(op))
-    return liOp.getValue();
-  return 5; // t0
-}
-
 //===----------------------------------------------------------------------===//
 // Instruction emit
 //===----------------------------------------------------------------------===//
@@ -132,14 +125,6 @@ static std::string getOrCreateBlockLabel(mlir::Block *block) {
 }
 
 /// Resolve a label for display in the hex dump (read-only, no new labels)
-static std::string getReadOnlyBlockLabel(mlir::Block *block) {
-  auto it = s_blockLabels.find(block);
-  if (it != s_blockLabels.end())
-    return ".L" + std::to_string(it->second);
-  return ".L?"; // shouldn't happen
-}
-
-/// Get the target label for a branch-like op
 static std::string getBranchLabel(mlir::Operation *op) {
   if (!s_useLabels)
     return ".L?";
@@ -521,9 +506,9 @@ struct CoralNPUEmitAssemblyPass
     s_useLabels = true;
 
     // Pre-assign labels to all blocks (so forward branches have valid labels)
-    auto &region = getOperation()->getRegion(0);
-    for (auto &block : region)
-      getOrCreateBlockLabel(&block);
+    getOperation()->walk([&](mlir::Block *block) {
+      getOrCreateBlockLabel(block);
+    });
 
     llvm::outs() << "# CoralNPU Assembly (target: real google-coral/coralnpu ISA)\n";
     llvm::outs() << "# ISA: rv32imf_zve32f_zvl128b_zicsr_zifencei_zbb_zfbfmin_zvfbfa\n";
@@ -536,15 +521,15 @@ struct CoralNPUEmitAssemblyPass
     llvm::outs() << "_start:\n";
     unsigned nInsn = 0;
 
-    // Walk blocks, emitting labels at block boundaries
-    for (auto &block : region) {
-      // Emit block label
-      llvm::outs() << getOrCreateBlockLabel(&block) << ":\n";
+    // Walk all blocks (recursively), emitting labels at block boundaries.
+    // Only emit instructions from blocks inside coralnpu ops.
+    getOperation()->walk([&](mlir::Block *block) {
+      // Skip blocks that are inside non-coralnpu ops (e.g. std.func)
+      // We only emit instructions for coralnpu dialect ops.
+      llvm::outs() << getOrCreateBlockLabel(block) << ":\n";
 
-      // Walk ops in this block
-      for (auto &op : block) {
+      for (auto &op : *block) {
         if (op.getDialect() && op.getDialect()->getNamespace() == "coralnpu") {
-          // Auto-vsetvli for vector ops
           if (mlir::isa<VAddOp, VSubOp, VMulOp, VWAddOp, VDotOp,
                         VLE8Op, VLE16Op, VLE32Op, VSE8Op, VSE16Op, VSE32Op,
                         VRedSumOp>(&op)) {
@@ -555,7 +540,7 @@ struct CoralNPUEmitAssemblyPass
           nInsn++;
         }
       }
-    }
+    });
 
     // Exit label (fallthrough for returns / ebreak)
     llvm::outs() << ".Lexit:\n";
