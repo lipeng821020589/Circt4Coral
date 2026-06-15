@@ -33,6 +33,7 @@
 #include "mlir/IR/Value.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
@@ -239,14 +240,16 @@ static void computeLiveness(mlir::Operation *root,
 
 static void annotateOp(mlir::Operation *op,
                        const llvm::DenseMap<mlir::Value, unsigned> &regMap,
-                       const llvm::DenseMap<mlir::Value, std::pair<unsigned,unsigned>> &accMap) {
+                       const llvm::DenseMap<mlir::Value, std::pair<unsigned,unsigned>> &accMap,
+                       const llvm::DenseSet<mlir::Value> &vectorVals) {
   llvm::SmallVector<mlir::NamedAttribute> regAttrs;
 
   for (unsigned i = 0; i < op->getNumOperands(); ++i) {
     auto val = op->getOperand(i);
     auto it = regMap.find(val);
-    if (it != regMap.end() && it->second < kNumScalarRegs) {
-      std::string attrName = "xreg_" + std::to_string(i);
+    if (it != regMap.end()) {
+      bool isVec = vectorVals.contains(val);
+      std::string attrName = (isVec ? "vreg_" : "xreg_") + std::to_string(i);
       regAttrs.push_back(mlir::NamedAttribute(
           mlir::StringAttr::get(op->getContext(), attrName),
           mlir::IntegerAttr::get(
@@ -265,8 +268,9 @@ static void annotateOp(mlir::Operation *op,
   for (unsigned i = 0; i < op->getNumResults(); ++i) {
     auto val = op->getResult(i);
     auto it = regMap.find(val);
-    if (it != regMap.end() && it->second < kNumScalarRegs) {
-      std::string attrName = "xreg_out_" + std::to_string(i);
+    if (it != regMap.end()) {
+      bool isVec = vectorVals.contains(val);
+      std::string attrName = (isVec ? "vreg_out_" : "xreg_out_") + std::to_string(i);
       regAttrs.push_back(mlir::NamedAttribute(
           mlir::StringAttr::get(op->getContext(), attrName),
           mlir::IntegerAttr::get(
@@ -301,27 +305,21 @@ struct CoralNPURegAllocPass
     // Run linear scan.
     auto result = linearScan(intervals);
 
-    // Build reg map from intervals. Values that didn't get a register
-    // (reg == fileSize) are considered "spilled" — for this dialect
-    // we leave them without an xreg_ attribute, signalling to later
-    // passes that they need stack memory.
+    // Build reg map and vector set from intervals.
     llvm::DenseMap<mlir::Value, unsigned> regMap;
+    llvm::DenseSet<mlir::Value> vectorVals;
     llvm::DenseMap<mlir::Value, std::pair<unsigned, unsigned>> accMap;
     for (const auto &lr : intervals) {
       if (lr.reg < (lr.isVector ? kNumVectorRegs : kNumScalarRegs)) {
-        if (lr.isVector) {
-          // The current annotation pipeline only emits xreg_* attrs.
-          // For now, map vector regs to the same attribute name with
-          // a 'v' prefix for future use.
-        } else {
-          regMap[lr.value] = lr.reg;
-        }
+        regMap[lr.value] = lr.reg;
+        if (lr.isVector)
+          vectorVals.insert(lr.value);
       }
     }
 
-    // Annotate all CoralNPU ops.
+    // Annotate all ops with register assignments.
     getOperation()->walk([&](mlir::Operation *op) {
-      annotateOp(op, regMap, accMap);
+      annotateOp(op, regMap, accMap, vectorVals);
     });
 
     // Stats.
@@ -331,13 +329,13 @@ struct CoralNPURegAllocPass
         ++spilled;
     }
 
-    // llvm::outs() << "; Register allocation (linear-scan):\n";
-    // llvm::outs() << ";   Scalars used: " << result.scalarsUsed << " / "
-                 // << kNumScalarRegs << "\n";
-    // llvm::outs() << ";   Vectors used: " << result.vectorsUsed << " / "
-                 // << kNumVectorRegs << "\n";
-    // llvm::outs() << ";   Intervals: " << intervals.size()
-                 // << ", Spilled: " << spilled << "\n\n";
+    llvm::outs() << "; Register allocation (linear-scan):\n";
+    llvm::outs() << ";   Scalars: " << result.scalarsUsed << " / "
+                 << kNumScalarRegs << "\n";
+    llvm::outs() << ";   Vectors: " << result.vectorsUsed << " / "
+                 << kNumVectorRegs << "\n";
+    llvm::outs() << ";   Intervals: " << intervals.size()
+                 << ", Spilled: " << spilled << "\n\n";
   }
 };
 

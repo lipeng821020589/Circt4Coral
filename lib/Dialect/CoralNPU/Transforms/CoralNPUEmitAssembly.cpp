@@ -194,46 +194,46 @@ static void emitInstruction(mlir::Operation *op, llvm::raw_ostream &os) {
   // ---- Vector ops (RVV standard encoding) ----
   else if (mlir::isa<VAddOp>(op)) {
     // vadd.vv vd, vs1, vs2  — both inputs and output are vector registers
-    os << "vadd.vv " << getVReg(op, "xreg_out_0") << ", "
-       << getVReg(op, "xreg_0") << ", " << getVReg(op, "xreg_1") << "\n";
+    os << "vadd.vv " << getVReg(op, "vreg_out_0") << ", "
+       << getVReg(op, "vreg_0") << ", " << getVReg(op, "vreg_1") << "\n";
   } else if (mlir::isa<VSubOp>(op))
-    os << "vsub.vv " << getVReg(op, "xreg_out_0") << ", "
-       << getVReg(op, "xreg_0") << ", " << getVReg(op, "xreg_1") << "\n";
+    os << "vsub.vv " << getVReg(op, "vreg_out_0") << ", "
+       << getVReg(op, "vreg_0") << ", " << getVReg(op, "vreg_1") << "\n";
   else if (mlir::isa<VMulOp>(op))
-    os << "vmul.vv " << getVReg(op, "xreg_out_0") << ", "
-       << getVReg(op, "xreg_0") << ", " << getVReg(op, "xreg_1") << "\n";
+    os << "vmul.vv " << getVReg(op, "vreg_out_0") << ", "
+       << getVReg(op, "vreg_0") << ", " << getVReg(op, "vreg_1") << "\n";
   else if (mlir::isa<VWAddOp>(op))
     // widening add: vd (2*SEW) = vs1 (SEW) + vs2 (SEW)
-    os << "vwadd.vv " << getVReg(op, "xreg_out_0") << ", "
-       << getVReg(op, "xreg_0") << ", " << getVReg(op, "xreg_1") << "\n";
+    os << "vwadd.vv " << getVReg(op, "vreg_out_0") << ", "
+       << getVReg(op, "vreg_0") << ", " << getVReg(op, "vreg_1") << "\n";
   else if (mlir::isa<VDotOp>(op)) {
     // RISC-V doesn't have a single vdot.vv; emulate with vmul + vredsum
-    os << "vmul.vv  v0, " << getVReg(op, "xreg_0") << ", "
-       << getVReg(op, "xreg_1") << "  # vdot step 1: element-wise mul\n"
-       << "vfredsum.vs " << getVReg(op, "xreg_out_0") << ", v0, "
-       << getVReg(op, "xreg_out_0") << "  # vdot step 2: reduce sum\n";
+    os << "vmul.vv  v0, " << getVReg(op, "vreg_0") << ", "
+       << getVReg(op, "vreg_1") << "  # vdot step 1: element-wise mul\n"
+       << "vfredsum.vs " << getVReg(op, "vreg_out_0") << ", v0, "
+       << getVReg(op, "vreg_out_0") << "  # vdot step 2: reduce sum\n";
   } else if (mlir::isa<VRedSumOp>(op))
-    os << "vredsum.vs " << getVReg(op, "xreg_out_0") << ", "
-       << getVReg(op, "xreg_0") << ", " << getVReg(op, "xreg_out_0") << "\n";
+    os << "vredsum.vs " << getVReg(op, "vreg_out_0") << ", "
+       << getVReg(op, "vreg_0") << ", " << getVReg(op, "vreg_out_0") << "\n";
 
   // ---- Vector loads (RVV unit-stride) ----
   else if (mlir::isa<VLE8Op>(op))
-    os << "vle8.v  " << getVReg(op, "xreg_out_0") << ", ("
+    os << "vle8.v  " << getVReg(op, "vreg_out_0") << ", ("
        << getXReg(op, "xreg_0") << ")\n";
   else if (mlir::isa<VLE16Op>(op))
-    os << "vle16.v " << getVReg(op, "xreg_out_0") << ", ("
+    os << "vle16.v " << getVReg(op, "vreg_out_0") << ", ("
        << getXReg(op, "xreg_0") << ")\n";
   else if (mlir::isa<VLE32Op>(op))
-    os << "vle32.v " << getVReg(op, "xreg_out_0") << ", ("
+    os << "vle32.v " << getVReg(op, "vreg_out_0") << ", ("
        << getXReg(op, "xreg_0") << ")\n";
   else if (mlir::isa<VSE8Op>(op))
-    os << "vse8.v  " << getVReg(op, "xreg_0") << ", ("
+    os << "vse8.v  " << getVReg(op, "vreg_0") << ", ("
        << getXReg(op, "xreg_1") << ")\n";
   else if (mlir::isa<VSE16Op>(op))
-    os << "vse16.v " << getVReg(op, "xreg_0") << ", ("
+    os << "vse16.v " << getVReg(op, "vreg_0") << ", ("
        << getXReg(op, "xreg_1") << ")\n";
   else if (mlir::isa<VSE32Op>(op))
-    os << "vse32.v " << getVReg(op, "xreg_0") << ", ("
+    os << "vse32.v " << getVReg(op, "vreg_0") << ", ("
        << getXReg(op, "xreg_1") << ")\n";
 
   // ---- Matrix ops (use KISA/KSCM custom CSRs to configure MLU) ----
