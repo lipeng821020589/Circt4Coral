@@ -42,6 +42,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/Support/raw_ostream.h"
+#include <string>
 
 using namespace circt;
 using namespace circt::coralnpu;
@@ -113,6 +114,43 @@ static int32_t getLiImm(mlir::Operation *op) {
 //===----------------------------------------------------------------------===//
 // Instruction emit
 //===----------------------------------------------------------------------===//
+
+// Label management: assign a label to each basic block
+// These are reset per-pass (see runOnOperation). They are static so
+// emitInstruction can access them without threading parameters through.
+static llvm::DenseMap<mlir::Block *, unsigned> s_blockLabels;
+static unsigned s_nextLabel = 0;
+static bool s_useLabels = true; // false during hex dump
+
+static std::string getOrCreateBlockLabel(mlir::Block *block) {
+  auto it = s_blockLabels.find(block);
+  if (it != s_blockLabels.end())
+    return ".L" + std::to_string(it->second);
+  unsigned n = s_nextLabel++;
+  s_blockLabels[block] = n;
+  return ".L" + std::to_string(n);
+}
+
+/// Resolve a label for display in the hex dump (read-only, no new labels)
+static std::string getReadOnlyBlockLabel(mlir::Block *block) {
+  auto it = s_blockLabels.find(block);
+  if (it != s_blockLabels.end())
+    return ".L" + std::to_string(it->second);
+  return ".L?"; // shouldn't happen
+}
+
+/// Get the target label for a branch-like op
+static std::string getBranchLabel(mlir::Operation *op) {
+  if (!s_useLabels)
+    return ".L?";
+  // For JalOp (symbol-based), allocate a fresh unique label
+  if (mlir::isa<JalOp>(op))
+    return ".L" + std::to_string(s_nextLabel++);
+  if (op->getNumSuccessors() > 0)
+    return getOrCreateBlockLabel(op->getSuccessor(0));
+  // Unknown branch type — allocate fresh label
+  return ".L" + std::to_string(s_nextLabel++);
+}
 
 static void emitInstruction(mlir::Operation *op, llvm::raw_ostream &os) {
   // ---- Scalar R-type arithmetic (RISC-V standard) ----
@@ -314,27 +352,27 @@ static void emitInstruction(mlir::Operation *op, llvm::raw_ostream &os) {
   // ---- Control flow ----
   else if (mlir::isa<BeqOp>(op))
     os << "beq    " << getXReg(op, "xreg_0") << ", "
-       << getXReg(op, "xreg_1") << ", .L?\n";
+       << getXReg(op, "xreg_1") << ", " + getBranchLabel(op) + "\n";
   else if (mlir::isa<BneOp>(op))
     os << "bne    " << getXReg(op, "xreg_0") << ", "
-       << getXReg(op, "xreg_1") << ", .L?\n";
+       << getXReg(op, "xreg_1") << ", " + getBranchLabel(op) + "\n";
   else if (mlir::isa<JalOp>(op))
-    os << "jal    " << getXReg(op, "xreg_out_0") << ", .L?\n";
+    os << "jal    " << getXReg(op, "xreg_out_0") << ", " + getBranchLabel(op) + "\n";
   else if (mlir::isa<JalrOp>(op))
     os << "jalr   " << getXReg(op, "xreg_out_0") << ", "
        << getXReg(op, "xreg_0") << "\n";
   else if (mlir::isa<BranchOp>(op))
-    os << "j      .L?\n";
+    os << "j      " + getBranchLabel(op) + "\n";
   else if (mlir::isa<CondBranchOp>(op)) {
     // cond_br has BoolAttr eq — true means beq (==), false means bne (!=)
     auto condBr = mlir::cast<CondBranchOp>(op);
     bool eq = condBr.getEq();
     if (eq)
       os << "beq    " << getXReg(op, "xreg_0") << ", "
-         << getXReg(op, "xreg_1") << ", .L?\n";
+         << getXReg(op, "xreg_1") << ", " + getBranchLabel(op) + "\n";
     else
       os << "bne    " << getXReg(op, "xreg_0") << ", "
-         << getXReg(op, "xreg_1") << ", .L?\n";
+         << getXReg(op, "xreg_1") << ", " + getBranchLabel(op) + "\n";
   } else if (mlir::isa<ReturnOp>(op))
     os << "ret\n";
   else
@@ -477,6 +515,16 @@ static uint32_t encodeSType(uint8_t rs1, uint8_t rs2, int16_t imm,
 struct CoralNPUEmitAssemblyPass
     : public impl::CoralNPUEmitAssemblyBase<CoralNPUEmitAssemblyPass> {
   void runOnOperation() override {
+    // ---- Reset global label state ----
+    s_blockLabels.clear();
+    s_nextLabel = 0;
+    s_useLabels = true;
+
+    // Pre-assign labels to all blocks (so forward branches have valid labels)
+    auto &region = getOperation()->getRegion(0);
+    for (auto &block : region)
+      getOrCreateBlockLabel(&block);
+
     llvm::outs() << "# CoralNPU Assembly (target: real google-coral/coralnpu ISA)\n";
     llvm::outs() << "# ISA: rv32imf_zve32f_zvl128b_zicsr_zifencei_zbb_zfbfmin_zvfbfa\n";
     llvm::outs() << "# Custom CSRs: KISA=0xFC0, KSCM0-4=0xFC4-0xFD4, MCONTEXT0=0x7C0\n";
@@ -487,25 +535,35 @@ struct CoralNPUEmitAssemblyPass
     llvm::outs() << ".globl _start\n";
     llvm::outs() << "_start:\n";
     unsigned nInsn = 0;
-    getOperation()->walk([&](mlir::Operation *op) {
-      if (op->getDialect() && op->getDialect()->getNamespace() == "coralnpu") {
-        // If this is a vector op, ensure a vsetvli was emitted before it
-        // (vsetvlo may have been DCE'd in upstream passes)
-        if (mlir::isa<VAddOp, VSubOp, VMulOp, VWAddOp, VDotOp,
-                      VLE8Op, VLE16Op, VLE32Op, VSE8Op, VSE16Op, VSE32Op,
-                      VRedSumOp>(op)) {
-          llvm::outs() << "vsetivli x0, 16, e32, m1, ta, ma  # auto vsetvl\n";
+
+    // Walk blocks, emitting labels at block boundaries
+    for (auto &block : region) {
+      // Emit block label
+      llvm::outs() << getOrCreateBlockLabel(&block) << ":\n";
+
+      // Walk ops in this block
+      for (auto &op : block) {
+        if (op.getDialect() && op.getDialect()->getNamespace() == "coralnpu") {
+          // Auto-vsetvli for vector ops
+          if (mlir::isa<VAddOp, VSubOp, VMulOp, VWAddOp, VDotOp,
+                        VLE8Op, VLE16Op, VLE32Op, VSE8Op, VSE16Op, VSE32Op,
+                        VRedSumOp>(&op)) {
+            llvm::outs() << "vsetivli x0, 16, e32, m1, ta, ma  # auto vsetvl\n";
+            nInsn++;
+          }
+          emitInstruction(&op, llvm::outs());
           nInsn++;
         }
-        emitInstruction(op, llvm::outs());
-        nInsn++;
       }
-    });
-    llvm::outs() << ".L0:\n";
+    }
+
+    // Exit label (fallthrough for returns / ebreak)
+    llvm::outs() << ".Lexit:\n";
     llvm::outs() << "ebreak\n";
     llvm::outs() << "\n# End of assembly (" << nInsn << " ops)\n\n";
 
     // ---- Binary hex dump section ----
+    s_useLabels = false; // don't consume labels in hex dump
     llvm::outs() << "# Binary encoding (RISC-V little-endian, first insn @ 0x10000):\n";
     llvm::outs() << "# addr   : hex_word  opcode    mnemonic\n";
     unsigned pc = 0;
