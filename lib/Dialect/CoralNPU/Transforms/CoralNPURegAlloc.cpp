@@ -223,13 +223,15 @@ static void computeLiveness(mlir::Operation *root,
     lr.value = valuePos.first;
     lr.start = valuePos.second;
     lr.end = it->second + 1; // half-open
-    // Heuristic: values defined by ops whose mnemonic starts with 'v'
-    // (VLE, VSE, VAdd, ...) are vector. Otherwise scalar.
-    auto opName = valuePos.first.getDefiningOp()->getName().getStringRef();
-    lr.isVector = opName.starts_with("coralnpu.v") ||
-                  opName.starts_with("coralnpu.outer") ||
-                  opName.starts_with("coralnpu.accread") ||
-                  opName.starts_with("coralnpu.vred");
+    // Determine if this value is vector-typed by checking the defining op.
+    // Vector-producing ops: VLE*, VSE*, VAdd, VSub, VMul, VWAdd, VDot, VRedSum,
+    // VSetVL, OuterProduct, AConv, AccRead.
+    auto *defOp = valuePos.first.getDefiningOp();
+    lr.isVector = mlir::isa<VLE8Op, VLE16Op, VLE32Op,
+                            VSE8Op, VSE16Op, VSE32Op,
+                            VAddOp, VSubOp, VMulOp, VWAddOp, VDotOp, VRedSumOp,
+                            VSetVLOp,
+                            OuterProductOp, AConvOp, AccReadOp>(defOp);
     out.push_back(lr);
   }
 }
