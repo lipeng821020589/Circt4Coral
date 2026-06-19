@@ -44,9 +44,8 @@ static unsigned getVRegCapacity(SEW sew) {
 
 /// Compute optimal stripmine factor for a given tile size and SEW.
 ///
-/// Algorithm per ARCHITECTURE.md §4.3:
 ///   needed = ceil(tile_elements / vreg_capacity)
-///   stripmine_factor = min(4, needed)
+///   stripmine_factor = clamp(needed, 1, 4)
 ///
 /// Returns a value in {1, 2, 4}.
 static unsigned computeStripmineFactor(unsigned tileElements, SEW sew) {
@@ -83,6 +82,45 @@ static void setStripmine(OpTy op, unsigned factor) {
   op.setStripmineAttr(mlir::IntegerAttr::get(intTy, factor));
 }
 
+/// Read the constant element count from a vector-load op's `$n` operand,
+/// i.e. the second operand produced by a `coralnpu.li`. Returns 0 if the
+/// operand is not a known constant.
+static int64_t loadElementCount(mlir::Operation *load) {
+  if (load->getNumOperands() < 2)
+    return 0;
+  if (auto li = load->getOperand(1).getDefiningOp<ScalarLiOp>())
+    return li.getValue();
+  return 0;
+}
+
+/// Find the real element count this vector op processes by walking its
+/// operands back to the producing vector load (vle8/vle16/vle32) and reading
+/// the load's element count. Producers may themselves be earlier vector ops
+/// (a register-chained element-wise sequence), so the walk follows i32
+/// operands transitively. Returns 0 when no load anchors the chain (e.g.
+/// hand-written IR whose operands are block arguments).
+static int64_t traceElementCount(mlir::Operation *op) {
+  llvm::SmallVector<mlir::Operation *, 8> worklist;
+  llvm::SmallPtrSet<mlir::Operation *, 8> seen;
+  for (auto v : op->getOperands())
+    if (auto *def = v.getDefiningOp())
+      worklist.push_back(def);
+
+  while (!worklist.empty()) {
+    auto *def = worklist.pop_back_val();
+    if (!seen.insert(def).second)
+      continue;
+    if (mlir::isa<VLE8Op, VLE16Op, VLE32Op>(def)) {
+      if (int64_t n = loadElementCount(def))
+        return n;
+    }
+    for (auto v : def->getOperands())
+      if (auto *d = v.getDefiningOp())
+        worklist.push_back(d);
+  }
+  return 0;
+}
+
 //===----------------------------------------------------------------------===//
 // Stripmine rewrite patterns
 //===----------------------------------------------------------------------===//
@@ -102,10 +140,13 @@ struct StripminePattern : public mlir::OpRewritePattern<OpTy> {
     SEW sew = getCurrentSEW(op);
     unsigned vregCap = getVRegCapacity(sew);
 
-    // Compute the effective number of elements this op processes.
-    // For now, use a heuristic: if the op produces a result, estimate
-    // from the data flow. Otherwise default to vregCap.
-    unsigned tileElements = vregCap * 4; // assume 4× vreg capacity by default
+    // Derive the element count from the real data flow: trace back to the
+    // vector load that anchors this op's operands. Fall back to the
+    // conservative 4×-capacity heuristic only when no load is found (e.g.
+    // hand-written IR whose operands are block arguments).
+    int64_t traced = traceElementCount(op);
+    unsigned tileElements =
+        traced > 0 ? (unsigned)traced : vregCap * 4;
     unsigned factor = computeStripmineFactor(tileElements, sew);
 
     if (factor <= 1)
