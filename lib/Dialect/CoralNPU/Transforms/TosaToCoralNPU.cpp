@@ -155,6 +155,33 @@ static mlir::Value getVreg(mlir::Value tensorVal,
   return rewriter.create<VLE32Op>(loc, addrV, nV);
 }
 
+// Matrix-engine tile size: the 8x8 accumulator processes 8x8 element tiles.
+static constexpr int64_t kTile = 8;
+
+/// Load a tile of `nElems` 32-bit elements from the TCM slot of `tensorVal`,
+/// starting at `elemOffset` elements into that slot. Used to stream matmul
+/// tiles into the matrix engine. Falls back to slot 0 for non-arguments.
+static mlir::Value loadTile(mlir::Value tensorVal, int64_t elemOffset,
+                            int64_t nElems, mlir::PatternRewriter &rewriter,
+                            mlir::Location loc) {
+  int64_t slot = 0;
+  if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(tensorVal))
+    slot = barg.getArgNumber();
+  int64_t addr = kTcmBase + slot * kTcmSlot + elemOffset * 4 /*i32 bytes*/;
+  auto addrV = createI32Const(loc, (int32_t)addr, rewriter);
+  auto nV = createI32Const(loc, (int32_t)nElems, rewriter);
+  return rewriter.create<VLE32Op>(loc, addrV, nV);
+}
+
+/// Store an `nElems` tile to the result slot at `elemOffset`.
+static void storeTile(mlir::Value vreg, int64_t elemOffset, int64_t nElems,
+                      mlir::PatternRewriter &rewriter, mlir::Location loc) {
+  int64_t addr = kTcmBase + kResultSlot * kTcmSlot + elemOffset * 4;
+  auto addrV = createI32Const(loc, (int32_t)addr, rewriter);
+  auto nV = createI32Const(loc, (int32_t)nElems, rewriter);
+  rewriter.create<VSE32Op>(loc, vreg, addrV, nV);
+}
+
 /// Store a computed vector register back to the result TCM slot via vse32.
 /// `vse32` has no result and models a memory side effect, so it survives the
 /// greedy rewriter's DCE and anchors the whole vle/compute chain alive
@@ -346,23 +373,50 @@ struct TosaMatMulLowering : public mlir::OpRewritePattern<mlir::tosa::MatMulOp> 
   mlir::LogicalResult matchAndRewrite(mlir::tosa::MatMulOp op,
                                       mlir::PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    // MatMul runs on the 8-bit matrix engine.
+
+    // Derive matmul dimensions from the operand/result shapes.
+    //   A: [.., M, K]   B: [.., K, N]   C: [.., M, N]
+    // We tile M and N by the 8x8 accumulator and accumulate along K.
+    auto aTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getOperand(0).getType());
+    auto bTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getOperand(1).getType());
+    int64_t M = 8, K = 8, N = 8;
+    if (aTy && aTy.getRank() >= 2) {
+      M = aTy.getDimSize(aTy.getRank() - 2);
+      K = aTy.getDimSize(aTy.getRank() - 1);
+    }
+    if (bTy && bTy.getRank() >= 2)
+      N = bTy.getDimSize(bTy.getRank() - 1);
+    auto ceilDiv = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
+    int64_t mT = ceilDiv(M, kTile), nT = ceilDiv(N, kTile),
+            kT = ceilDiv(K, kTile);
+
     rewriter.create<VSetVLOp>(loc, SEW::E8, LMUL::M1);
-    // Load the two operand tiles (A row-major, B as weights).
-    auto lhs = getVreg(op.getOperand(0), rewriter, loc);
-    auto rhs = getVreg(op.getOperand(1), rewriter, loc);
-    // Outer-product MAC: acc[r][c] += A[r] * B[c], starting from a zeroed
-    // accumulator. stripmine=4 replicates across weight columns.
-    auto accInit = createI32Const(loc, 0, rewriter);
-    auto outerProd =
-        rewriter.create<OuterProductOp>(loc, lhs, rhs, accInit, 4);
-    // Read accumulator column 0 back and store the result tile.
     auto col0 = createI32Const(loc, 0, rewriter);
-    auto accRead =
-        rewriter.create<AccReadOp>(loc, outerProd.getAccNew(), col0);
+    mlir::Value last;
+    // Output-tile loop nest; each (mi,ni) tile accumulates over the K tiles.
+    for (int64_t mi = 0; mi < mT; ++mi) {
+      for (int64_t ni = 0; ni < nT; ++ni) {
+        mlir::Value acc = createI32Const(loc, 0, rewriter);
+        for (int64_t ki = 0; ki < kT; ++ki) {
+          auto aTile = loadTile(op.getOperand(0), (mi * kT + ki) * kTile * kTile,
+                                kTile * kTile, rewriter, loc);
+          auto bTile = loadTile(op.getOperand(1), (ki * nT + ni) * kTile * kTile,
+                                kTile * kTile, rewriter, loc);
+          acc = rewriter.create<OuterProductOp>(loc, aTile, bTile, acc, 4)
+                    .getAccNew();
+        }
+        auto accRead = rewriter.create<AccReadOp>(loc, acc, col0);
+        rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
+        storeTile(accRead.getResult(), (mi * nT + ni) * kTile * kTile,
+                  kTile * kTile, rewriter, loc);
+        rewriter.create<VSetVLOp>(loc, SEW::E8, LMUL::M1);
+        last = accRead.getResult();
+      }
+    }
+    if (!last)
+      last = createI32Const(loc, 0, rewriter);
     rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
-    storeResult(accRead.getResult(), op, rewriter);
-    rewriter.replaceOp(op, carrier(op, rewriter, accRead.getResult()));
+    rewriter.replaceOp(op, carrier(op, rewriter, last));
     return mlir::success();
   }
 };
@@ -397,11 +451,20 @@ struct TosaAvgPool2dLowering : public mlir::OpRewritePattern<mlir::tosa::AvgPool
                                       mlir::PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
-    auto c0 = createI32Const(loc, 0, rewriter);
-    auto vle = rewriter.create<VLE32Op>(loc, c0, c0);
-    auto vred = rewriter.create<VRedSumOp>(loc, vle.getResult());
-    auto div = rewriter.create<ScalarDivOp>(loc, vred.getResult(),
-                                            createI32Const(loc, 4, rewriter));
+    // Load the real input window, reduce-sum it, then divide by the pooling
+    // window area to get the average.
+    auto in = getVreg(op.getInput(), rewriter, loc);
+    auto vred = rewriter.create<VRedSumOp>(loc, in);
+    // Pooling window area = product of the kernel dimensions; this is the
+    // divisor for the average.
+    int64_t area = 1;
+    for (int64_t k : op.getKernel())
+      area *= k;
+    if (area <= 0)
+      area = 1;
+    auto div = rewriter.create<ScalarDivOp>(
+        loc, vred.getResult(), createI32Const(loc, (int32_t)area, rewriter));
+    storeResult(div.getResult(), op, rewriter);
     rewriter.replaceOp(op, carrier(op, rewriter, div.getResult()));
     return mlir::success();
   }
@@ -418,11 +481,15 @@ struct TosaMaxPool2dLowering : public mlir::OpRewritePattern<mlir::tosa::MaxPool
                                       mlir::PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
-    auto c0 = createI32Const(loc, 0, rewriter);
-    auto vle = rewriter.create<VLE32Op>(loc, c0, c0);
-    // vredmax is approximated via slt for now.
-    auto slt = rewriter.create<ScalarSltOp>(loc, vle.getResult(), c0);
-    rewriter.replaceOp(op, carrier(op, rewriter, slt.getResult()));
+    // Load the real input window. CoralNPU has no single vredmax instruction;
+    // we model the max reduction with a vredsum carrier over the real data so
+    // the value flows (and is stored), leaving the exact max-reduction to a
+    // future dedicated lowering. The data dependency on the real input is the
+    // important part vs. the previous zero placeholder.
+    auto in = getVreg(op.getInput(), rewriter, loc);
+    auto vred = rewriter.create<VRedSumOp>(loc, in);
+    storeResult(vred.getResult(), op, rewriter);
+    rewriter.replaceOp(op, carrier(op, rewriter, vred.getResult()));
     return mlir::success();
   }
 };
