@@ -73,7 +73,7 @@ using mlir::TypeSwitch;       // NOLINT(misc-unused-using-decls)
 // namespace.
 namespace llvm {
 template <typename KeyT, typename ValueT, typename MapType,
-          typename VectorType>
+          typename VectorType, unsigned N>
 class MapVector;
 template <typename KeyT, typename ValueT, unsigned InlineBuckets,
           typename KeyInfoT, typename BucketT>
