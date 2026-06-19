@@ -51,6 +51,32 @@ if( CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR )
   message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
   message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
+  # --- Pinned LLVM submodule check -------------------------------------------
+  # The CoralNPU dialect tracks a specific LLVM/MLIR revision. Upstream main
+  # drifts (e.g. MapVector gained a 5th template parameter; op `create` no
+  # longer accepts std::nullopt), which breaks the CIRCT source against a
+  # newer submodule. We record the expected commit here and warn loudly on a
+  # mismatch so build breaks are diagnosed immediately rather than as cryptic
+  # template errors. Update CIRCT_EXPECTED_LLVM_COMMIT when intentionally
+  # bumping the submodule.
+  set(CIRCT_EXPECTED_LLVM_COMMIT "b7152ff7026a05282b6ae91ccf150ede0217b08a")
+  set(_llvm_submodule "${CMAKE_CURRENT_SOURCE_DIR}/llvm")
+  if (EXISTS "${_llvm_submodule}/.git")
+    execute_process(
+      COMMAND git -C "${_llvm_submodule}" rev-parse HEAD
+      OUTPUT_VARIABLE _llvm_actual_commit
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET)
+    if (_llvm_actual_commit AND
+        NOT _llvm_actual_commit STREQUAL CIRCT_EXPECTED_LLVM_COMMIT)
+      message(WARNING
+        "LLVM submodule is at ${_llvm_actual_commit} but CoralNPU expects "
+        "${CIRCT_EXPECTED_LLVM_COMMIT}. If the build fails with template or "
+        "op-builder errors, run: git submodule update --init llvm")
+    endif()
+  endif()
+  # ---------------------------------------------------------------------------
+
   set(LLVM_RUNTIME_OUTPUT_INTDIR ${CMAKE_BINARY_DIR}/bin)
   set(LLVM_LIBRARY_OUTPUT_INTDIR ${CMAKE_BINARY_DIR}/lib)
 
