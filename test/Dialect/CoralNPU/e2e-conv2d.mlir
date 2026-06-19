@@ -1,8 +1,14 @@
 // RUN: circt-opt --tosa-to-coralnpu --coralnpu-stripmine --coralnpu-legalize --coralnpu-regalloc --emit-coralnpu-assembly %s 2>/dev/null | FileCheck %s
 
-// CHECK: # Coral NPU Assembly
-// CHECK: li     x1, 0
-// CHECK: vadd.vv  # stripmine=4
+// End-to-end element-wise add through the full CoralNPU pipeline. The TOSA
+// add lowers to a real load / compute / store sequence rather than a
+// placeholder, so the emitted assembly contains the full vle/vadd/vse chain.
+
+// CHECK: # CoralNPU Assembly (target: real google-coral/coralnpu ISA)
+// CHECK: _start:
+// CHECK: vle32.v
+// CHECK: vadd.vv
+// CHECK: vse32.v
 // CHECK: ret
 // CHECK: # End of assembly
 
