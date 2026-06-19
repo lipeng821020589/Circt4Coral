@@ -298,18 +298,20 @@ struct TosaConv2DLowering : public mlir::OpRewritePattern<mlir::tosa::Conv2DOp> 
     // conv2d operates on 8-bit activations and weights.
     rewriter.create<VSetVLOp>(loc, SEW::E8, LMUL::M1);
 
-    // Emit the core outer-product MAC that conv2d decomposes into.
-    auto c0 = createI32Const(loc, 0, rewriter);
-    auto outerProd = rewriter.create<OuterProductOp>(loc, c0, c0, c0);
+    // Load activations (operand 0) and weights (operand 1) from their TCM
+    // slots, then feed the outer-product MAC: acc[r][c] += input[r]*wgt[c].
+    auto input = getVreg(op.getOperand(0), rewriter, loc);
+    auto weight = getVreg(op.getOperand(1), rewriter, loc);
+    auto accInit = createI32Const(loc, 0, rewriter);
+    auto outerProd =
+        rewriter.create<OuterProductOp>(loc, input, weight, accInit, 4);
 
-    // Read accumulator result back to a vector register.
-    auto accRead = rewriter.create<AccReadOp>(loc, outerProd.getAccNew(), c0);
-
-    // The result is materialized as a vector store so the tensor type
-    // is preserved (memory-backed) — wire the VLE for a 32-bit tensor
-    // since conv2d outputs are typically i32.
+    // Read the accumulator column back and store the 32-bit result tile.
+    auto col0 = createI32Const(loc, 0, rewriter);
+    auto accRead =
+        rewriter.create<AccReadOp>(loc, outerProd.getAccNew(), col0);
     rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
-    (void)accRead;
+    storeResult(accRead.getResult(), op, rewriter);
     rewriter.replaceOp(op, carrier(op, rewriter, accRead.getResult()));
     return mlir::success();
   }
@@ -344,11 +346,22 @@ struct TosaMatMulLowering : public mlir::OpRewritePattern<mlir::tosa::MatMulOp> 
   mlir::LogicalResult matchAndRewrite(mlir::tosa::MatMulOp op,
                                       mlir::PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
+    // MatMul runs on the 8-bit matrix engine.
     rewriter.create<VSetVLOp>(loc, SEW::E8, LMUL::M1);
-    auto c0 = createI32Const(loc, 0, rewriter);
-    auto outerProd = rewriter.create<OuterProductOp>(loc, c0, c0, c0, 4);
-    auto accRead = rewriter.create<AccReadOp>(loc, outerProd.getAccNew(), c0);
-    (void)accRead;
+    // Load the two operand tiles (A row-major, B as weights).
+    auto lhs = getVreg(op.getOperand(0), rewriter, loc);
+    auto rhs = getVreg(op.getOperand(1), rewriter, loc);
+    // Outer-product MAC: acc[r][c] += A[r] * B[c], starting from a zeroed
+    // accumulator. stripmine=4 replicates across weight columns.
+    auto accInit = createI32Const(loc, 0, rewriter);
+    auto outerProd =
+        rewriter.create<OuterProductOp>(loc, lhs, rhs, accInit, 4);
+    // Read accumulator column 0 back and store the result tile.
+    auto col0 = createI32Const(loc, 0, rewriter);
+    auto accRead =
+        rewriter.create<AccReadOp>(loc, outerProd.getAccNew(), col0);
+    rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
+    storeResult(accRead.getResult(), op, rewriter);
     rewriter.replaceOp(op, carrier(op, rewriter, accRead.getResult()));
     return mlir::success();
   }
