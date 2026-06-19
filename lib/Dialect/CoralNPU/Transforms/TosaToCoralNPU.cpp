@@ -65,6 +65,38 @@ static std::pair<SEW, LMUL> pickVConfig(mlir::Type elementType) {
   return {SEW::E32, LMUL::M1};
 }
 
+/// Number of elements a single 128-bit vector register holds for `sew`.
+static unsigned vregCapacity(SEW sew) {
+  constexpr unsigned kVLEN = 128;
+  switch (sew) {
+  case SEW::E8:  return kVLEN / 8;   // 16
+  case SEW::E16: return kVLEN / 16;  // 8
+  case SEW::E32: return kVLEN / 32;  // 4
+  }
+  return kVLEN / 32;
+}
+
+/// Stripmine factor for processing `nElems` of width `sew`: how many SIMD
+/// issues a single dispatch should serialize, = ceil(nElems / vregCap),
+/// clamped to the hardware-supported {1, 2, 4}. A factor derived from the
+/// real tile size instead of a hardcoded constant.
+static unsigned stripmineFor(int64_t nElems, SEW sew) {
+  unsigned cap = vregCapacity(sew);
+  if (cap == 0 || nElems <= 0)
+    return 1;
+  int64_t needed = (nElems + cap - 1) / cap;
+  if (needed <= 1) return 1;
+  if (needed == 2) return 2;
+  return 4;
+}
+
+/// Number of elements `v` carries (1 if not a tensor type).
+static int64_t numElements(mlir::Value v) {
+  if (auto tt = mlir::dyn_cast<mlir::TensorType>(v.getType()))
+    return tt.getNumElements();
+  return 1;
+}
+
 /// Extract the i32 element type from a TOSA tensor type, falling back to i32.
 static mlir::Type tensorElementType(mlir::Value v) {
   if (auto tt = mlir::dyn_cast<mlir::TensorType>(v.getType()))
@@ -212,8 +244,8 @@ struct TosaAddLowering : public mlir::OpRewritePattern<mlir::tosa::AddOp> {
     rewriter.create<VSetVLOp>(loc, sewLmul.first, sewLmul.second);
     auto lhs = getVreg(op.getOperand(0), rewriter, loc);
     auto rhs = getVreg(op.getOperand(1), rewriter, loc);
-    // 4-way stripmine = max SIMD throughput
-    auto vadd = rewriter.create<VAddOp>(loc, lhs, rhs, 4);
+    unsigned sm = stripmineFor(numElements(op.getResult()), sewLmul.first);
+    auto vadd = rewriter.create<VAddOp>(loc, lhs, rhs, sm);
     storeResult(vadd.getResult(), op, rewriter);
     rewriter.replaceOp(op, carrier(op, rewriter, vadd.getResult()));
     return mlir::success();
@@ -230,7 +262,8 @@ struct TosaSubLowering : public mlir::OpRewritePattern<mlir::tosa::SubOp> {
     rewriter.create<VSetVLOp>(loc, sewLmul.first, sewLmul.second);
     auto lhs = getVreg(op.getOperand(0), rewriter, loc);
     auto rhs = getVreg(op.getOperand(1), rewriter, loc);
-    auto vsub = rewriter.create<VSubOp>(loc, lhs, rhs, 4);
+    unsigned sm = stripmineFor(numElements(op.getResult()), sewLmul.first);
+    auto vsub = rewriter.create<VSubOp>(loc, lhs, rhs, sm);
     storeResult(vsub.getResult(), op, rewriter);
     rewriter.replaceOp(op, carrier(op, rewriter, vsub.getResult()));
     return mlir::success();
@@ -247,7 +280,8 @@ struct TosaMulLowering : public mlir::OpRewritePattern<mlir::tosa::MulOp> {
     rewriter.create<VSetVLOp>(loc, sewLmul.first, sewLmul.second);
     auto lhs = getVreg(op.getOperand(0), rewriter, loc);
     auto rhs = getVreg(op.getOperand(1), rewriter, loc);
-    auto vmul = rewriter.create<VMulOp>(loc, lhs, rhs, 4);
+    unsigned sm = stripmineFor(numElements(op.getResult()), sewLmul.first);
+    auto vmul = rewriter.create<VMulOp>(loc, lhs, rhs, sm);
     storeResult(vmul.getResult(), op, rewriter);
     rewriter.replaceOp(op, carrier(op, rewriter, vmul.getResult()));
     return mlir::success();
@@ -330,8 +364,9 @@ struct TosaConv2DLowering : public mlir::OpRewritePattern<mlir::tosa::Conv2DOp> 
     auto input = getVreg(op.getOperand(0), rewriter, loc);
     auto weight = getVreg(op.getOperand(1), rewriter, loc);
     auto accInit = createI32Const(loc, 0, rewriter);
+    unsigned sm = stripmineFor(kTile * kTile, SEW::E8);
     auto outerProd =
-        rewriter.create<OuterProductOp>(loc, input, weight, accInit, 4);
+        rewriter.create<OuterProductOp>(loc, input, weight, accInit, sm);
 
     // Read the accumulator column back and store the 32-bit result tile.
     auto col0 = createI32Const(loc, 0, rewriter);
@@ -391,6 +426,7 @@ struct TosaMatMulLowering : public mlir::OpRewritePattern<mlir::tosa::MatMulOp> 
             kT = ceilDiv(K, kTile);
 
     rewriter.create<VSetVLOp>(loc, SEW::E8, LMUL::M1);
+    unsigned sm = stripmineFor(kTile * kTile, SEW::E8);
     auto col0 = createI32Const(loc, 0, rewriter);
     mlir::Value last;
     // Output-tile loop nest; each (mi,ni) tile accumulates over the K tiles.
@@ -402,7 +438,7 @@ struct TosaMatMulLowering : public mlir::OpRewritePattern<mlir::tosa::MatMulOp> 
                                 kTile * kTile, rewriter, loc);
           auto bTile = loadTile(op.getOperand(1), (ki * nT + ni) * kTile * kTile,
                                 kTile * kTile, rewriter, loc);
-          acc = rewriter.create<OuterProductOp>(loc, aTile, bTile, acc, 4)
+          acc = rewriter.create<OuterProductOp>(loc, aTile, bTile, acc, sm)
                     .getAccNew();
         }
         auto accRead = rewriter.create<AccReadOp>(loc, acc, col0);
