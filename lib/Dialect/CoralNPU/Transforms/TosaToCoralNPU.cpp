@@ -90,6 +90,16 @@ static unsigned stripmineFor(int64_t nElems, SEW sew) {
   return 4;
 }
 
+/// Number of register-sized tiles needed to cover `nElems` at `sew`:
+/// ceil(nElems / vregCapacity(sew)), at least 1. This is the tensor-internal
+/// tiling factor — each tile is exactly one vector register's worth of work.
+static int64_t tileCount(SEW sew, int64_t nElems) {
+  unsigned cap = vregCapacity(sew);
+  if (cap == 0 || nElems <= 0)
+    return 1;
+  return (nElems + cap - 1) / cap;
+}
+
 /// Number of elements `v` carries (1 if not a tensor type).
 static int64_t numElements(mlir::Value v) {
   if (auto tt = mlir::dyn_cast<mlir::TensorType>(v.getType()))
@@ -171,6 +181,8 @@ static constexpr int64_t kResultSlot = 8;
 ///     unwrap and reuse the vreg, chaining element-wise ops in registers.
 ///   - Function argument: emit a `vle32` from its TCM slot.
 ///   - Otherwise: conservatively load from kTcmBase.
+/// Used by the non-element-wise patterns (pool, etc.) that still carry a
+/// single vreg via `tensor.splat`.
 static mlir::Value getVreg(mlir::Value tensorVal,
                            mlir::PatternRewriter &rewriter,
                            mlir::Location loc) {
@@ -185,6 +197,92 @@ static mlir::Value getVreg(mlir::Value tensorVal,
   auto addrV = createI32Const(loc, (int32_t)addr, rewriter);
   auto nV = createI32Const(loc, (int32_t)n, rewriter);
   return rewriter.create<VLE32Op>(loc, addrV, nV);
+}
+
+//===----------------------------------------------------------------------===//
+// Tensor-internal tiling for element-wise ops
+//===----------------------------------------------------------------------===//
+//
+// An element-wise tensor<NxT> is split into k = ceil(N / vregCap(SEW))
+// register-sized tiles. Each tile is one vector register; the multi-tile
+// carrier is a `tensor.from_elements(v0..v_{k-1})` (the single-vreg
+// `tensor.splat` generalized to width k). A consumer unpacks the carrier in
+// `getTiles` to reuse the producer's registers tile-by-tile (no reload).
+
+// A 128-bit register spans 16 bytes regardless of SEW, so tile i begins
+// `i * 16` bytes into a slot. `vle32` still names the element count of the
+// tile in its `$n` operand.
+static constexpr int64_t kTileBytes = 16;
+
+/// Number of elements carried by tile `i` of `k` covering `nElems`: every
+/// tile is `vregCap` elements except the last, which carries the remainder.
+static int64_t tileElems(int64_t i, int64_t k, int64_t nElems, SEW sew) {
+  unsigned cap = vregCapacity(sew);
+  if (i < k - 1)
+    return cap;
+  int64_t rem = nElems - (k - 1) * (int64_t)cap;
+  return rem > 0 ? rem : cap;
+}
+
+/// Resolve the `k` register-sized tiles for `operand` (generalizes getVreg):
+///   - Defined by `tensor.from_elements` → return its operands verbatim
+///     (already in registers — chained, NOT reloaded).
+///   - Function argument → emit `k` vle32s; tile i loads tileElems(i) elements
+///     from kTcmBase + argIndex*kTcmSlot + i*kTileBytes.
+///   - Otherwise (conservative) → `k` vle32s from kTcmBase + i*kTileBytes.
+static llvm::SmallVector<mlir::Value>
+getTiles(mlir::Value operand, SEW sew, mlir::PatternRewriter &rewriter,
+         mlir::Location loc) {
+  if (auto fe = operand.getDefiningOp<mlir::tensor::FromElementsOp>())
+    return llvm::SmallVector<mlir::Value>(fe.getElements());
+
+  int64_t n = numElements(operand);
+  int64_t k = tileCount(sew, n);
+  int64_t base = kTcmBase;
+  if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(operand))
+    base = kTcmBase + barg.getArgNumber() * kTcmSlot;
+
+  llvm::SmallVector<mlir::Value> tiles;
+  tiles.reserve(k);
+  for (int64_t i = 0; i < k; ++i) {
+    auto addrV = createI32Const(loc, (int32_t)(base + i * kTileBytes), rewriter);
+    auto nV = createI32Const(loc, (int32_t)tileElems(i, k, n, sew), rewriter);
+    tiles.push_back(rewriter.create<VLE32Op>(loc, addrV, nV));
+  }
+  return tiles;
+}
+
+/// Store each computed tile to the result slot via vse32; tile i lands at
+/// kTcmBase + kResultSlot*kTcmSlot + i*kTileBytes. Each vse32 is a memory
+/// side effect that anchors its vle/compute chain alive across both driver
+/// phases (the anchoring principle, applied per tile).
+static void storeTiles(llvm::ArrayRef<mlir::Value> vregs, SEW sew,
+                       int64_t nElems, mlir::PatternRewriter &rewriter,
+                       mlir::Location loc) {
+  int64_t k = (int64_t)vregs.size();
+  int64_t base = kTcmBase + kResultSlot * kTcmSlot;
+  for (int64_t i = 0; i < k; ++i) {
+    auto addrV = createI32Const(loc, (int32_t)(base + i * kTileBytes), rewriter);
+    auto nV = createI32Const(loc, (int32_t)tileElems(i, k, nElems, sew), rewriter);
+    rewriter.create<VSE32Op>(loc, vregs[i], addrV, nV);
+  }
+}
+
+/// Build the multi-tile carrier for an element-wise result: a
+/// `tensor.from_elements(v0..v_{k-1})` of type `tensor<kxi32>`. This is the
+/// single-vreg `tensor.splat` carrier generalized to k registers; a consumer
+/// unpacks it in `getTiles`. `replaceOp` is a plain RAUW (no type check), and
+/// `func.return` is rewritten to an i32 status word in phase 2, so the
+/// carrier's `tensor<kxi32>` type never needs to match the original
+/// `tensor<NxT>`.
+static mlir::Value tileCarrier(mlir::Operation *op,
+                               llvm::ArrayRef<mlir::Value> vregs,
+                               mlir::PatternRewriter &rewriter) {
+  auto loc = op->getLoc();
+  auto i32 = rewriter.getI32Type();
+  auto carrierTy =
+      mlir::RankedTensorType::get({(int64_t)vregs.size()}, i32);
+  return rewriter.create<mlir::tensor::FromElementsOp>(loc, carrierTy, vregs);
 }
 
 // Matrix-engine tile size: the 8x8 accumulator processes 8x8 element tiles.
@@ -240,14 +338,16 @@ struct TosaAddLowering : public mlir::OpRewritePattern<mlir::tosa::AddOp> {
   mlir::LogicalResult matchAndRewrite(mlir::tosa::AddOp op,
                                       mlir::PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    auto sewLmul = pickVConfig(tensorElementType(op.getResult()));
-    rewriter.create<VSetVLOp>(loc, sewLmul.first, sewLmul.second);
-    auto lhs = getVreg(op.getOperand(0), rewriter, loc);
-    auto rhs = getVreg(op.getOperand(1), rewriter, loc);
-    unsigned sm = stripmineFor(numElements(op.getResult()), sewLmul.first);
-    auto vadd = rewriter.create<VAddOp>(loc, lhs, rhs, sm);
-    storeResult(vadd.getResult(), op, rewriter);
-    rewriter.replaceOp(op, carrier(op, rewriter, vadd.getResult()));
+    auto sew = pickVConfig(tensorElementType(op.getResult())).first;
+    rewriter.create<VSetVLOp>(loc, sew, LMUL::M1);
+    int64_t n = numElements(op.getResult());
+    auto lhsTiles = getTiles(op.getOperand(0), sew, rewriter, loc);
+    auto rhsTiles = getTiles(op.getOperand(1), sew, rewriter, loc);
+    llvm::SmallVector<mlir::Value> res;
+    for (auto [l, r] : llvm::zip(lhsTiles, rhsTiles))
+      res.push_back(rewriter.create<VAddOp>(loc, l, r, /*stripmine=*/1));
+    storeTiles(res, sew, n, rewriter, loc);
+    rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
     return mlir::success();
   }
 };
@@ -258,14 +358,16 @@ struct TosaSubLowering : public mlir::OpRewritePattern<mlir::tosa::SubOp> {
   mlir::LogicalResult matchAndRewrite(mlir::tosa::SubOp op,
                                       mlir::PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    auto sewLmul = pickVConfig(tensorElementType(op.getResult()));
-    rewriter.create<VSetVLOp>(loc, sewLmul.first, sewLmul.second);
-    auto lhs = getVreg(op.getOperand(0), rewriter, loc);
-    auto rhs = getVreg(op.getOperand(1), rewriter, loc);
-    unsigned sm = stripmineFor(numElements(op.getResult()), sewLmul.first);
-    auto vsub = rewriter.create<VSubOp>(loc, lhs, rhs, sm);
-    storeResult(vsub.getResult(), op, rewriter);
-    rewriter.replaceOp(op, carrier(op, rewriter, vsub.getResult()));
+    auto sew = pickVConfig(tensorElementType(op.getResult())).first;
+    rewriter.create<VSetVLOp>(loc, sew, LMUL::M1);
+    int64_t n = numElements(op.getResult());
+    auto lhsTiles = getTiles(op.getOperand(0), sew, rewriter, loc);
+    auto rhsTiles = getTiles(op.getOperand(1), sew, rewriter, loc);
+    llvm::SmallVector<mlir::Value> res;
+    for (auto [l, r] : llvm::zip(lhsTiles, rhsTiles))
+      res.push_back(rewriter.create<VSubOp>(loc, l, r, /*stripmine=*/1));
+    storeTiles(res, sew, n, rewriter, loc);
+    rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
     return mlir::success();
   }
 };
@@ -276,14 +378,16 @@ struct TosaMulLowering : public mlir::OpRewritePattern<mlir::tosa::MulOp> {
   mlir::LogicalResult matchAndRewrite(mlir::tosa::MulOp op,
                                       mlir::PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    auto sewLmul = pickVConfig(tensorElementType(op.getResult()));
-    rewriter.create<VSetVLOp>(loc, sewLmul.first, sewLmul.second);
-    auto lhs = getVreg(op.getOperand(0), rewriter, loc);
-    auto rhs = getVreg(op.getOperand(1), rewriter, loc);
-    unsigned sm = stripmineFor(numElements(op.getResult()), sewLmul.first);
-    auto vmul = rewriter.create<VMulOp>(loc, lhs, rhs, sm);
-    storeResult(vmul.getResult(), op, rewriter);
-    rewriter.replaceOp(op, carrier(op, rewriter, vmul.getResult()));
+    auto sew = pickVConfig(tensorElementType(op.getResult())).first;
+    rewriter.create<VSetVLOp>(loc, sew, LMUL::M1);
+    int64_t n = numElements(op.getResult());
+    auto lhsTiles = getTiles(op.getOperand(0), sew, rewriter, loc);
+    auto rhsTiles = getTiles(op.getOperand(1), sew, rewriter, loc);
+    llvm::SmallVector<mlir::Value> res;
+    for (auto [l, r] : llvm::zip(lhsTiles, rhsTiles))
+      res.push_back(rewriter.create<VMulOp>(loc, l, r, /*stripmine=*/1));
+    storeTiles(res, sew, n, rewriter, loc);
+    rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
     return mlir::success();
   }
 };
