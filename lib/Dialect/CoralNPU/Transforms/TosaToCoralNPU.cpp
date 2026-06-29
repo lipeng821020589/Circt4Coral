@@ -581,7 +581,7 @@ struct TosaPadLowering : public mlir::OpRewritePattern<mlir::tosa::PadOp> {
 };
 
 //===----------------------------------------------------------------------===//
-// tosa.avg_pool2d → vle + vredsum + div
+// tosa.avg_pool2d → k×(vle32 + vredsum) + scalar add chain + div
 //===----------------------------------------------------------------------===//
 
 struct TosaAvgPool2dLowering : public mlir::OpRewritePattern<mlir::tosa::AvgPool2dOp> {
@@ -591,10 +591,22 @@ struct TosaAvgPool2dLowering : public mlir::OpRewritePattern<mlir::tosa::AvgPool
                                       mlir::PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
-    // Load the real input window, reduce-sum it, then divide by the pooling
-    // window area to get the average.
-    auto in = getVreg(op.getInput(), rewriter, loc);
-    auto vred = rewriter.create<VRedSumOp>(loc, in);
+    // Tile the input window into k = ceil(N / vregCap) register-sized loads
+    // (reusing the element-wise getTiles helper), give each tile its own
+    // vredsum partial sum, then fold the partials with a scalar add chain.
+    // This keeps the reduction honest for windows larger than one vector
+    // register (a 128-bit reg holds only 4 i32 / 8 i16 / 16 i8), instead of
+    // pretending a single vredsum covers all N elements.
+    auto tiles = getTiles(op.getInput(), SEW::E32, rewriter, loc);
+    llvm::SmallVector<mlir::Value> partials;
+    partials.reserve(tiles.size());
+    for (auto tile : tiles)
+      partials.push_back(rewriter.create<VRedSumOp>(loc, tile).getResult());
+    // Scalar add chain: sum = ((p0 + p1) + p2) + ...  (k == 1 => sum = p0,
+    // no add — byte-for-byte equivalent to the pre-tiling single vredsum).
+    mlir::Value sum = partials[0];
+    for (size_t i = 1; i < partials.size(); ++i)
+      sum = rewriter.create<ScalarAddOp>(loc, sum, partials[i]).getResult();
     // Pooling window area = product of the kernel dimensions; this is the
     // divisor for the average.
     int64_t area = 1;
@@ -603,7 +615,7 @@ struct TosaAvgPool2dLowering : public mlir::OpRewritePattern<mlir::tosa::AvgPool
     if (area <= 0)
       area = 1;
     auto div = rewriter.create<ScalarDivOp>(
-        loc, vred.getResult(), createI32Const(loc, (int32_t)area, rewriter));
+        loc, sum, createI32Const(loc, (int32_t)area, rewriter));
     storeResult(div.getResult(), op, rewriter);
     rewriter.replaceOp(op, carrier(op, rewriter, div.getResult()));
     return mlir::success();
