@@ -93,6 +93,14 @@ struct AllocResult {
   unsigned accColsUsed = 0;
 };
 
+/// Scalar R-type ops that read their operands from the scalar register file
+/// (and therefore cannot consume a value that lives only in a vector reg).
+static bool isScalarConsumer(mlir::Operation *op) {
+  return mlir::isa<ScalarAddOp, ScalarSubOp, ScalarMulOp, ScalarDivOp,
+                   ScalarAndOp, ScalarOrOp, ScalarXorOp, ScalarSllOp,
+                   ScalarSrlOp, ScalarSraOp, ScalarSltOp, ScalarSltuOp>(op);
+}
+
 static AllocResult linearScan(llvm::MutableArrayRef<LiveRange> intervals) {
   // Sort by start point, then by (descending) end point as tiebreaker
   // (Wimmer's textbook rule).
@@ -243,11 +251,31 @@ static void computeLiveness(mlir::Operation *root,
 static void annotateOp(mlir::Operation *op,
                        const llvm::DenseMap<mlir::Value, unsigned> &regMap,
                        const llvm::DenseMap<mlir::Value, std::pair<unsigned,unsigned>> &accMap,
-                       const llvm::DenseSet<mlir::Value> &vectorVals) {
+                       const llvm::DenseSet<mlir::Value> &vectorVals,
+                       const llvm::DenseMap<mlir::Value, unsigned> &moveRegMap) {
   llvm::SmallVector<mlir::NamedAttribute> regAttrs;
+
+  // A scalar op consuming a vector-resident value (e.g. a vredsum result,
+  // which lives in vector-register lane 0) must read it from a scalar
+  // register. The producer is annotated with `xmove_out_0` (a dedicated
+  // scalar move register) and emits a vmv.x.s into it; here we point the
+  // consumer operand at that same scalar register via `xreg_` instead of
+  // `vreg_`.
+  bool scalarConsumer = isScalarConsumer(op);
 
   for (unsigned i = 0; i < op->getNumOperands(); ++i) {
     auto val = op->getOperand(i);
+    // Vector-resident value feeding a scalar op: read the moved scalar reg.
+    if (scalarConsumer && vectorVals.contains(val)) {
+      auto mv = moveRegMap.find(val);
+      if (mv != moveRegMap.end()) {
+        regAttrs.push_back(mlir::NamedAttribute(
+            mlir::StringAttr::get(op->getContext(), "xreg_" + std::to_string(i)),
+            mlir::IntegerAttr::get(
+                mlir::IntegerType::get(op->getContext(), 32), mv->second)));
+        continue;
+      }
+    }
     auto it = regMap.find(val);
     if (it != regMap.end()) {
       bool isVec = vectorVals.contains(val);
@@ -277,6 +305,16 @@ static void annotateOp(mlir::Operation *op,
           mlir::StringAttr::get(op->getContext(), attrName),
           mlir::IntegerAttr::get(
               mlir::IntegerType::get(op->getContext(), 32), it->second)));
+    }
+    // A vector-resident result with a scalar consumer also gets a dedicated
+    // scalar move register; emit-assembly issues a vmv.x.s into it after the
+    // producing instruction (e.g. vredsum.vs → vmv.x.s).
+    auto mv = moveRegMap.find(val);
+    if (mv != moveRegMap.end()) {
+      regAttrs.push_back(mlir::NamedAttribute(
+          mlir::StringAttr::get(op->getContext(), "xmove_out_" + std::to_string(i)),
+          mlir::IntegerAttr::get(
+              mlir::IntegerType::get(op->getContext(), 32), mv->second)));
     }
     auto accIt = accMap.find(val);
     if (accIt != accMap.end()) {
@@ -319,9 +357,28 @@ struct CoralNPURegAllocPass
       }
     }
 
+    // Allocate scalar "move" registers for vector-resident values that are
+    // consumed by a scalar op (e.g. a vredsum result feeding the avg_pool
+    // partial-sum add chain). vredsum.vs leaves its result in vector-register
+    // lane 0; a vmv.x.s must move it into a scalar register before a scalar
+    // R-type op can read it. We hand these moves fresh scalar registers above
+    // the scalars the linear scan already used, so they never collide.
+    llvm::DenseMap<mlir::Value, unsigned> moveRegMap;
+    unsigned nextMoveReg = std::max(result.scalarsUsed, kFirstAllocScalar);
+    getOperation()->walk([&](mlir::Operation *op) {
+      if (!isScalarConsumer(op))
+        return;
+      for (auto operand : op->getOperands()) {
+        if (!vectorVals.contains(operand) || moveRegMap.count(operand))
+          continue;
+        if (nextMoveReg < kNumScalarRegs)
+          moveRegMap[operand] = nextMoveReg++;
+      }
+    });
+
     // Annotate all ops with register assignments.
     getOperation()->walk([&](mlir::Operation *op) {
-      annotateOp(op, regMap, accMap, vectorVals);
+      annotateOp(op, regMap, accMap, vectorVals, moveRegMap);
     });
 
     // Stats.

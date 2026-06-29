@@ -235,9 +235,16 @@ static void emitInstruction(mlir::Operation *op, llvm::raw_ostream &os) {
        << getVReg(op, "vreg_1") << "  # vdot step 1: element-wise mul\n"
        << "vfredsum.vs " << getVReg(op, "vreg_out_0") << ", v0, "
        << getVReg(op, "vreg_out_0") << "  # vdot step 2: reduce sum\n";
-  } else if (mlir::isa<VRedSumOp>(op))
+  } else if (mlir::isa<VRedSumOp>(op)) {
     os << "vredsum.vs " << getVReg(op, "vreg_out_0") << ", "
        << getVReg(op, "vreg_0") << ", " << getVReg(op, "vreg_out_0") << "\n";
+    // vredsum.vs leaves the reduction in vector-register lane 0. If a scalar
+    // op consumes this result, regalloc assigned a scalar move register
+    // (xmove_out_0); emit the vmv.x.s that bridges the vector→scalar domain.
+    if (op->getDiscardableAttr("xmove_out_0"))
+      os << "vmv.x.s " << getXReg(op, "xmove_out_0") << ", "
+         << getVReg(op, "vreg_out_0") << "\n";
+  }
 
   // ---- Vector loads (RVV unit-stride) ----
   else if (mlir::isa<VLE8Op>(op))
