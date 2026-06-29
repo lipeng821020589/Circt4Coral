@@ -428,7 +428,7 @@ module SampleValueBuiltins #() (
 );
   // CHECK: [[CLKWIRE:%.+]] = moore.net name "clk_i" wire : <l1>
   // CHECK: [[DATAWIRE:%.+]] = moore.net name "data_i" wire : <l8>
-  // CHECK: [[DATABITWIRE:%.+]] = moore.variable name "data_bit_i" : <i8>
+  // CHECK: [[DATABITWIRE:%.+]] = moore.net name "data_bit_i" wire : <i8>
   // CHECK: moore.procedure always {
   // CHECK-NEXT: [[C:%.+]] = moore.read [[CLKWIRE]] : <l1>
   // CHECK-NEXT: [[C_INT:%.+]] = moore.logic_to_int [[C]] : l1
@@ -708,6 +708,42 @@ module SampleValueBuiltins #() (
     assert property (@(posedge clk_i) $countones(data_bit_i) == 0);
 endmodule
 
+// CHECK-LABEL: func.func private @BitVectorPackedBuiltins(
+// CHECK-SAME: [[S:%[^ ,]+]]: !moore.struct<{a: l4, b: l4}>,
+// CHECK-SAME: [[A:%[^ ,]+]]: !moore.array<2 x l4>)
+function void BitVectorPackedBuiltins(
+    struct packed { logic [3:0] a; logic [3:0] b; } s,
+    logic [1:0][3:0] arr);
+  bit result;
+  int cnt;
+
+  // CHECK: [[SBV:%.+]] = moore.packed_to_sbv [[S]] : struct<{a: l4, b: l4}>
+  // CHECK-NEXT: [[RED:%.+]] = moore.reduce_xor [[SBV]] : l8 -> l1
+  // CHECK-NEXT: [[X:%.+]] = moore.constant bX : l1
+  // CHECK-NEXT: moore.case_eq [[RED]], [[X]] : l1
+  result = $isunknown(s);
+
+  // CHECK: [[SBV2:%.+]] = moore.packed_to_sbv [[S]] : struct<{a: l4, b: l4}>
+  // CHECK: moore.reduce_xor [[SBV2]] : l8 -> l1
+  // CHECK: comb.icmp eq
+  result = $onehot0(s);
+
+  // CHECK: [[SBV3:%.+]] = moore.packed_to_sbv [[S]] : struct<{a: l4, b: l4}>
+  // CHECK: moore.reduce_xor [[SBV3]] : l8 -> l1
+  // CHECK: comb.icmp ne
+  result = $onehot(s);
+
+  // CHECK: [[SBV4:%.+]] = moore.packed_to_sbv [[S]] : struct<{a: l4, b: l4}>
+  // CHECK-NEXT: moore.logic_to_int [[SBV4]] : l8
+  cnt = $countones(s);
+
+  // CHECK: [[SBV5:%.+]] = moore.packed_to_sbv [[A]] : array<2 x l4>
+  // CHECK-NEXT: [[RED2:%.+]] = moore.reduce_xor [[SBV5]] : l8 -> l1
+  // CHECK-NEXT: [[X2:%.+]] = moore.constant bX : l1
+  // CHECK-NEXT: moore.case_eq [[RED2]], [[X2]] : l1
+  result = $isunknown(arr);
+endfunction
+
 // CHECK-LABEL: func.func private @StringBuiltins(
 // CHECK-SAME: [[STR:%.+]]: !moore.string,
 // CHECK-SAME: [[INT:%.+]]: !moore.i32,
@@ -915,4 +951,18 @@ function void FileDisplayBuiltins(int fd, int x);
   // CHECK: moore.builtin.fdisplay [[FD]], [[TMP3]]
   $fdisplayh(fd, x);
 
+endfunction
+
+// IEEE 1800-2017 § 21.6 "Command line input"
+// CHECK-LABEL: func.func private @PlusArgsBuiltins(
+function void PlusArgsBuiltins();
+  bit rv;
+  int val;
+
+  // CHECK: [[T:%.+]] = moore.builtin.plusargs_test "FOO" : i1
+  rv = $test$plusargs("FOO");
+
+  // CHECK: [[FOUND:%.+]], [[RESULT:%.+]] = moore.builtin.plusargs_value "BAR=%d" : i1, i32
+  // CHECK: moore.blocking_assign {{%.+}}, [[RESULT]] : i32
+  rv = $value$plusargs("BAR=%d", val);
 endfunction

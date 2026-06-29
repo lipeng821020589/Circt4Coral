@@ -1,4 +1,4 @@
-//===- ArcPasses.td - Arc dialect passes -------------------*- tablegen -*-===//
+//===----------------------------------------------------------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -199,6 +199,23 @@ def LowerArrays : Pass<"arc-lower-arrays", "mlir::ModuleOp"> {
   let dependentDialects = ["arc::ArcDialect"];
 }
 
+def GenerateDriver : Pass<"arc-generate-driver", "mlir::ModuleOp"> {
+  let summary = "Generate a simulation driver function for each model";
+  let description = [{
+    Emit a `func.func @<model>_main` for every `arc.model` that instantiates the
+    model and drives it forward in time until no more events are scheduled: it
+    repeatedly advances simulation time to the next scheduled wakeup and
+    evaluates the model until no further wakeup is pending. This lets a model be
+    run directly through the arcilator JIT without a hand-written driver loop.
+  }];
+  let dependentDialects = [
+    "arc::ArcDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::func::FuncDialect",
+    "mlir::scf::SCFDialect",
+  ];
+}
+
 def LowerLUT : Pass<"arc-lower-lut", "arc::DefineOp"> {
   let summary = "Lowers arc.lut into a comb and hw only representation.";
   let dependentDialects = ["hw::HWDialect", "comb::CombDialect"];
@@ -209,6 +226,7 @@ def LowerStatePass : Pass<"arc-lower-state", "mlir::ModuleOp"> {
   let dependentDialects = [
     "arc::ArcDialect",
     "comb::CombDialect",
+    "mlir::arith::ArithDialect",
     "mlir::LLVM::LLVMDialect",
     "mlir::func::FuncDialect",
     "mlir::scf::SCFDialect",

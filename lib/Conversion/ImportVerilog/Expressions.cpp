@@ -73,7 +73,7 @@ static Value getSelectIndex(Context &context, Location loc, Value index,
   // Compute offset first so we know if it is negative.
   auto lo = range.lower();
   auto hi = range.upper();
-  auto offset = range.isLittleEndian() ? lo : hi;
+  auto offset = range.isDescending() ? lo : hi;
 
   // If any bound is negative we need a signed index type.
   const bool needSigned = (lo < 0) || (hi < 0);
@@ -96,7 +96,7 @@ static Value getSelectIndex(Context &context, Location loc, Value index,
   index = context.materializeConversion(intType, index, needSigned, loc);
 
   if (offset == 0) {
-    if (range.isLittleEndian())
+    if (range.isDescending())
       return index;
     else
       return moore::NegOp::create(builder, loc, index);
@@ -104,7 +104,7 @@ static Value getSelectIndex(Context &context, Location loc, Value index,
 
   auto offsetConst =
       moore::ConstantOp::create(builder, loc, intType, offset, needSigned);
-  if (range.isLittleEndian())
+  if (range.isDescending())
     return moore::SubOp::create(builder, loc, index, offsetConst);
   else
     return moore::SubOp::create(builder, loc, offsetConst, index);
@@ -539,7 +539,7 @@ struct ExprVisitor {
       // therefore have to take the `a` from above and adjust it by `-b+1` to
       // arrive at the right bound.
       if (expr.getSelectionKind() == RangeSelectionKind::IndexedDown &&
-          range.isLittleEndian()) {
+          range.isDescending()) {
         assert(constRight && "constness checked in slang");
         offsetAdd = 1 - *constRight;
       }
@@ -548,7 +548,7 @@ struct ExprVisitor {
       // therefore have to take the `a` from above and adjust it by `+b-1` to
       // arrive at the right bound.
       if (expr.getSelectionKind() == RangeSelectionKind::IndexedUp &&
-          !range.isLittleEndian()) {
+          !range.isDescending()) {
         assert(constRight && "constness checked in slang");
         offsetAdd = *constRight - 1;
       }
@@ -1495,6 +1495,34 @@ struct RvalueExprVisitor : public ExprVisitor {
 
   // Handle binary operators.
   Value visit(const slang::ast::BinaryExpression &expr) {
+    if (expr.left().kind == slang::ast::ExpressionKind::TypeReference &&
+        expr.right().kind == slang::ast::ExpressionKind::TypeReference) {
+      auto &lhsType =
+          expr.left().as<slang::ast::TypeReferenceExpression>().targetType;
+      auto &rhsType =
+          expr.right().as<slang::ast::TypeReferenceExpression>().targetType;
+      bool value = lhsType.isMatching(rhsType);
+
+      using slang::ast::BinaryOperator;
+      switch (expr.op) {
+      case BinaryOperator::Equality:
+      case BinaryOperator::CaseEquality:
+        break;
+      case BinaryOperator::Inequality:
+      case BinaryOperator::CaseInequality:
+        value = !value;
+        break;
+      default:
+        mlir::emitError(loc, "unsupported type reference binary operator");
+        return {};
+      }
+
+      auto type = moore::IntType::get(context.getContext(), /*width=*/1,
+                                      moore::Domain::TwoValued);
+      return moore::ConstantOp::create(builder, loc, type, value,
+                                       /*isSigned=*/false);
+    }
+
     // First check whether we need real or integral BOps
     const auto *rhsFloatType =
         expr.right().type->as_if<slang::ast::FloatingType>();
@@ -3300,11 +3328,18 @@ Value Context::convertSystemCall(
     auto value = convertRvalueExpression(*args[0]);
     if (!value)
       return {};
-    auto valTy = dyn_cast<moore::IntType>(value.getType());
-    if (!valTy) {
-      mlir::emitError(loc) << "expected integer argument for `$isunknown`";
-      return {};
+
+    if (!isa<moore::IntType>(value.getType())) {
+      if (!isa<moore::PackedType>(value.getType())) {
+        mlir::emitError(loc) << "expected integer argument for `$isunknown`";
+        return {};
+      }
+      value = materializePackedToSBVConversion(*this, value, loc,
+                                               /*fallible=*/false);
+      if (!value)
+        return {};
     }
+    auto valTy = dyn_cast<moore::IntType>(value.getType());
     return getIsUnknown(builder, loc, value, valTy, getContext());
   }
 
@@ -3313,6 +3348,17 @@ Value Context::convertSystemCall(
     auto value = convertRvalueExpression(*args[0]);
     if (!value)
       return {};
+    if (!isa<moore::IntType>(value.getType())) {
+      if (!isa<moore::PackedType>(value.getType())) {
+        mlir::emitError(loc)
+            << "expected integer argument for `$onehot`/`$onehot0`";
+        return {};
+      }
+      value = materializePackedToSBVConversion(*this, value, loc,
+                                               /*fallible=*/false);
+      if (!value)
+        return {};
+    }
     auto valTy = dyn_cast<moore::IntType>(value.getType());
     if (!valTy) {
       mlir::emitError(loc) << "expected integer argument for `"
@@ -3364,6 +3410,16 @@ Value Context::convertSystemCall(
     auto value = convertRvalueExpression(*args[0]);
     if (!value)
       return {};
+    if (!isa<moore::IntType>(value.getType())) {
+      if (!isa<moore::PackedType>(value.getType())) {
+        mlir::emitError(loc) << "expected integer argument for `$countones`";
+        return {};
+      }
+      value = materializePackedToSBVConversion(*this, value, loc,
+                                               /*fallible=*/false);
+      if (!value)
+        return {};
+    }
     auto valTy = dyn_cast<moore::IntType>(value.getType());
     if (!valTy) {
       mlir::emitError(loc) << "expected integer argument for `$countones`";
@@ -3753,6 +3809,53 @@ Value Context::convertSystemCall(
       modeAttr = moore::FOpenModeAttr::get(getContext(), *mode);
     }
     return moore::FOpenBIOp::create(builder, loc, filename, modeAttr);
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Command Line Input System Functions
+  //===--------------------------------------------------------------------===//
+
+  if (nameId == ksn::TestPlusArgs) {
+    // Slang already checks the arity of `$test$plusargs`.
+    assert(numArgs == 1 && "`$test$plusargs` takes 1 argument");
+    auto *strLit =
+        args[0]->unwrapImplicitConversions().as_if<slang::ast::StringLiteral>();
+    if (!strLit)
+      return emitError(loc) << "`$test$plusargs` argument must be a string "
+                               "literal",
+             Value{};
+    auto foundTy = moore::IntType::getInt(getContext(), 1);
+    return moore::PlusArgsTestBIOp::create(
+        builder, loc, foundTy, builder.getStringAttr(strLit->getValue()));
+  }
+
+  if (nameId == ksn::ValuePlusArgs) {
+    // Slang already checks the arity of `$value$plusargs`. The parsed value is
+    // written back into the second (lvalue) argument, and the function returns
+    // whether a matching plusarg was found.
+    assert(numArgs == 2 && "`$value$plusargs` takes 2 arguments");
+    auto *strLit =
+        args[0]->unwrapImplicitConversions().as_if<slang::ast::StringLiteral>();
+    if (!strLit)
+      return emitError(loc) << "`$value$plusargs` format must be a string "
+                               "literal",
+             Value{};
+    // Slang emits output arguments as a `<lvalue> = EmptyArgument` assignment;
+    // unpack it to recover the lvalue that receives the parsed value.
+    const auto *valueArg = args[1];
+    if (const auto *assign =
+            valueArg->as_if<slang::ast::AssignmentExpression>())
+      valueArg = &assign->left();
+    auto lvalue = convertLvalueExpression(*valueArg);
+    if (!lvalue)
+      return {};
+    auto resultType = cast<moore::RefType>(lvalue.getType()).getNestedType();
+    auto foundTy = moore::IntType::getInt(getContext(), 1);
+    auto op = moore::PlusArgsValueBIOp::create(
+        builder, loc, foundTy, resultType,
+        builder.getStringAttr(strLit->getValue()));
+    moore::BlockingAssignOp::create(builder, loc, lvalue, op.getResult());
+    return op.getFound();
   }
 
   // Unrecognized system call

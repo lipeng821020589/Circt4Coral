@@ -126,6 +126,7 @@ void circt::populateArcStateLoweringPipeline(
   pm.addPass(arc::createMergeIfsPass());
   pm.addPass(createCSEPass());
   pm.addPass(arc::createArcCanonicalizer());
+  pm.addPass(arc::createLowerCoroutinesPass());
 }
 
 void circt::populateArcStateAllocationPipeline(
@@ -149,6 +150,8 @@ void circt::populateArcStateAllocationPipeline(
 
 void circt::populateArcToLLVMPipeline(OpPassManager &pm,
                                       const ArcToLLVMOptions &options) {
+  if (!options.noGenerateDriver)
+    pm.addPass(createGenerateDriver());
   {
     hw::HWConvertBitcastsOptions options;
     options.allowPartialConversion = false;
