@@ -412,10 +412,58 @@ def test_avgpool():
             elf_path.unlink()
 
 
-# ── 测试 4: CSR codegen（outer_product → csrw KSCM/KISA）────────────────────
+# ── 测试 4: max_pool2d (tensor<1x2x2x1xi32>, N=4, k=1) ───────────────────────
+
+def test_max_pool():
+    print("\n=== TEST 4: max_pool2d (tensor<1x2x2x1xi32>, N=4, k=1) ===")
+    mlir = """\
+func.func @mp(%in: tensor<1x2x2x1xi32>) -> tensor<1x1x1x1xi32> {
+  %0 = tosa.max_pool2d %in {kernel = array<i64: 2, 2>, stride = array<i64: 2, 2>, pad = array<i64: 0, 0, 0, 0>, nan_mode = "PROPAGATE"} : (tensor<1x2x2x1xi32>) -> tensor<1x1x1x1xi32>
+  func.return %0 : tensor<1x1x1x1xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+              "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+
+    circt_out = run_circt_opt(mlir, passes)
+    insns = extract_asm_instructions(circt_out)
+
+    inputs = [3, 7, 1, 5] + [0]*12  # max = 7
+    expected_max = max(inputs[:4])
+
+    prologue = [
+        ".section .text",
+        ".globl _start",
+        "_start:",
+        "    csrr  t0, mstatus",
+        "    li    t1, 0x600",
+        "    or    t0, t0, t1",
+        "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(inputs, TCM_BASE + 0 * TCM_SLOT)
+
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 4)
+        actual_val = struct.unpack("<i", raw)[0]
+        check_result(f"max_pool [3,7,1,5] expect={expected_max}",
+                     [actual_val], [expected_max])
+    except Exception as e:
+        print(f"  [ERROR] {e}")
+        COUNTS['fail'] += 1
+    finally:
+        if elf_path.exists():
+            elf_path.unlink()
+
+
+# ── 测试 5: CSR codegen（outer_product → csrw KSCM/KISA）────────────────────
 
 def test_csr_outer_product():
-    print("\n=== TEST 4: CSR codegen (outer_product → KSCM/KISA csrw) ===")
+    print("\n=== TEST 5: CSR codegen (outer_product → KSCM/KISA csrw) ===")
     mlir = """\
 func.func @demo_outer_product() -> i32 {
   %a = coralnpu.li 2 : i32
@@ -513,6 +561,7 @@ if __name__ == "__main__":
     test_elementwise_add()
     test_elementwise_tiled()
     test_avgpool()
+    test_max_pool()
     test_csr_outer_product()
 
     print(f"\n{'='*50}")

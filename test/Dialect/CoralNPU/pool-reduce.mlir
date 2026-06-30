@@ -26,11 +26,16 @@ func.func @ap(%in: tensor<1x2x2x2xi32>, %izp: tensor<1xi32>, %ozp: tensor<1xi32>
   func.return %0 : tensor<1x1x1x2xi32>
 }
 
-// max_pool2d: load real input, reduce, store. Unchanged placeholder form.
+// max_pool2d: tiled vredmax + branchless scalar max fold + sw store.
 // CHECK-LABEL: @mp
-// CHECK: %[[IN2:.*]] = coralnpu.vle32
-// CHECK: %[[R2:.*]] = coralnpu.vredsum %[[IN2]]
-// CHECK: coralnpu.vse32 %[[R2]]
+// CHECK: %[[T0:.*]] = coralnpu.vle32
+// CHECK: %[[M0:.*]] = coralnpu.vredmax %[[T0]]
+// CHECK: coralnpu.sub
+// CHECK: coralnpu.sra
+// CHECK: coralnpu.xor
+// CHECK: coralnpu.and
+// CHECK: coralnpu.add
+// CHECK: coralnpu.sw
 func.func @mp(%in: tensor<1x8x8x4xi32>) -> tensor<1x4x4x4xi32> {
   %0 = tosa.max_pool2d %in {kernel = array<i64: 2, 2>, stride = array<i64: 2, 2>, pad = array<i64: 0, 0, 0, 0>, nan_mode = "PROPAGATE"} : (tensor<1x8x8x4xi32>) -> tensor<1x4x4x4xi32>
   func.return %0 : tensor<1x4x4x4xi32>

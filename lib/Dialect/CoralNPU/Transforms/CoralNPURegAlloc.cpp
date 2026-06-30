@@ -98,7 +98,7 @@ struct AllocResult {
 static bool isScalarConsumer(mlir::Operation *op) {
   return mlir::isa<ScalarAddOp, ScalarSubOp, ScalarMulOp, ScalarDivOp,
                    ScalarAndOp, ScalarOrOp, ScalarXorOp, ScalarSllOp,
-                   ScalarSrlOp, ScalarSraOp, ScalarSltOp, ScalarSltuOp>(op);
+                   ScalarSrlOp, ScalarSraOp, ScalarSltOp, ScalarSltuOp, ScalarSwOp>(op);
 }
 
 static AllocResult linearScan(llvm::MutableArrayRef<LiveRange> intervals) {
@@ -237,7 +237,7 @@ static void computeLiveness(mlir::Operation *root,
     auto *defOp = valuePos.first.getDefiningOp();
     lr.isVector = mlir::isa<VLE8Op, VLE16Op, VLE32Op,
                             VSE8Op, VSE16Op, VSE32Op,
-                            VAddOp, VSubOp, VMulOp, VWAddOp, VDotOp, VRedSumOp,
+                            VAddOp, VSubOp, VMulOp, VWAddOp, VDotOp, VRedSumOp, VRedMaxOp,
                             VSetVLOp,
                             OuterProductOp, AConvOp, AccReadOp>(defOp);
     out.push_back(lr);

@@ -636,15 +636,28 @@ struct TosaMaxPool2dLowering : public mlir::OpRewritePattern<mlir::tosa::MaxPool
                                       mlir::PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
-    // Load the real input window. CoralNPU has no single vredmax instruction;
-    // we model the max reduction with a vredsum carrier over the real data so
-    // the value flows (and is stored), leaving the exact max-reduction to a
-    // future dedicated lowering. The data dependency on the real input is the
-    // important part vs. the previous zero placeholder.
-    auto in = getVreg(op.getInput(), rewriter, loc);
-    auto vred = rewriter.create<VRedSumOp>(loc, in);
-    storeResult(vred.getResult(), op, rewriter);
-    rewriter.replaceOp(op, carrier(op, rewriter, vred.getResult()));
+    // Tile input into k register-sized loads, one vredmax per tile,
+    // then fold per-tile max scalars with branchless scalar max chain.
+    auto tiles = getTiles(op.getInput(), SEW::E32, rewriter, loc);
+    llvm::SmallVector<mlir::Value> tileMaxes;
+    tileMaxes.reserve(tiles.size());
+    for (auto tile : tiles)
+      tileMaxes.push_back(rewriter.create<VRedMaxOp>(loc, tile).getResult());
+    // Branchless scalar max: max(a,b) = a + ((b-a) & ~((b-a)>>31))
+    mlir::Value result = tileMaxes[0];
+    for (size_t i = 1; i < tileMaxes.size(); ++i) {
+      auto a    = result;
+      auto b    = tileMaxes[i];
+      auto sub  = rewriter.create<ScalarSubOp>(loc, b, a);
+      auto sra  = rewriter.create<ScalarSraOp>(loc, sub, createI32Const(loc, 31, rewriter));
+      auto mask = rewriter.create<ScalarXorOp>(loc, sra, createI32Const(loc, -1, rewriter));
+      auto sel  = rewriter.create<ScalarAndOp>(loc, sub, mask);
+      result    = rewriter.create<ScalarAddOp>(loc, a, sel);
+    }
+    // Store scalar max via sw.
+    auto resultAddr = createI32Const(loc, (int32_t)(kTcmBase + kResultSlot * kTcmSlot), rewriter);
+    rewriter.create<ScalarSwOp>(loc, result, resultAddr);
+    rewriter.replaceOp(op, carrier(op, rewriter, result));
     return mlir::success();
   }
 };

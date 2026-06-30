@@ -232,6 +232,18 @@ def VRedSumOp : CoralNPU_Op<"vredsum", [Pure]> {
   let assemblyFormat = "$vector attr-dict `:` type($result)";
 }
 
+def VRedMaxOp : CoralNPU_Op<"vredmax", [Pure]> {
+  let summary = "Vector reduction max (vector→scalar)";
+  let description = [{
+    Reduces all elements of a vector register to the maximum scalar value.
+    Used as the building block for max_pool2d operations.
+    Maps to vredmax.vs (signed) on RISC-V.
+  }];
+  let arguments = (ins I32:$vector);
+  let results = (outs I32:$result);
+  let assemblyFormat = "$vector attr-dict `:` type($result)";
+}
+
 def VDotOp : CoralNPU_Op<"vdot", [Pure]> {
   let summary = "Vector dot product (4×int8→int32)";
   let description = [{

@@ -249,6 +249,17 @@ static void emitInstruction(mlir::Operation *op, llvm::raw_ostream &os) {
          << getVReg(op, "vreg_out_0") << "\n";
   }
 
+  else if (mlir::isa<VRedMaxOp>(op)) {
+    // Zero-initialize accumulator: vredmax.vs vD,vS,vD with vD[0]=0 gives
+    // max(vS) when inputs are non-negative (typical for i32 pooling).
+    os << "vmv.v.i " << getVReg(op, "vreg_out_0") << ", 0\n";
+    os << "vredmax.vs " << getVReg(op, "vreg_out_0") << ", "
+       << getVReg(op, "vreg_0") << ", " << getVReg(op, "vreg_out_0") << "\n";
+    if (op->getDiscardableAttr("xmove_out_0"))
+      os << "vmv.x.s " << getXReg(op, "xmove_out_0") << ", "
+         << getVReg(op, "vreg_out_0") << "\n";
+  }
+
   // ---- Vector loads (RVV unit-stride) ----
   else if (mlir::isa<VLE8Op>(op))
     os << "vle8.v  " << getVReg(op, "vreg_out_0") << ", ("
@@ -464,6 +475,8 @@ static uint32_t encodeBinary(mlir::Operation *op) {
     return 0x94000057 | (rd() << 7);  // vmul.vv (first step of vdot)
   if (mlir::isa<VRedSumOp>(op))
     return 0x02000057 | (rd() << 7);  // vredsum.vs (approx)
+  if (mlir::isa<VRedMaxOp>(op))
+    return 0x04002057 | (rd() << 7);  // vredmax.vs (signed)
   if (mlir::isa<VLE8Op>(op))
     return 0x00000007 | (rd() << 7);  // vle8.v v0
   if (mlir::isa<VLE16Op>(op))
@@ -542,7 +555,7 @@ struct CoralNPUEmitAssemblyPass
         if (op.getDialect() && op.getDialect()->getNamespace() == "coralnpu") {
           if (mlir::isa<VAddOp, VSubOp, VMulOp, VWAddOp, VDotOp,
                         VLE8Op, VLE16Op, VLE32Op, VSE8Op, VSE16Op, VSE32Op,
-                        VRedSumOp>(&op)) {
+                        VRedSumOp, VRedMaxOp>(&op)) {
             llvm::outs() << "vsetivli x0, 16, e32, m1, ta, ma  # auto vsetvl\n";
             nInsn++;
           }
