@@ -237,7 +237,7 @@ static void computeLiveness(mlir::Operation *root,
     auto *defOp = valuePos.first.getDefiningOp();
     lr.isVector = mlir::isa<VLE8Op, VLE16Op, VLE32Op,
                             VSE8Op, VSE16Op, VSE32Op,
-                            VAddOp, VSubOp, VMulOp, VWAddOp, VDotOp, VRedSumOp, VRedMaxOp,
+                            VAddOp, VSubOp, VMulOp, VWAddOp, VDotOp, VRedSumOp, VRedMaxOp, VMaxVXOp,
                             VSetVLOp,
                             OuterProductOp, AConvOp, AccReadOp>(defOp);
     out.push_back(lr);

@@ -408,12 +408,18 @@ struct TosaClampLowering : public mlir::OpRewritePattern<mlir::tosa::ClampOp> {
       return mlir::failure();
 
     auto loc = op.getLoc();
-    auto sewLmul = pickVConfig(tensorElementType(op.getResult()));
-    rewriter.create<VSetVLOp>(loc, sewLmul.first, sewLmul.second);
-    // ReLU = max(x, 0). Emitted as slt + select-style sequence.
-    auto c0 = createI32Const(loc, 0, rewriter);
-    auto slt = rewriter.create<ScalarSltOp>(loc, c0, c0);
-    rewriter.replaceOp(op, carrier(op, rewriter, slt.getResult()));
+    auto sew = pickVConfig(tensorElementType(op.getResult())).first;
+    rewriter.create<VSetVLOp>(loc, sew, LMUL::M1);
+    // ReLU = max(x, 0) per element, applied tile-by-tile.
+    // getTiles loads input into k register-sized tiles; VMaxVXOp emits
+    // vmax.vx v_out, v_in, x0 which is signed-max with zero (= ReLU).
+    int64_t n = numElements(op.getResult());
+    auto tiles = getTiles(op.getInput(), sew, rewriter, loc);
+    llvm::SmallVector<mlir::Value> res;
+    for (auto tile : tiles)
+      res.push_back(rewriter.create<VMaxVXOp>(loc, tile).getResult());
+    storeTiles(res, sew, n, rewriter, loc);
+    rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
     return mlir::success();
   }
 };

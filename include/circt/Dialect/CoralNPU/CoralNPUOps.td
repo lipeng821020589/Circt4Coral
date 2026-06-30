@@ -244,6 +244,18 @@ def VRedMaxOp : CoralNPU_Op<"vredmax", [Pure]> {
   let assemblyFormat = "$vector attr-dict `:` type($result)";
 }
 
+def VMaxVXOp : CoralNPU_Op<"vmax_vx", [Pure]> {
+  let summary = "Vector-scalar signed max (ReLU: max(v, 0))";
+  let description = [{
+    Per-element signed max of a vector register against a scalar.
+    When the scalar is zero (x0), this implements ReLU.
+    Maps to vmax.vx v_out, v_in, x0.
+  }];
+  let arguments = (ins I32:$vector);
+  let results = (outs I32:$result);
+  let assemblyFormat = "$vector attr-dict `:` type($result)";
+}
+
 def VDotOp : CoralNPU_Op<"vdot", [Pure]> {
   let summary = "Vector dot product (4×int8→int32)";
   let description = [{

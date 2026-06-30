@@ -259,6 +259,12 @@ static void emitInstruction(mlir::Operation *op, llvm::raw_ostream &os) {
       os << "vmv.x.s " << getXReg(op, "xmove_out_0") << ", "
          << getVReg(op, "vreg_out_0") << "\n";
   }
+  else if (mlir::isa<VMaxVXOp>(op)) {
+    // ReLU: vmax.vx v_out, v_in, x0  (signed max with zero scalar)
+    os << "vmax.vx " << getVReg(op, "vreg_out_0") << ", "
+       << getVReg(op, "vreg_0") << ", x0\n";
+  }
+
 
   // ---- Vector loads (RVV unit-stride) ----
   else if (mlir::isa<VLE8Op>(op))
@@ -477,6 +483,8 @@ static uint32_t encodeBinary(mlir::Operation *op) {
     return 0x02000057 | (rd() << 7);  // vredsum.vs (approx)
   if (mlir::isa<VRedMaxOp>(op))
     return 0x04002057 | (rd() << 7);  // vredmax.vs (signed)
+  if (mlir::isa<VMaxVXOp>(op))
+    return 0x12004057 | (rd() << 7);  // vmax.vx v0, v0, x0
   if (mlir::isa<VLE8Op>(op))
     return 0x00000007 | (rd() << 7);  // vle8.v v0
   if (mlir::isa<VLE16Op>(op))
@@ -555,7 +563,7 @@ struct CoralNPUEmitAssemblyPass
         if (op.getDialect() && op.getDialect()->getNamespace() == "coralnpu") {
           if (mlir::isa<VAddOp, VSubOp, VMulOp, VWAddOp, VDotOp,
                         VLE8Op, VLE16Op, VLE32Op, VSE8Op, VSE16Op, VSE32Op,
-                        VRedSumOp, VRedMaxOp>(&op)) {
+                        VRedSumOp, VRedMaxOp, VMaxVXOp>(&op)) {
             llvm::outs() << "vsetivli x0, 16, e32, m1, ta, ma  # auto vsetvl\n";
             nInsn++;
           }
