@@ -616,7 +616,10 @@ struct TosaAvgPool2dLowering : public mlir::OpRewritePattern<mlir::tosa::AvgPool
       area = 1;
     auto div = rewriter.create<ScalarDivOp>(
         loc, sum, createI32Const(loc, (int32_t)area, rewriter));
-    storeResult(div.getResult(), op, rewriter);
+    // Store the scalar div result via sw (not VSE32Op which expects a vreg).
+    // kResultSlot is the TCM slot for the output tensor.
+    auto resultAddr = createI32Const(loc, (int32_t)(kTcmBase + kResultSlot * kTcmSlot), rewriter);
+    rewriter.create<ScalarSwOp>(loc, div.getResult(), resultAddr);
     rewriter.replaceOp(op, carrier(op, rewriter, div.getResult()));
     return mlir::success();
   }

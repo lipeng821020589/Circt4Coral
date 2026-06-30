@@ -22,7 +22,7 @@
 // CHECK: %[[P1:.*]] = coralnpu.vredsum %[[T1]]
 // CHECK: %[[SUM:.*]] = coralnpu.add %[[P0]], %[[P1]]
 // CHECK: %{{.*}} = coralnpu.div %[[SUM]]
-// CHECK: coralnpu.vse32
+// CHECK: coralnpu.sw
 func.func @avgpool_tiled(%in: tensor<1x2x2x2xi32>, %izp: tensor<1xi32>, %ozp: tensor<1xi32>) -> tensor<1x1x1x2xi32> {
   %0 = tosa.avg_pool2d %in, %izp, %ozp {acc_type = i32, kernel = array<i64: 2, 2>, stride = array<i64: 2, 2>, pad = array<i64: 0, 0, 0, 0>} : (tensor<1x2x2x2xi32>, tensor<1xi32>, tensor<1xi32>) -> tensor<1x1x1x2xi32>
   func.return %0 : tensor<1x1x1x2xi32>

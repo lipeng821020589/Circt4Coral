@@ -236,6 +236,9 @@ static void emitInstruction(mlir::Operation *op, llvm::raw_ostream &os) {
        << "vfredsum.vs " << getVReg(op, "vreg_out_0") << ", v0, "
        << getVReg(op, "vreg_out_0") << "  # vdot step 2: reduce sum\n";
   } else if (mlir::isa<VRedSumOp>(op)) {
+    // Zero-initialize the accumulator register before reduction so that
+    // vredsum.vs vD, vS, vD gives sum(vS) not sum(vS) + stale_vD[0].
+    os << "vmv.v.i " << getVReg(op, "vreg_out_0") << ", 0\n";
     os << "vredsum.vs " << getVReg(op, "vreg_out_0") << ", "
        << getVReg(op, "vreg_0") << ", " << getVReg(op, "vreg_out_0") << "\n";
     // vredsum.vs leaves the reduction in vector-register lane 0. If a scalar
