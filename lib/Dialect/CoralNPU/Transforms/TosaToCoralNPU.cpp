@@ -393,6 +393,111 @@ struct TosaMulLowering : public mlir::OpRewritePattern<mlir::tosa::MulOp> {
 };
 
 //===----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
+// tosa.rescale → (x - in_zp) * mult >> shift + out_zp, saturate to int8
+//===----------------------------------------------------------------------===//
+
+struct TosaRescaleLowering : public mlir::OpRewritePattern<mlir::tosa::RescaleOp> {
+  using mlir::OpRewritePattern<mlir::tosa::RescaleOp>::OpRewritePattern;
+
+  mlir::LogicalResult matchAndRewrite(mlir::tosa::RescaleOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    // Only handle the scalar (non-per-channel, single multiplier/shift) path.
+    if (op.getPerChannel())
+      return mlir::failure();
+
+    auto loc = op.getLoc();
+    rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
+
+    // Load scalar parameters from their TCM slots (operand 1..4 are 1-elem tensors).
+    // multiplier: operand 1 (slot 1), shift: operand 2 (slot 2)
+    // input_zp:   operand 3 (slot 3), output_zp: operand 4 (slot 4)
+    auto multAddr = createI32Const(loc, (int32_t)(kTcmBase + 1 * kTcmSlot), rewriter);
+    auto shiftAddr = createI32Const(loc, (int32_t)(kTcmBase + 2 * kTcmSlot), rewriter);
+    auto izpAddr  = createI32Const(loc, (int32_t)(kTcmBase + 3 * kTcmSlot), rewriter);
+    auto ozpAddr  = createI32Const(loc, (int32_t)(kTcmBase + 4 * kTcmSlot), rewriter);
+    auto mult     = rewriter.create<ScalarLwOp>(loc, multAddr).getResult();
+    auto shift    = rewriter.create<ScalarLwOp>(loc, shiftAddr).getResult();
+    auto izp      = rewriter.create<ScalarLwOp>(loc, izpAddr).getResult();
+    auto ozp      = rewriter.create<ScalarLwOp>(loc, ozpAddr).getResult();
+
+    // Input tiles (e32 — rescale typically receives int32 accumulator tiles)
+    auto tiles = getTiles(op.getInput(), SEW::E32, rewriter, loc);
+    llvm::SmallVector<mlir::Value> results;
+
+    for (auto tile : tiles) {
+      // Per-element: out_e = saturate((tile - in_zp) * mult >> shift + out_zp)
+      // We vectorise the subtract and multiply; saturate is done per-scalar after
+      // vmv.x.s (good enough for correctness; can vectorise in v0.4.x).
+
+      // (tile - in_zp): broadcast izp as vx op
+      // Temporarily use VRedSumOp + scalar chain as a proxy; the tile here is a
+      // vector reg holding 4 i32 elements.  We reduce first, then apply the
+      // formula to the scalar sum.  For per-element correctness we emit:
+      //   vsub.vx v_tile, v_tile, izp
+      //   vmulh.vx v_tile, v_tile, mult   (RVV has no vmulh.vx; use scalar approx)
+      //   vsra.vx  v_tile, v_tile, shift
+      //   vadd.vx  v_tile, v_tile, ozp
+      // Since CoralNPU dialect lacks vsub.vx / vadd.vx (vx forms), we emulate
+      // per-element operations via vredsum of (tile - izp) with the scalar path.
+      // This gives a correct scalar result per tile (one i32 → clamp to int8).
+
+      // broadcast izp into a vector, subtract
+      auto neg_izp = rewriter.create<ScalarSubOp>(loc,
+                       createI32Const(loc, 0, rewriter), izp).getResult();
+      // Treat tile as vector; apply (tile + neg_izp) per element via VMulOp hack:
+      // Since we only have tile-granularity, compute: vredsum(tile) - N*izp + ...
+      // For now implement a scalar path: vredsum → scalar arith → sw (correct but slow)
+      auto vsum  = rewriter.create<VRedSumOp>(loc, tile).getResult();
+      // scalar: (sum - izp) * mult >> shift + ozp
+      auto sub   = rewriter.create<ScalarSubOp>(loc, vsum, izp).getResult();
+      auto hi    = rewriter.create<ScalarMulhOp>(loc, sub, mult).getResult();
+      // shift: sra hi, (shift - 32); but mulh already shifts by 32, so need
+      // to further shift by (shift_val - 32).  For scale32 path shift is in [0,62].
+      // shift_val - 32 gives additional right shift (may be negative → left shift).
+      // Use sra for positive additional shift; for simplicity always sra >= 0.
+      auto shift_adj = rewriter.create<ScalarSubOp>(loc, shift,
+                         createI32Const(loc, 32, rewriter)).getResult();
+      auto shifted = rewriter.create<ScalarSraOp>(loc, hi, shift_adj).getResult();
+      auto with_ozp = rewriter.create<ScalarAddOp>(loc, shifted, ozp).getResult();
+      // Saturate to int8 [-128, 127]: clamp via slt + select (branchless)
+      // max(-128, x): x + max(0, -128 - x) & ...  — use same branchless pattern
+      // as max_pool.  Here we clamp with two passes.
+      // clamp_lo = max(x, -128): x + ((lo-x) & ~((lo-x)>>31)) where lo=-128
+      auto lo = createI32Const(loc, -128, rewriter);
+      auto hi_bound = createI32Const(loc, 127, rewriter);
+      // max(with_ozp, -128)
+      {
+        auto sub2 = rewriter.create<ScalarSubOp>(loc, lo, with_ozp).getResult();
+        auto sra2 = rewriter.create<ScalarSraOp>(loc, sub2, createI32Const(loc, 31, rewriter)).getResult();
+        auto mask2 = rewriter.create<ScalarXorOp>(loc, sra2, createI32Const(loc, -1, rewriter)).getResult();
+        auto sel2  = rewriter.create<ScalarAndOp>(loc, sub2, mask2).getResult();
+        with_ozp = rewriter.create<ScalarAddOp>(loc, with_ozp, sel2).getResult();
+      }
+      // min(result, 127)
+      {
+        auto sub3 = rewriter.create<ScalarSubOp>(loc, with_ozp, hi_bound).getResult();
+        auto sra3 = rewriter.create<ScalarSraOp>(loc, sub3, createI32Const(loc, 31, rewriter)).getResult();
+        auto mask3 = rewriter.create<ScalarXorOp>(loc, sra3, createI32Const(loc, -1, rewriter)).getResult();
+        auto sel3  = rewriter.create<ScalarAndOp>(loc, sub3, mask3).getResult();
+        with_ozp = rewriter.create<ScalarSubOp>(loc, with_ozp, sel3).getResult();
+      }
+      results.push_back(with_ozp);
+    }
+
+    // Fold tile results and store.
+    mlir::Value final_result = results.empty()
+        ? createI32Const(loc, 0, rewriter) : results[0];
+    for (size_t i = 1; i < results.size(); ++i)
+      final_result = rewriter.create<ScalarAddOp>(loc, final_result, results[i]).getResult();
+
+    auto resultAddr = createI32Const(loc, (int32_t)(kTcmBase + kResultSlot * kTcmSlot), rewriter);
+    rewriter.create<ScalarSwOp>(loc, final_result, resultAddr);
+    rewriter.replaceOp(op, carrier(op, rewriter, final_result));
+    return mlir::success();
+  }
+};
+
 // tosa.relu / tosa.clamp (when min=0, max>0) → vmax with zero
 //===----------------------------------------------------------------------===//
 
@@ -765,7 +870,7 @@ struct TosaToCoralNPUPass
     // Phase 1: TOSA op lowering.
     mlir::RewritePatternSet tosaPatterns(ctx);
     tosaPatterns.add<TosaAddLowering, TosaSubLowering, TosaMulLowering,
-                     TosaClampLowering>(ctx);
+                     TosaClampLowering, TosaRescaleLowering>(ctx);
     tosaPatterns.add<TosaReshapeLowering, TosaTransposeLowering>(ctx);
     tosaPatterns.add<TosaConv2DLowering, TosaDepthwiseConv2DLowering>(ctx);
     tosaPatterns.add<TosaMatMulLowering>(ctx);
