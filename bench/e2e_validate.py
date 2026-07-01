@@ -568,8 +568,95 @@ func.func @dw(%in: tensor<1x1x1x4xi8>, %wt: tensor<1x1x4x1xi8>,
             elf_path.unlink()
 
 
+def test_scalar_mulh_rem():
+    print("\n=== TEST 7: scalar mulh + rem ===")
+    # Use coralnpu.li to embed literals directly — avoids function-arg regalloc issues
+    # mulh(17,5) = high32(85) = 0; rem(17,5) = 2; result = add(0,2) = 2
+    mlir = """\
+func.func @test_mulh_rem() -> i32 {
+  %a   = coralnpu.li 17 : i32
+  %b   = coralnpu.li 5  : i32
+  %h   = coralnpu.mulh %a, %b : i32
+  %r   = coralnpu.rem  %a, %b : i32
+  %s   = coralnpu.add  %h, %r : i32
+  coralnpu.return %s : i32
+}
+"""
+    passes = ["--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+
+    circt_out = run_circt_opt(mlir, passes)
+    insns = extract_asm_instructions(circt_out)
+
+    a, b = 17, 5
+    expected = 0 + (a % b)  # mulh(17,5)=0, rem(17,5)=2 → 2
+
+    prologue = [
+        ".section .text",
+        ".globl _start",
+        "_start:",
+    ]
+
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        # Use non-vector ISA for scalar-only test
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".S", delete=False) as af:
+            af.write(full_asm)
+            asm_file = Path(af.name)
+        obj_file = asm_file.with_suffix(".o")
+        ld_file  = asm_file.with_suffix(".ld")
+        ld_file.write_text(LINKER_SCRIPT)
+        import subprocess as _sp
+        r = _sp.run(["riscv64-unknown-elf-as", "-march=rv32im_zicsr", "-mabi=ilp32",
+                     "-o", str(obj_file), str(asm_file)],
+                    capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"as failed: {r.stderr[:200]}\nSource:\n{full_asm[:400]}")
+        r = _sp.run(["riscv64-unknown-elf-ld", "-m", "elf32lriscv", "--no-dynamic-linker",
+                     "-static", "-e", "_start", "-T", str(ld_file),
+                     "-o", str(elf_path), str(obj_file)],
+                    capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"ld failed: {r.stderr}")
+        for p in [asm_file, obj_file, ld_file]:
+            if p.exists(): p.unlink()
+
+        # patch3 dumps all GPRs when ebreak executes.
+        # We run until ebreak (which triggers the dump), parse x1 = final result.
+        # extract_asm replaces `ret` with `ebreak`, so `add x1,x3,x4` is last real insn.
+        ebreak_addr = _get_ebreak_addr(elf_path)
+        cmd = f"until pc 0 {ebreak_addr:#x}\nquit\n"
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".spk", delete=False) as sf:
+            sf.write(cmd); spk = Path(sf.name)
+        r = _sp.run([str(SPIKE), "--isa=rv32im_zicsr", "--priv=m",
+                     f"-m{SPIKE_MEM}", "-d", f"--debug-cmd={spk}", str(elf_path)],
+                    capture_output=True, text=True, timeout=15)
+        spk.unlink()
+        # Parse all GPR values from spike output
+        gprs = {}
+        for line in (r.stderr + r.stdout).split("\n"):
+            for reg in range(32):
+                tag = f"GPR[{reg}] = "
+                if tag in line:
+                    try: gprs[reg] = int(line.split("=")[1].strip(), 16)
+                    except: pass
+        # x1 has the final `add x1, x3, x4` result (set by last instruction before ebreak)
+        gpr_val = gprs.get(1, None)
+        if gpr_val is None:
+            raise RuntimeError(f"x1 not found; all GPRs={gprs}")
+        check_result(f"mulh({a},{b})+rem({a},{b}) expect={expected}",
+                     [gpr_val], [expected])
+    except Exception as e:
+        print(f"  [ERROR] {e}")
+        COUNTS['fail'] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
+
 def test_csr_outer_product():
-    print("\n=== TEST 7: CSR codegen (outer_product → KSCM/KISA csrw) ===")
+    print("\n=== TEST 8: CSR codegen (outer_product → KSCM/KISA csrw) ===")
     mlir = """\
 func.func @demo_outer_product() -> i32 {
   %a = coralnpu.li 2 : i32
@@ -670,6 +757,7 @@ if __name__ == "__main__":
     test_avgpool()
     test_max_pool()
     test_depthwise_conv2d()
+    test_scalar_mulh_rem()
     test_csr_outer_product()
 
     print(f"\n{'='*50}")

@@ -47,6 +47,27 @@ def ScalarDivOp : CoralNPU_Op<"div", [Pure, SameTypeOperands, SameOperandsAndRes
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($result)";
 }
 
+def ScalarMulhOp : CoralNPU_Op<"mulh", [Pure, SameTypeOperands, SameOperandsAndResultType]> {
+  let summary = "Scalar mulh: high 32 bits of signed 32x32 product";
+  let arguments = (ins I32:$lhs, I32:$rhs);
+  let results = (outs I32:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($result)";
+}
+
+def ScalarMulhsuOp : CoralNPU_Op<"mulhsu", [Pure, SameTypeOperands, SameOperandsAndResultType]> {
+  let summary = "Scalar mulhsu: high 32 bits of signed-unsigned 32x32";
+  let arguments = (ins I32:$lhs, I32:$rhs);
+  let results = (outs I32:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($result)";
+}
+
+def ScalarRemOp : CoralNPU_Op<"rem", [Pure, SameTypeOperands, SameOperandsAndResultType]> {
+  let summary = "Scalar signed remainder (RV32M rem)";
+  let arguments = (ins I32:$lhs, I32:$rhs);
+  let results = (outs I32:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($result)";
+}
+
 // --- Scalar bitwise ---
 
 def ScalarAndOp : CoralNPU_Op<"and", [Pure, SameTypeOperands, SameOperandsAndResultType]> {

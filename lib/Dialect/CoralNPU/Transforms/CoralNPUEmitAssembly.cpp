@@ -153,6 +153,15 @@ static void emitInstruction(mlir::Operation *op, llvm::raw_ostream &os) {
   } else if (mlir::isa<ScalarDivOp>(op))
     os << "div    " << getXReg(op, "xreg_out_0") << ", "
        << getXReg(op, "xreg_0") << ", " << getXReg(op, "xreg_1") << "\n";
+  else if (mlir::isa<ScalarMulhOp>(op))
+    os << "mulh   " << getXReg(op, "xreg_out_0") << ", "
+       << getXReg(op, "xreg_0") << ", " << getXReg(op, "xreg_1") << "\n";
+  else if (mlir::isa<ScalarMulhsuOp>(op))
+    os << "mulhsu " << getXReg(op, "xreg_out_0") << ", "
+       << getXReg(op, "xreg_0") << ", " << getXReg(op, "xreg_1") << "\n";
+  else if (mlir::isa<ScalarRemOp>(op))
+    os << "rem    " << getXReg(op, "xreg_out_0") << ", "
+       << getXReg(op, "xreg_0") << ", " << getXReg(op, "xreg_1") << "\n";
   else if (mlir::isa<ScalarAndOp>(op))
     os << "and    " << getXReg(op, "xreg_out_0") << ", "
        << getXReg(op, "xreg_0") << ", " << getXReg(op, "xreg_1") << "\n";
@@ -423,6 +432,12 @@ static uint32_t encodeBinary(mlir::Operation *op) {
     return encR(Opcode::OP, rd(), Funct3::MUL_DIV, rs1(), rs2(), Funct7::MULDIV);
   if (mlir::isa<ScalarDivOp>(op))
     return encR(Opcode::OP, rd(), 0b100, rs1(), rs2(), Funct7::MULDIV);
+  if (mlir::isa<ScalarMulhOp>(op))
+    return encR(Opcode::OP, rd(), 0b001, rs1(), rs2(), Funct7::MULDIV);
+  if (mlir::isa<ScalarMulhsuOp>(op))
+    return encR(Opcode::OP, rd(), 0b010, rs1(), rs2(), Funct7::MULDIV);
+  if (mlir::isa<ScalarRemOp>(op))
+    return encR(Opcode::OP, rd(), 0b110, rs1(), rs2(), Funct7::MULDIV);
   if (mlir::isa<ScalarAndOp>(op))
     return encR(Opcode::OP, rd(), Funct3::AND, rs1(), rs2(), Funct7::BASE);
   if (mlir::isa<ScalarOrOp>(op))
