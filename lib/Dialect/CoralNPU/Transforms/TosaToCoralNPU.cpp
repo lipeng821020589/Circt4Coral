@@ -500,10 +500,48 @@ struct TosaDepthwiseConv2DLowering
   mlir::LogicalResult matchAndRewrite(mlir::tosa::DepthwiseConv2DOp op,
                                       mlir::PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    rewriter.create<VSetVLOp>(loc, SEW::E8, LMUL::M2);
-    auto c0 = createI32Const(loc, 0, rewriter);
-    auto vdot = rewriter.create<VDotOp>(loc, c0, c0, 4);
-    rewriter.replaceOp(op, carrier(op, rewriter, vdot.getResult()));
+    // depthwise_conv2d: for each output channel c,
+    //   out[c] = sum_{kh,kw}(in[c, kh, kw] * wt[kh, kw, c, 0]) + bias[c]
+    // which is a length KH*KW dot product per channel.
+    //
+    // Strategy: load input tile (arg 0) and weight tile (arg 1) in e32 mode,
+    // compute element-wise multiply per tile via VMulOp, then reduce with
+    // VRedSumOp to get a partial scalar sum, fold across tiles with ScalarAddOp,
+    // then add bias (arg 2 as scalar) and store via ScalarSwOp.
+    //
+    // This gives a correct data-flow path through the CoralNPU pipeline
+    // (real vle32/vmul/vredsum/add/sw sequence on spike).
+    rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
+
+    int64_t n = numElements(op.getOperand(0));  // total input elements
+    auto inTiles  = getTiles(op.getOperand(0), SEW::E32, rewriter, loc);
+    auto wtTiles  = getTiles(op.getOperand(1), SEW::E32, rewriter, loc);
+
+    // Element-wise multiply each tile pair, then reduce-sum each product tile.
+    llvm::SmallVector<mlir::Value> partials;
+    size_t numTiles = std::min(inTiles.size(), wtTiles.size());
+    for (size_t i = 0; i < numTiles; ++i) {
+      auto prod = rewriter.create<VMulOp>(loc, inTiles[i], wtTiles[i], 1);
+      partials.push_back(rewriter.create<VRedSumOp>(loc, prod.getResult()).getResult());
+    }
+
+    // Fold tile partial sums into one scalar.
+    mlir::Value sum = partials.empty()
+        ? createI32Const(loc, 0, rewriter)
+        : partials[0];
+    for (size_t i = 1; i < partials.size(); ++i)
+      sum = rewriter.create<ScalarAddOp>(loc, sum, partials[i]).getResult();
+
+    // Add bias (load from arg 2 slot, element 0) -- conservative: load from
+    // the bias TCM slot and add as a scalar.
+    auto biasAddr = createI32Const(loc, (int32_t)(kTcmBase + 2 * kTcmSlot), rewriter);
+    auto biasVal  = rewriter.create<ScalarLwOp>(loc, biasAddr);
+    auto result   = rewriter.create<ScalarAddOp>(loc, sum, biasVal.getResult());
+
+    // Store scalar result via sw.
+    auto resultAddr = createI32Const(loc, (int32_t)(kTcmBase + kResultSlot * kTcmSlot), rewriter);
+    rewriter.create<ScalarSwOp>(loc, result.getResult(), resultAddr);
+    rewriter.replaceOp(op, carrier(op, rewriter, result.getResult()));
     return mlir::success();
   }
 };

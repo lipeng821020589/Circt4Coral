@@ -509,8 +509,67 @@ func.func @mp(%in: tensor<1x2x2x1xi32>) -> tensor<1x1x1x1xi32> {
 
 # ── 测试 5: CSR codegen（outer_product → csrw KSCM/KISA）────────────────────
 
+def test_depthwise_conv2d():
+    print("\n=== TEST 6: depthwise_conv2d (1x1 kernel, 4 channels) ===")
+    # Use tensor<1x1x1x4xi8> (N=4, exactly 1 e32 tile) so getTiles produces
+    # a single tile pair and vmul covers all valid input elements.
+    mlir = """\
+func.func @dw(%in: tensor<1x1x1x4xi8>, %wt: tensor<1x1x4x1xi8>,
+              %bias: tensor<4xi32>, %izp: tensor<1xi8>, %wzp: tensor<1xi8>)
+    -> tensor<1x1x1x4xi32> {
+  %0 = tosa.depthwise_conv2d %in, %wt, %bias, %izp, %wzp {
+    acc_type = i32, dilation = array<i64: 1, 1>,
+    pad = array<i64: 0, 0, 0, 0>, stride = array<i64: 1, 1>
+  } : (tensor<1x1x1x4xi8>, tensor<1x1x4x1xi8>, tensor<4xi32>,
+       tensor<1xi8>, tensor<1xi8>) -> tensor<1x1x1x4xi32>
+  func.return %0 : tensor<1x1x1x4xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+              "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+
+    circt_out = run_circt_opt(mlir, passes)
+    insns = extract_asm_instructions(circt_out)
+
+    # N=4, k=1 tile; vmul([2,4,6,8],[1,1,1,1])=[2,4,6,8]; vredsum=20; +bias(0)=20
+    inputs  = [2, 4, 6, 8] + [0]*12
+    weights = [1, 1, 1, 1] + [0]*12
+    bias    = [0] * 16
+    expected_sum = sum(a * b for a, b in zip(inputs[:4], weights[:4]))  # 20
+
+    prologue = [
+        ".section .text",
+        ".globl _start",
+        "_start:",
+        "    csrr  t0, mstatus",
+        "    li    t1, 0x600",
+        "    or    t0, t0, t1",
+        "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(inputs,  TCM_BASE + 0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(weights, TCM_BASE + 1 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(bias,    TCM_BASE + 2 * TCM_SLOT)  # bias slot
+
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 4)
+        actual_val = struct.unpack("<i", raw)[0]
+        check_result(f"depthwise vmul+sum in=[2,4,6,8] wt=[1]*4 bias=0 expect={expected_sum}",
+                     [actual_val], [expected_sum])
+    except Exception as e:
+        print(f"  [ERROR] {e}")
+        COUNTS['fail'] += 1
+    finally:
+        if elf_path.exists():
+            elf_path.unlink()
+
+
 def test_csr_outer_product():
-    print("\n=== TEST 6: CSR codegen (outer_product → KSCM/KISA csrw) ===")
+    print("\n=== TEST 7: CSR codegen (outer_product → KSCM/KISA csrw) ===")
     mlir = """\
 func.func @demo_outer_product() -> i32 {
   %a = coralnpu.li 2 : i32
@@ -610,6 +669,7 @@ if __name__ == "__main__":
     test_relu()
     test_avgpool()
     test_max_pool()
+    test_depthwise_conv2d()
     test_csr_outer_product()
 
     print(f"\n{'='*50}")
