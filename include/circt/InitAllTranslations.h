@@ -22,6 +22,7 @@
 #include "circt/Dialect/MSFT/ExportTcl.h"
 #include "circt/Target/DebugInfo.h"
 #include "circt/Target/ExportSystemC.h"
+#include "circt/Dialect/CoralNPU/CoralNPUPasses.h"
 #include "mlir/Target/SMTLIB/ExportSMTLIB.h"
 
 #ifndef CIRCT_INITALLTRANSLATIONS_H
@@ -43,6 +44,7 @@ inline void registerAllTranslations() {
     debug::registerTranslations();
     aiger::registerImportAIGERTranslation();
     aiger::registerExportAIGERTranslation();
+    coralnpu::registerExportCoralNPUTranslation();
     liberty::registerImportLibertyTranslation();
     return true;
   }();

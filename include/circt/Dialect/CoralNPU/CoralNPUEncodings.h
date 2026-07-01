@@ -94,7 +94,9 @@ constexpr uint8_t VSUB   = 0b001;
 constexpr uint8_t VMUL   = 0b010;
 constexpr uint8_t VDOT   = 0b011;
 constexpr uint8_t VWADD  = 0b100;
-constexpr uint8_t VREDSUM = 0b101;
+constexpr uint8_t VREDSUM  = 0b101;
+constexpr uint8_t VREDMAX  = 0b110;  // signed integer max reduction
+constexpr uint8_t VMAXVX   = 0b111;  // vector-scalar signed max (ReLU)
 constexpr uint8_t VLE    = 0b000; // funct7: 0=8b, 1=16b, 2=32b
 constexpr uint8_t VSE    = 0b001; // funct7: 0=8b, 1=16b, 2=32b
 

@@ -7,6 +7,7 @@
 
 #include "circt/Dialect/CoralNPU/CoralNPUEncodings.h"
 #include "circt/Dialect/CoralNPU/CoralNPUOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "circt/Dialect/CoralNPU/CoralNPUPasses.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Support/FileUtilities.h"
@@ -146,6 +147,18 @@ public:
         emit32(encodeRType(Opcode::OP, getRd(op), 0b100,
                            getRs1(op), getRs2(op), Funct7::MULDIV));
       })
+      .Case<ScalarMulhOp>([&](auto) {
+        emit32(encodeRType(Opcode::OP, getRd(op), 0b001,
+                           getRs1(op), getRs2(op), Funct7::MULDIV));
+      })
+      .Case<ScalarMulhsuOp>([&](auto) {
+        emit32(encodeRType(Opcode::OP, getRd(op), 0b010,
+                           getRs1(op), getRs2(op), Funct7::MULDIV));
+      })
+      .Case<ScalarRemOp>([&](auto) {
+        emit32(encodeRType(Opcode::OP, getRd(op), 0b110,
+                           getRs1(op), getRs2(op), Funct7::MULDIV));
+      })
       .Case<ScalarLiOp>([&](auto liOp) {
         int32_t imm = liOp.getValue();
         emit32(encodeIType(Opcode::OP_IMM, getRd(op), 0b000,
@@ -198,6 +211,12 @@ public:
       .Case<VRedSumOp>([&](auto) {
         emit32(encodeRType(Opcode::CUSTOM_VEC, 0, NPUFunct3::VREDSUM, 0, 0, 0));
       })
+      .Case<VRedMaxOp>([&](auto) {
+        emit32(encodeRType(Opcode::CUSTOM_VEC, 0, NPUFunct3::VREDMAX, 0, 0, 0));
+      })
+      .Case<VMaxVXOp>([&](auto) {
+        emit32(encodeRType(Opcode::CUSTOM_VEC, 0, NPUFunct3::VMAXVX, 0, 0, 0));
+      })
       .Case<VLE8Op>([&](auto) {
         emit32(encodeIType(Opcode::CUSTOM_VEC, 0, NPUFunct3::VLE, 0, 0));
       })
@@ -223,6 +242,10 @@ public:
       })
       .Case<DmaStoreOp>([&](auto) {
         emit32(encodeIType(Opcode::CUSTOM_DMA, 0, NPUFunct3::DMA_STORE, 0, 0));
+      })
+      .Case<ReturnOp>([&](auto) {
+        // ret = jalr x0, x1, 0
+        emit32(encodeIType(Opcode::JALR, 0, 0b000, 1, 0));
       })
       .Default([&](auto) {
         // Emit NOP (addi x0, x0, 0) for unsupported ops
@@ -335,8 +358,8 @@ private:
 
 struct ExportCoralNPUPass {
   void runOnOperation(mlir::ModuleOp module, llvm::raw_ostream &os) {
-    os << "; Coral NPU ELF Binary Export\n";
-    os << "; Target: RISC-V + Coral NPU custom extensions\n\n";
+    llvm::errs() << "; Coral NPU ELF Binary Export\n";
+    llvm::errs() << "; Target: RISC-V + Coral NPU custom extensions\n\n";
 
     BinaryEmitter emitter(os);
     unsigned pc = 0;
@@ -348,9 +371,9 @@ struct ExportCoralNPUPass {
       }
     });
 
-    os << "\n; Text section: " << emitter.getTextSize() << " instructions ("
+    llvm::errs() << "\n; Text section: " << emitter.getTextSize() << " instructions ("
        << (emitter.getTextSize() * 4) << " bytes)\n";
-    os << "; ELF file generation: use --export-coralnpu-elf=<filename>\n";
+    llvm::errs() << "; ELF file generation: use --export-coralnpu-elf=<filename>\n";
   }
 };
 
@@ -373,7 +396,7 @@ void registerExportCoralNPUTranslation() {
         return mlir::success();
       },
       [](mlir::DialectRegistry &registry) {
-        registry.insert<CoralNPUDialect>();
+        registry.insert<CoralNPUDialect, mlir::func::FuncDialect>();
       });
 }
 

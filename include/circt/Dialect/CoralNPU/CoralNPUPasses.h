@@ -20,6 +20,9 @@ namespace coralnpu {
 #define GEN_PASS_REGISTRATION
 #include "circt/Dialect/CoralNPU/Passes.h.inc"
 
+/// Register the export-coralnpu translation.
+void registerExportCoralNPUTranslation();
+
 } // namespace coralnpu
 } // namespace circt
 
