@@ -15,11 +15,64 @@
 #include "slang/ast/SemanticFacts.h"
 #include "slang/ast/Statement.h"
 #include "slang/ast/SystemSubroutine.h"
+#include "slang/ast/expressions/MiscExpressions.h"
+#include "slang/ast/symbols/CompilationUnitSymbols.h"
+#include "slang/ast/symbols/InstanceSymbols.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/Support/raw_ostream.h"
 
 using namespace mlir;
 using namespace circt;
 using namespace ImportVerilog;
+
+/// Build the message printed by the `$printtimescale` system task. If a module
+/// instance or `$unit` is passed as argument, report that scope's time scale;
+/// otherwise report the time scale of the current scope.
+static std::string buildPrintTimeScaleMessage(
+    Context &context, std::span<const slang::ast::Expression *const> args) {
+  auto timeScale = context.timeScale;
+  std::string target;
+
+  if (!args.empty()) {
+    if (auto *expr = args[0]->as_if<slang::ast::ArbitrarySymbolExpression>()) {
+      const auto *symbol = expr->symbol.get();
+      if (auto *instance = symbol->as_if<slang::ast::InstanceSymbol>()) {
+        timeScale = instance->body.getTimeScale().value_or(timeScale);
+        target = instance->getHierarchicalPath();
+      } else if (auto *unit =
+                     symbol->as_if<slang::ast::CompilationUnitSymbol>()) {
+        timeScale = unit->getTimeScale().value_or(timeScale);
+        target = "$unit";
+      } else if (symbol->kind == slang::ast::SymbolKind::Root) {
+        target = "$root";
+      }
+    }
+  }
+
+  std::string out;
+  llvm::raw_string_ostream os(out);
+  os << "Time scale";
+  if (!target.empty())
+    os << " of " << target;
+  os << " is " << timeScale.base.toString() << " / "
+     << timeScale.precision.toString() << "\n";
+  return out;
+}
+
+static std::array<Value, 4> getDefaultTimeFormatValues(OpBuilder &builder,
+                                                       Location loc,
+                                                       MLIRContext *context) {
+  auto i32Ty = moore::IntType::getInt(context, 32);
+
+  auto unit = moore::ConstantOp::create(builder, loc, i32Ty, -15);
+  auto precision = moore::ConstantOp::create(builder, loc, i32Ty, 0);
+  auto emptyInt = moore::ConstantStringOp::create(
+      builder, loc, moore::IntType::getInt(context, 0), "");
+  auto suffix = moore::IntToStringOp::create(builder, loc, emptyInt);
+  auto minWidth = moore::ConstantOp::create(builder, loc, i32Ty, 20);
+
+  return {unit, precision, suffix, minWidth};
+}
 
 // NOLINTBEGIN(misc-no-recursion)
 namespace {
@@ -177,26 +230,39 @@ struct StmtVisitor {
 
     // Slang stores all threads of a fork-join block inside a `StatementList`.
     // This cannot be visited normally due to the need to make each statement a
-    // separate thread so must be converted here.
-    auto *threadList = stmt.body.as_if<slang::ast::StatementList>();
-    unsigned int threadCount = threadList ? threadList->list.size() : 1;
+    // separate thread so must be converted here. When only a single statement
+    // is present, Slang does not create a `StatementList`.
+    //
+    // Declarations inside a fork block are block items, not separate forked
+    // processes. Slang stores them in the same `StatementList` as the forked
+    // statements, so convert them in place before creating the fork regions
+    // (their values must dominate all threads) and collect the remaining
+    // statements as the actual threads.
+    SmallVector<const slang::ast::Statement *> items;
+    if (auto *threadList = stmt.body.as_if<slang::ast::StatementList>())
+      items.append(threadList->list.begin(), threadList->list.end());
+    else
+      items.push_back(&stmt.body);
 
-    auto forkOp = moore::ForkJoinOp::create(builder, loc, kind, threadCount);
+    SmallVector<const slang::ast::Statement *> threads;
+    for (auto *item : items) {
+      if (item->as_if<slang::ast::VariableDeclStatement>()) {
+        if (failed(context.convertStatement(*item)))
+          return failure();
+        continue;
+      }
+      threads.push_back(item);
+    }
+    // If the fork contained only declarations, there are no threads to spawn
+    // and the fork degenerates to the declarations themselves. Genuinely
+    // empty forks keep producing an empty fork op.
+    if (threads.empty() && !items.empty())
+      return success();
+
+    auto forkOp = moore::ForkJoinOp::create(builder, loc, kind, threads.size());
     OpBuilder::InsertionGuard guard(builder);
 
-    // When only a single statement is present, Slang does not create a
-    // `StatementList`.
-    if (!threadList) {
-      auto &tBlock = forkOp->getRegion(0).emplaceBlock();
-      builder.setInsertionPointToStart(&tBlock);
-      if (failed(context.convertStatement(stmt.body)))
-        return failure();
-      moore::CompleteOp::create(builder, loc);
-      return success();
-    }
-
-    int i = 0;
-    for (auto *thread : threadList->list) {
+    for (auto [i, thread] : llvm::enumerate(threads)) {
       auto &tBlock = forkOp->getRegion(i).emplaceBlock();
       builder.setInsertionPointToStart(&tBlock);
       // Populate thread operator with thread body and finish with a thread
@@ -204,7 +270,6 @@ struct StmtVisitor {
       if (failed(context.convertStatement(*thread)))
         return failure();
       moore::CompleteOp::create(builder, loc);
-      i++;
     }
     return success();
   }
@@ -327,6 +392,36 @@ struct StmtVisitor {
   LogicalResult visit(const slang::ast::CaseStatement &caseStmt) {
     using slang::ast::AttributeSymbol;
     using slang::ast::CaseStatementCondition;
+    if (auto *caseType =
+            caseStmt.expr.as_if<slang::ast::TypeReferenceExpression>()) {
+      if (caseStmt.condition != CaseStatementCondition::Normal)
+        return mlir::emitError(loc,
+                               "unsupported type reference case condition");
+
+      const slang::ast::Statement *matchedStmt = nullptr;
+      for (const auto &item : caseStmt.items) {
+        for (const auto *expr : item.expressions) {
+          auto *itemType = expr->as_if<slang::ast::TypeReferenceExpression>();
+          if (!itemType)
+            return mlir::emitError(
+                context.convertLocation(expr->sourceRange),
+                "unsupported non-type item in type reference case statement");
+          if (itemType->targetType.isMatching(caseType->targetType)) {
+            matchedStmt = item.stmt;
+            break;
+          }
+        }
+        if (matchedStmt)
+          break;
+      }
+
+      if (matchedStmt)
+        return context.convertStatement(*matchedStmt);
+      if (caseStmt.defaultCase)
+        return context.convertStatement(*caseStmt.defaultCase);
+      return success();
+    }
+
     auto caseExpr = context.convertRvalueExpression(caseStmt.expr);
     if (!caseExpr)
       return failure();
@@ -964,6 +1059,15 @@ struct StmtVisitor {
       return true;
     }
 
+    // Timescale tasks (`$printtimescale`)
+
+    if (nameId == ksn::PrintTimeScale) {
+      auto message = moore::FormatLiteralOp::create(
+          builder, loc, buildPrintTimeScaleMessage(context, args));
+      moore::DisplayBIOp::create(builder, loc, message);
+      return true;
+    }
+
     // Display and Write Tasks (`$display[boh]?` or `$write[boh]?` or
     // `$fdisplay[boh]?` or `$fwrite[boh]?` or `$swrite[boh]` or `$sformat`)
 
@@ -1337,6 +1441,54 @@ struct StmtVisitor {
       return true;
     }
 
+    if (nameId == ksn::TimeFormat) {
+      context.ensureTimeFormatGlobal();
+      auto i32Ty = moore::IntType::getInt(context.getContext(), 32);
+      auto strTy = moore::StringType::get(context.getContext());
+
+      if (args.empty()) {
+        auto defaults = getDefaultTimeFormatValues(context.builder, loc,
+                                                   context.getContext());
+        std::array<StringRef, 4> argNames = {"unit", "precision", "suffix",
+                                             "min_width"};
+        for (auto [name, value] : llvm::zip(argNames, defaults)) {
+          auto base = moore::GetGlobalVariableOp::create(
+              context.builder, loc, context.timeFormatGlobal);
+          auto fieldRef = moore::StructExtractRefOp::create(
+              context.builder, loc,
+              moore::RefType::get(cast<moore::UnpackedType>(value.getType())),
+              StringAttr::get(context.getContext(), name), base);
+          moore::BlockingAssignOp::create(context.builder, loc, fieldRef,
+                                          value);
+        }
+        return true;
+      }
+
+      std::array<std::pair<StringRef, Type>, 4> argsTypes = {{
+          {"unit", i32Ty},
+          {"precision", i32Ty},
+          {"suffix", strTy},
+          {"min_width", i32Ty},
+      }};
+
+      for (auto [i, arg] : llvm::enumerate(argsTypes)) {
+        if (args.size() <= i)
+          break;
+        auto value = context.convertRvalueExpression(*args[i], arg.second);
+        if (!value)
+          return failure();
+
+        auto base = moore::GetGlobalVariableOp::create(
+            context.builder, loc, context.timeFormatGlobal);
+        auto fieldRef = moore::StructExtractRefOp::create(
+            context.builder, loc,
+            moore::RefType::get(cast<moore::UnpackedType>(arg.second)),
+            StringAttr::get(context.getContext(), arg.first), base);
+        moore::BlockingAssignOp::create(context.builder, loc, fieldRef, value);
+      }
+      return true;
+    }
+
     // Give up on any other system tasks. These will be tried again as an
     // expression later.
     return false;
@@ -1547,4 +1699,40 @@ LogicalResult Context::flushPendingMonitors() {
 
   pendingMonitors.clear();
   return success();
+}
+
+//===----------------------------------------------------------------------===//
+// Time format support
+//===----------------------------------------------------------------------===//
+
+void Context::ensureTimeFormatGlobal() {
+  if (timeFormatGlobal)
+    return;
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToStart(intoModuleOp.getBody());
+
+  auto loc = intoModuleOp.getLoc();
+  auto i32Ty = moore::IntType::getInt(getContext(), 32);
+  auto strTy = moore::StringType::get(getContext());
+
+  SmallVector<moore::StructLikeMember> members{
+      {StringAttr::get(getContext(), "unit"), i32Ty},
+      {StringAttr::get(getContext(), "precision"), i32Ty},
+      {StringAttr::get(getContext(), "suffix"), strTy},
+      {StringAttr::get(getContext(), "min_width"), i32Ty},
+  };
+  auto structTy = moore::UnpackedStructType::get(getContext(), members);
+
+  timeFormatGlobal = moore::GlobalVariableOp::create(
+      builder, loc, "__timeformat_state", structTy);
+  {
+    OpBuilder::InsertionGuard initGuard(builder);
+    builder.setInsertionPointToStart(
+        &timeFormatGlobal.getInitRegion().emplaceBlock());
+    auto defaults = getDefaultTimeFormatValues(builder, loc, getContext());
+    auto init = moore::StructCreateOp::create(builder, loc, structTy,
+                                              ValueRange(defaults));
+    moore::YieldOp::create(builder, loc, init);
+  }
+  symbolTable.insert(timeFormatGlobal);
 }

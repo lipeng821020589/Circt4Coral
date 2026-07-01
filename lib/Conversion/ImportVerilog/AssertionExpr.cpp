@@ -95,6 +95,7 @@ struct AssertionExprVisitor {
     // boolean value
     if (!mlir::isa<ltl::SequenceType, ltl::PropertyType, mlir::IntegerType>(
             valueType)) {
+      value = context.convertToBool(value);
       value = context.convertToI1(value);
     }
     if (!value)
@@ -473,7 +474,8 @@ Value Context::convertToI1(Value value) {
 
 namespace {
 struct AssertionClockVisitor
-    : slang::ast::ASTVisitor<AssertionClockVisitor, true, true> {
+    : slang::ast::ASTVisitor<AssertionClockVisitor,
+                             slang::ast::VisitFlags::AllGood> {
   Context &context;
   const slang::analysis::AnalyzedAssertion &assertion;
   const slang::ast::TimingControl *currentClock = nullptr;

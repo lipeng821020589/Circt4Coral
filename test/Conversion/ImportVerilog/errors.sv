@@ -21,7 +21,7 @@ endmodule
 module Foo;
   mailbox a;
   string b;
-  // expected-error @below {{value of type 'string' cannot be assigned to type 'mailbox'}}
+  // expected-error @below {{value of type 'string' cannot be assigned to type 'mailbox#(untyped)'}}
   initial a = b;
 endmodule
 
@@ -136,12 +136,6 @@ module Foo;
   // expected-error @below {{hello}}
   $fatal(0, "hello");
 endmodule
-
-// -----
-function Foo;
-  // expected-error @below {{unsupported format specifier `%l`}}
-  $write("%l");
-endfunction
 
 // -----
 function Foo;

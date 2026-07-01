@@ -412,6 +412,25 @@ struct Context {
       moore::IntFormat defaultFormat = moore::IntFormat::Decimal,
       bool appendNewline = false);
 
+  /// Result of converting a scan format string. The final cursor of the
+  /// consuming chain and the list of (destination expression, scanned value,
+  /// matched flag) tuples to assign
+  struct ScanStringResult {
+    Value finalCursor;
+    SmallVector<std::tuple<const slang::ast::Expression *, Value, Value>>
+        assignments;
+  };
+
+  /// Convert a scan format string into a consuming chain of `moore.scan.*`
+  /// operations starting from `initialCursor`. Each non-suppressed specifier
+  /// produces an entry in `assignments`; the caller is responsible for emitting
+  /// the corresponding `moore.blocking_assign` ops. Returns failur if an erro
+  /// occurs.
+  FailureOr<ScanStringResult>
+  convertScanString(StringRef formatStr, Value initialCursor,
+                    std::span<const slang::ast::Expression *const> destinations,
+                    Location loc);
+
   /// Convert system function calls. Returns a null `Value` on failure after
   /// emitting an error.
   Value convertSystemCall(const slang::ast::SystemSubroutine &subroutine,
@@ -485,6 +504,9 @@ struct Context {
   DenseMap<const slang::ast::SubroutineSymbol *,
            std::unique_ptr<FunctionLowering>>
       functions;
+
+  /// DPI-C export directives keyed by the SystemVerilog subroutine they expose.
+  DenseMap<const slang::ast::SubroutineSymbol *, std::string> dpiExportCNames;
 
   /// Classes that have already been converted.
   DenseMap<const slang::ast::ClassType *, std::unique_ptr<ClassLowering>>
@@ -573,9 +595,17 @@ struct Context {
   /// returns the index of the last element of the queue.
   Value currentQueue = {};
 
+  /// The definition symbol of the module body currently being converted.
+  /// Used to resolve the `%l`/`%L` library binding format specifier.
+  const slang::ast::DefinitionSymbol *currentDefinition = nullptr;
+
   /// Ensure that the global variables for `$monitor` state exist. This creates
   /// the `__monitor_active_id` and `__monitor_enabled` globals on first call.
   void ensureMonitorGlobals();
+
+  /// Ensure that the global variable for `$timeformat` state exists.
+  /// This creates the `__timeformat_state` global on first call.
+  void ensureTimeFormatGlobal();
 
   /// Process any pending `$monitor` calls and generate the monitoring
   /// procedures at module level.
@@ -585,6 +615,10 @@ struct Context {
   /// demand by `ensureMonitorGlobals()`.
   moore::GlobalVariableOp monitorActiveIdGlobal = nullptr;
   moore::GlobalVariableOp monitorEnabledGlobal = nullptr;
+
+  /// Global variable ops for `$timeformat` state management. These are created
+  /// on demand by `ensureTimeFormatGlobal()`.
+  moore::GlobalVariableOp timeFormatGlobal = nullptr;
 
   /// The next monitor ID to allocate. ID 0 is reserved for "no monitor active".
   unsigned nextMonitorId = 1;
