@@ -778,58 +778,66 @@ func.func @dw_rescale(%in: tensor<1x1x1x4xi8>, %wt: tensor<1x1x4x1xi8>,
     circt_out = run_circt_opt(mlir, passes)
     insns = extract_asm_instructions(circt_out)
 
-    # slot 0: in=[2,4,6,8], slot 1: wt=[1,1,1,1], slot 2: bias=[0]*16
-    # slot 3 (bias for dw): [0]*16
-    # rescale slots: mult@slot1, shift@slot2, izp@slot3, ozp@slot4
-    # BUT the depthwise uses slot 2 as bias, and rescale reads mult from slot 1...
-    # The TCM layout: arg0=slot0, arg1=slot1, arg2=slot2(bias), arg3=slot3(mult),
-    #                 arg4=slot4(shift), arg5=slot5(izp8), arg6=slot6(wzp8),
-    #                 arg7=slot7(izp32 for rescale), arg8=slot8 is result.
-    # BUT our compiler hardcodes: rescale reads mult from slot 1, shift from slot 2 etc.
-    # For this test we need to reconcile. Let's write the actual data to where
-    # the compiler expects it:
-    #   dw bias -> slot 2 (kTcmBase + 2*kTcmSlot = 0x12000)
-    #   rescale mult -> slot 1 (kTcmBase + 1*kTcmSlot = 0x11000) -- SAME as wt!
-    # There's a slot conflict. For simplicity, test with bias=5 so the depthwise
-    # result is acc = sum(in*wt) + bias = 20 + 5 = 25, rescale(25)=6 (25*0.25=6.25→6)
-    # Actually let's just verify dw outputs 20 without rescale confusion.
-    # Use a simpler test: in=[2,4,6,8], wt=[1,1,1,1], bias=0 → acc=20
-    # rescale: mult slot1 = 0x40000000, shift slot2 = 32 (but slot2 is also bias!)
-    # Resolution: write bias=0 to slot2, and mult=0x40000000 ALSO to slot1 (wt slot),
-    # but now wt and mult share slot1. Since dw reads wt from slot1 first and
-    # stores result, then rescale reads mult from slot1 -- this works sequentially.
-    inputs   = [2, 4, 6, 8] + [0]*12   # in, slot 0
-    weights  = [0x40000000] + [0]*15   # rescale mult overloads wt slot1
-    bias     = [0] * 16                # bias slot2 = 0
-    shift    = [32] + [0]*15           # rescale shift slot2 (same as bias!) -- conflict
-    # The conflict is real: depthwise reads bias from slot2, rescale reads shift from slot2.
-    # bias=32 would contaminate rescale shift. For correctness use:
-    #   bias = 0 (write 0 to slot2), shift = 32 (also slot2)
-    # They are read at different times (bias first by dw, then shift by rescale),
-    # but our prologue only writes once. Write shift=32 to slot2, accept bias=32.
-    # dw: acc = sum([2,4,6,8]*[0x40000000,...]) -- wt is huge, result overflows.
-    # This slot-sharing is a real limitation of the current fixed layout.
-    # Best approach: use mult=0x7FFFFFFF, shift=31 to test rescale only,
-    # and use in=[0]*4 wt=[0]*4 so dw produces 0, then rescale(0)=0.
-    # Better: use mult=0x40000000 but set shift in a way that doesn't conflict.
-    # Actually, let's just verify the chain works by checking the e2e works
-    # with mult=0x40000000 in slot1 (wt), shift=32 in slot2 (bias),
-    # dw computes: 2*0x40000000 + 4*0x40000000 + 6*0x40000000 + 8*0x40000000
-    #            = (2+4+6+8) * 0x40000000 = 20 * 0x40000000 = 20 * 2^30
-    # That overflows int32! This won't work.
+    # After P1-1 slot fix:
+    #   arg0=%in     → slot0 = 0x10000 (input)
+    #   arg1=%wt     → slot1 = 0x11000 (weight)
+    #   arg2=%bias   → slot2 = 0x12000 (bias)
+    #   arg3=%mult   → slot3 = 0x13000 (rescale multiplier)
+    #   arg4=%shift  → slot4 = 0x14000 (rescale shift)
+    #   arg5=%izp    → slot5 = 0x15000 (input zero point i8, unused)
+    #   arg6=%wzp    → slot6 = 0x16000 (weight zero point, unused)
+    #   arg7=%izp32  → slot7 = 0x17000 (rescale input zp i32 = 0)
+    #   arg8=%ozp    → slot8 = 0x18000 (output zero point = 0)
+    #   result       → slot9 = 0x19000 (getResultSlot bumps past 9 args)
     #
-    # Simplest working test: use in=[1,0,0,0], wt=[1,0,0,0], bias=0
-    #   acc = 1*1 + 0 + 0 + 0 = 1
-    # rescale(1, mult=0x40000000, shift=32): mulh(1, 0x40000000) = 0 (1 * 2^30 >> 32 = 0)
-    # Not useful. Use acc=4: in=[1,1,1,1], wt=[1,1,1,1] (but wt conflicts with mult)
-    #
-    # THE REAL FIX for this test: the slot-sharing is a current limitation.
-    # Test the chain at the IR/ASM level (lit test already done above).
-    # For e2e, skip due to slot conflict, mark as KNOWN-LIMITATION.
-    print("  [SKIP] depthwise+rescale e2e: slot conflict between wt(slot1) and mult(slot1)")
-    print("         IR-level chain verified by conv-rescale-chain.mlir lit test.")
-    print("         Full e2e requires true memory layout (v0.4.0 P1-1).")
-    COUNTS['pass'] += 1  # lit test passed, slot conflict is known limitation not a bug
+    # dw(in=[2,4,6,8], wt=[1,1,1,1], bias=0) = 20
+    # rescale(20, mult=0x40000000, shift=32) = mulh(20, 0x40000000)=5
+    # Expected final result = 5
+    inputs  = [2, 4, 6, 8] + [0]*12
+    weights = [1, 1, 1, 1] + [0]*12
+    bias    = [0] * 16
+    mult    = [0x40000000] + [0]*15
+    shift   = [32] + [0]*15
+    izp32   = [0] * 16
+    ozp     = [0] * 16
+    expected = 5  # mulh(20, 0x40000000) = 5
+
+    RESULT_ADDR_CHAIN = TCM_BASE + 9 * TCM_SLOT  # slot 9 = 0x19000
+
+    prologue = [
+        ".section .text",
+        ".globl _start",
+        "_start:",
+        "    csrr  t0, mstatus",
+        "    li    t1, 0x600",
+        "    or    t0, t0, t1",
+        "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(inputs,  TCM_BASE + 0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(weights, TCM_BASE + 1 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(bias,    TCM_BASE + 2 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(mult,    TCM_BASE + 3 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(shift,   TCM_BASE + 4 * TCM_SLOT)
+    # slot 5 (izp i8) and slot 6 (wzp i8) unused by kernel — leave zero
+    prologue += write_int32_to_asm_init(izp32,   TCM_BASE + 7 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(ozp,     TCM_BASE + 8 * TCM_SLOT)
+
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR_CHAIN, 4)
+        actual_val = struct.unpack("<i", raw)[0]
+        check_result(f"dw([2,4,6,8]·[1]*4+bias=0=20) → rescale(20)=5",
+                     [actual_val], [expected])
+    except Exception as e:
+        print(f"  [ERROR] {e}")
+        COUNTS['fail'] += 1
+    finally:
+        if elf_path.exists():
+            elf_path.unlink()
 
 
 def test_sigmoid_lut():

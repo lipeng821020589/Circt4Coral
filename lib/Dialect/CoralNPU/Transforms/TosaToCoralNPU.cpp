@@ -176,6 +176,17 @@ static constexpr int64_t kTcmBase = 0x10000;
 static constexpr int64_t kTcmSlot = 0x1000;
 static constexpr int64_t kResultSlot = 8;
 
+/// TCM result slot for op output. Bumped past arg count to avoid collision.
+static int64_t getResultSlot(mlir::Operation *op) {
+  if (auto funcOp = op->getParentOfType<mlir::func::FuncOp>()) {
+    int64_t numArgs = (int64_t)funcOp.getNumArguments();
+    if (numArgs > kResultSlot)
+      return numArgs;
+  }
+  return kResultSlot;
+}
+
+
 /// Resolve the i32 vector-register carrier holding the data for `tensorVal`:
 ///   - Already-lowered operand (its replacement is `tensor.splat(vreg)`):
 ///     unwrap and reuse the vreg, chaining element-wise ops in registers.
@@ -322,7 +333,8 @@ static void storeResult(mlir::Value vreg, mlir::Operation *op,
   int64_t n = 1;
   if (auto tt = mlir::dyn_cast<mlir::TensorType>(op->getResult(0).getType()))
     n = tt.getNumElements();
-  int64_t addr = kTcmBase + kResultSlot * kTcmSlot;
+  int64_t resultSlot = getResultSlot(op);
+  int64_t addr = kTcmBase + resultSlot * kTcmSlot;
   auto addrV = createI32Const(loc, (int32_t)addr, rewriter);
   auto nV = createI32Const(loc, (int32_t)n, rewriter);
   rewriter.create<VSE32Op>(loc, vreg, addrV, nV);
@@ -409,17 +421,19 @@ struct TosaRescaleLowering : public mlir::OpRewritePattern<mlir::tosa::RescaleOp
     auto loc = op.getLoc();
     rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
 
-    // Load scalar parameters from their TCM slots (operand 1..4 are 1-elem tensors).
-    // multiplier: operand 1 (slot 1), shift: operand 2 (slot 2)
-    // input_zp:   operand 3 (slot 3), output_zp: operand 4 (slot 4)
-    auto multAddr = createI32Const(loc, (int32_t)(kTcmBase + 1 * kTcmSlot), rewriter);
-    auto shiftAddr = createI32Const(loc, (int32_t)(kTcmBase + 2 * kTcmSlot), rewriter);
-    auto izpAddr  = createI32Const(loc, (int32_t)(kTcmBase + 3 * kTcmSlot), rewriter);
-    auto ozpAddr  = createI32Const(loc, (int32_t)(kTcmBase + 4 * kTcmSlot), rewriter);
-    auto mult     = rewriter.create<ScalarLwOp>(loc, multAddr).getResult();
-    auto shift    = rewriter.create<ScalarLwOp>(loc, shiftAddr).getResult();
-    auto izp      = rewriter.create<ScalarLwOp>(loc, izpAddr).getResult();
-    auto ozp      = rewriter.create<ScalarLwOp>(loc, ozpAddr).getResult();
+    // Derive TCM slot from the operand's block argument index so that
+    // rescale works correctly both as a standalone function and when chained
+    // after conv/depthwise (where mult/shift/zp are not arg 1..4 but arg 3..8).
+    auto slotAddr = [&](mlir::Value operand) -> mlir::Value {
+      int64_t slot = 1; // fallback
+      if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(operand))
+        slot = barg.getArgNumber();
+      return createI32Const(loc, (int32_t)(kTcmBase + slot * kTcmSlot), rewriter);
+    };
+    auto mult  = rewriter.create<ScalarLwOp>(loc, slotAddr(op.getMultiplier())).getResult();
+    auto shift = rewriter.create<ScalarLwOp>(loc, slotAddr(op.getShift())).getResult();
+    auto izp   = rewriter.create<ScalarLwOp>(loc, slotAddr(op.getInputZp())).getResult();
+    auto ozp   = rewriter.create<ScalarLwOp>(loc, slotAddr(op.getOutputZp())).getResult();
 
     // Input tiles (e32 — rescale typically receives int32 accumulator tiles)
     auto tiles = getTiles(op.getInput(), SEW::E32, rewriter, loc);
@@ -491,7 +505,7 @@ struct TosaRescaleLowering : public mlir::OpRewritePattern<mlir::tosa::RescaleOp
     for (size_t i = 1; i < results.size(); ++i)
       final_result = rewriter.create<ScalarAddOp>(loc, final_result, results[i]).getResult();
 
-    auto resultAddr = createI32Const(loc, (int32_t)(kTcmBase + kResultSlot * kTcmSlot), rewriter);
+    auto resultAddr = createI32Const(loc, (int32_t)(kTcmBase + getResultSlot(op) * kTcmSlot), rewriter);
     rewriter.create<ScalarSwOp>(loc, final_result, resultAddr);
     rewriter.replaceOp(op, carrier(op, rewriter, final_result));
     return mlir::success();
@@ -721,14 +735,16 @@ struct TosaDepthwiseConv2DLowering
     for (size_t i = 1; i < partials.size(); ++i)
       sum = rewriter.create<ScalarAddOp>(loc, sum, partials[i]).getResult();
 
-    // Add bias (load from arg 2 slot, element 0) -- conservative: load from
-    // the bias TCM slot and add as a scalar.
-    auto biasAddr = createI32Const(loc, (int32_t)(kTcmBase + 2 * kTcmSlot), rewriter);
+    // Add bias: derive slot from bias operand arg index for correctness in chains.
+    int64_t biasSlot = 2; // default for standalone depthwise
+    if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(op.getBias()))
+      biasSlot = barg.getArgNumber();
+    auto biasAddr = createI32Const(loc, (int32_t)(kTcmBase + biasSlot * kTcmSlot), rewriter);
     auto biasVal  = rewriter.create<ScalarLwOp>(loc, biasAddr);
     auto result   = rewriter.create<ScalarAddOp>(loc, sum, biasVal.getResult());
 
     // Store scalar result via sw.
-    auto resultAddr = createI32Const(loc, (int32_t)(kTcmBase + kResultSlot * kTcmSlot), rewriter);
+    auto resultAddr = createI32Const(loc, (int32_t)(kTcmBase + getResultSlot(op) * kTcmSlot), rewriter);
     rewriter.create<ScalarSwOp>(loc, result.getResult(), resultAddr);
     rewriter.replaceOp(op, carrier(op, rewriter, result.getResult()));
     return mlir::success();
@@ -851,7 +867,7 @@ struct TosaAvgPool2dLowering : public mlir::OpRewritePattern<mlir::tosa::AvgPool
         loc, sum, createI32Const(loc, (int32_t)area, rewriter));
     // Store the scalar div result via sw (not VSE32Op which expects a vreg).
     // kResultSlot is the TCM slot for the output tensor.
-    auto resultAddr = createI32Const(loc, (int32_t)(kTcmBase + kResultSlot * kTcmSlot), rewriter);
+    auto resultAddr = createI32Const(loc, (int32_t)(kTcmBase + getResultSlot(op) * kTcmSlot), rewriter);
     rewriter.create<ScalarSwOp>(loc, div.getResult(), resultAddr);
     rewriter.replaceOp(op, carrier(op, rewriter, div.getResult()));
     return mlir::success();
@@ -888,7 +904,7 @@ struct TosaMaxPool2dLowering : public mlir::OpRewritePattern<mlir::tosa::MaxPool
       result    = rewriter.create<ScalarAddOp>(loc, a, sel);
     }
     // Store scalar max via sw.
-    auto resultAddr = createI32Const(loc, (int32_t)(kTcmBase + kResultSlot * kTcmSlot), rewriter);
+    auto resultAddr = createI32Const(loc, (int32_t)(kTcmBase + getResultSlot(op) * kTcmSlot), rewriter);
     rewriter.create<ScalarSwOp>(loc, result, resultAddr);
     rewriter.replaceOp(op, carrier(op, rewriter, result));
     return mlir::success();
