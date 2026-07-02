@@ -832,8 +832,87 @@ func.func @dw_rescale(%in: tensor<1x1x1x4xi8>, %wt: tensor<1x1x4x1xi8>,
     COUNTS['pass'] += 1  # lit test passed, slot conflict is known limitation not a bug
 
 
+def test_sigmoid_lut():
+    print("\n=== TEST 10: tosa.sigmoid LUT lookup (int8) ===")
+    import math
+    # Precompute 256-entry sigmoid LUT (int8 symmetric): lut[i] = round(sigmoid((i-128)/128.0*6)*255) - 128
+    lut = []
+    for i in range(256):
+        x = (i - 128) / 128.0 * 6.0
+        y = 1.0 / (1.0 + math.exp(-x))
+        out = max(-128, min(127, int(round(y * 255)) - 128))
+        lut.append(out)
+    # Test: input=0 → index=0+128=128 → lut[128] = sigmoid(0) ≈ 0
+    # input=-64 → index=64 → lut[64] ≈ sigmoid(-3) ≈ -105
+    # Use input=0 for simplest test: expected = lut[128]
+    expected_idx = 128  # input 0 → index 128
+    expected = lut[expected_idx]
+
+    mlir = """\
+func.func @sigmoid_lut(%in: tensor<1xi8>) -> tensor<1xi8> {
+  %out = tosa.sigmoid %in : (tensor<1xi8>) -> tensor<1xi8>
+  func.return %out : tensor<1xi8>
+}
+"""
+    passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+              "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+
+    circt_out = run_circt_opt(mlir, passes)
+    insns = extract_asm_instructions(circt_out)
+
+    # LUT_SLOT=9 → TCM_BASE + 9*TCM_SLOT = 0x10000 + 9*0x1000 = 0x19000
+    LUT_BASE = TCM_BASE + 9 * TCM_SLOT
+    # input slot 0: [0, 0, ...] (input=0)
+    inputs = [0] + [0]*15
+
+    prologue = [
+        ".section .text",
+        ".globl _start",
+        "_start:",
+        "    csrr  t0, mstatus",
+        "    li    t1, 0x600",
+        "    or    t0, t0, t1",
+        "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(inputs, TCM_BASE + 0 * TCM_SLOT)
+    # Write LUT to slot 9 (256 entries as i32)
+    prologue += write_int32_to_asm_init(lut[:16], LUT_BASE + 0 * 64)
+    prologue += write_int32_to_asm_init(lut[16:32], LUT_BASE + 16 * 4)
+    prologue += write_int32_to_asm_init(lut[32:48], LUT_BASE + 32 * 4)
+    prologue += write_int32_to_asm_init(lut[48:64], LUT_BASE + 48 * 4)
+    prologue += write_int32_to_asm_init(lut[64:80], LUT_BASE + 64 * 4)
+    prologue += write_int32_to_asm_init(lut[80:96], LUT_BASE + 80 * 4)
+    prologue += write_int32_to_asm_init(lut[96:112], LUT_BASE + 96 * 4)
+    prologue += write_int32_to_asm_init(lut[112:128], LUT_BASE + 112 * 4)
+    prologue += write_int32_to_asm_init(lut[128:144], LUT_BASE + 128 * 4)
+    prologue += write_int32_to_asm_init(lut[144:160], LUT_BASE + 144 * 4)
+    prologue += write_int32_to_asm_init(lut[160:176], LUT_BASE + 160 * 4)
+    prologue += write_int32_to_asm_init(lut[176:192], LUT_BASE + 176 * 4)
+    prologue += write_int32_to_asm_init(lut[192:208], LUT_BASE + 192 * 4)
+    prologue += write_int32_to_asm_init(lut[208:224], LUT_BASE + 208 * 4)
+    prologue += write_int32_to_asm_init(lut[224:240], LUT_BASE + 224 * 4)
+    prologue += write_int32_to_asm_init(lut[240:256], LUT_BASE + 240 * 4)
+
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 4)
+        actual_val = struct.unpack("<i", raw)[0]
+        check_result(f"sigmoid(0) → lut[128]={expected}",
+                     [actual_val], [expected])
+    except Exception as e:
+        print(f"  [ERROR] {e}")
+        COUNTS['fail'] += 1
+    finally:
+        if elf_path.exists():
+            elf_path.unlink()
+
+
 def test_csr_outer_product():
-    print("\n=== TEST 10: CSR codegen (outer_product → KSCM/KISA csrw) ===")
+    print("\n=== TEST 11: CSR codegen (outer_product → KSCM/KISA csrw) ===")
     mlir = """\
 func.func @demo_outer_product() -> i32 {
   %a = coralnpu.li 2 : i32
@@ -937,6 +1016,7 @@ if __name__ == "__main__":
     test_scalar_mulh_rem()
     test_rescale()
     test_dw_rescale_chain()
+    test_sigmoid_lut()
     test_csr_outer_product()
 
     print(f"\n{'='*50}")

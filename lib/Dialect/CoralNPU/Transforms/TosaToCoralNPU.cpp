@@ -498,6 +498,90 @@ struct TosaRescaleLowering : public mlir::OpRewritePattern<mlir::tosa::RescaleOp
   }
 };
 
+//===----------------------------------------------------------------------===//
+// tosa.table → scalar LUT lookup (int8 input, 256-entry table in TCM slot 9)
+//===----------------------------------------------------------------------===//
+// TCM slot for the LUT data (must be loaded by the caller before executing).
+static constexpr int64_t kLutSlot = 9;
+
+struct TosaTableLowering : public mlir::OpRewritePattern<mlir::tosa::TableOp> {
+  using mlir::OpRewritePattern<mlir::tosa::TableOp>::OpRewritePattern;
+
+  mlir::LogicalResult matchAndRewrite(mlir::tosa::TableOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    // Only handle int8 input → int8 output (256-entry LUT).
+    auto inType = mlir::dyn_cast<mlir::RankedTensorType>(op.getInput1().getType());
+    if (!inType || !inType.getElementType().isInteger(8))
+      return mlir::failure();
+
+    auto loc = op.getLoc();
+    // Scalar path: for each element, load from LUT at (input + 128) * 4.
+    // The LUT is stored as i32 values in kLutSlot (one per table entry).
+    // lut_base = kTcmBase + kLutSlot * kTcmSlot
+    auto lutBase = createI32Const(loc, (int32_t)(kTcmBase + kLutSlot * kTcmSlot), rewriter);
+    auto c128    = createI32Const(loc, 128, rewriter);
+    auto c4      = createI32Const(loc, 4, rewriter);
+
+    // For each tile, reduce to scalar, compute LUT index, load result.
+    auto tiles = getTiles(op.getInput1(), SEW::E32, rewriter, loc);
+    llvm::SmallVector<mlir::Value> results;
+    for (auto tile : tiles) {
+      // Get element value (scalar) from tile via vredsum (single-element tile)
+      rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
+      auto vsum = rewriter.create<VRedSumOp>(loc, tile).getResult();
+      // LUT index = (element + 128) -- treat signed int8 as [0,255] index
+      auto idx  = rewriter.create<ScalarAddOp>(loc, vsum, c128).getResult();
+      // Byte address = lutBase + idx * 4 (stored as i32)
+      auto byteOff = rewriter.create<ScalarMulOp>(loc, idx, c4).getResult();
+      auto addr    = rewriter.create<ScalarAddOp>(loc, lutBase, byteOff).getResult();
+      auto val     = rewriter.create<ScalarLwOp>(loc, addr).getResult();
+      results.push_back(val);
+    }
+
+    // Store results and create carrier.
+    int64_t n = numElements(op.getResult());
+    storeTiles(results, SEW::E32, n, rewriter, loc);
+    rewriter.replaceOp(op, tileCarrier(op, results, rewriter));
+    return mlir::success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// tosa.sigmoid → tosa.table with precomputed int8 sigmoid LUT
+// (The LUT must be initialized in TCM slot kLutSlot before execution.)
+//===----------------------------------------------------------------------===//
+
+struct TosaSigmoidLowering : public mlir::OpRewritePattern<mlir::tosa::SigmoidOp> {
+  using mlir::OpRewritePattern<mlir::tosa::SigmoidOp>::OpRewritePattern;
+
+  mlir::LogicalResult matchAndRewrite(mlir::tosa::SigmoidOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    // Sigmoid = LUT lookup. Re-use the TosaTableLowering logic directly:
+    // scalar path: output[i] = lut[input[i] + 128].
+    auto lutBase = createI32Const(loc, (int32_t)(kTcmBase + kLutSlot * kTcmSlot), rewriter);
+    auto c128    = createI32Const(loc, 128, rewriter);
+    auto c4      = createI32Const(loc, 4, rewriter);
+    rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
+
+    auto tiles = getTiles(op.getInput(), SEW::E32, rewriter, loc);
+    llvm::SmallVector<mlir::Value> results;
+    for (auto tile : tiles) {
+      auto vsum    = rewriter.create<VRedSumOp>(loc, tile).getResult();
+      auto idx     = rewriter.create<ScalarAddOp>(loc, vsum, c128).getResult();
+      auto byteOff = rewriter.create<ScalarMulOp>(loc, idx, c4).getResult();
+      auto addr    = rewriter.create<ScalarAddOp>(loc, lutBase, byteOff).getResult();
+      auto val     = rewriter.create<ScalarLwOp>(loc, addr).getResult();
+      results.push_back(val);
+    }
+
+    int64_t n = numElements(op.getResult());
+    storeTiles(results, SEW::E32, n, rewriter, loc);
+    rewriter.replaceOp(op, tileCarrier(op, results, rewriter));
+    return mlir::success();
+  }
+};
+
 // tosa.relu / tosa.clamp (when min=0, max>0) → vmax with zero
 //===----------------------------------------------------------------------===//
 
@@ -870,7 +954,8 @@ struct TosaToCoralNPUPass
     // Phase 1: TOSA op lowering.
     mlir::RewritePatternSet tosaPatterns(ctx);
     tosaPatterns.add<TosaAddLowering, TosaSubLowering, TosaMulLowering,
-                     TosaClampLowering, TosaRescaleLowering>(ctx);
+                     TosaClampLowering, TosaRescaleLowering,
+                     TosaTableLowering, TosaSigmoidLowering>(ctx);
     tosaPatterns.add<TosaReshapeLowering, TosaTransposeLowering>(ctx);
     tosaPatterns.add<TosaConv2DLowering, TosaDepthwiseConv2DLowering>(ctx);
     tosaPatterns.add<TosaMatMulLowering>(ctx);
