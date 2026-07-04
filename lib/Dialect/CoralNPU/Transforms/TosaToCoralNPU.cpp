@@ -720,16 +720,15 @@ struct TosaDepthwiseConv2DLowering
     auto inTiles  = getTiles(op.getOperand(0), SEW::E32, rewriter, loc);
     auto wtTiles  = getTiles(op.getOperand(1), SEW::E32, rewriter, loc);
 
-    // Use VWMACCOp (vwmacc.vv) for bandwidth-efficient int8 MAC:
-    // acc[i] += in[i] * wt[i] with 8-bit inputs widening to 32-bit accumulator.
-    // Then reduce each acc tile to a scalar partial sum via VRedSumOp.
-    mlir::Value zeroAcc = createI32Const(loc, 0, rewriter);
+    // Element-wise multiply each tile pair, then reduce-sum each product tile.
+    // Note: VWMACCOp (vwmacc.vv) is defined in the dialect for future use, but
+    // requires a vector accumulator operand; using VMulOp + VRedSumOp here for
+    // correctness until a proper vector-acc init sequence is designed.
     llvm::SmallVector<mlir::Value> partials;
     size_t numTiles = std::min(inTiles.size(), wtTiles.size());
     for (size_t i = 0; i < numTiles; ++i) {
-      // vwmacc.vv: accumulate in*wt into zeroAcc
-      auto acc = rewriter.create<VWMACCOp>(loc, inTiles[i], wtTiles[i], zeroAcc, 1);
-      partials.push_back(rewriter.create<VRedSumOp>(loc, acc.getResult()).getResult());
+      auto prod = rewriter.create<VMulOp>(loc, inTiles[i], wtTiles[i], 1);
+      partials.push_back(rewriter.create<VRedSumOp>(loc, prod.getResult()).getResult());
     }
 
     // Fold tile partial sums into one scalar.

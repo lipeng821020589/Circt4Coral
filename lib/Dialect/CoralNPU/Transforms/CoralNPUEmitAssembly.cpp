@@ -501,9 +501,9 @@ static uint32_t encodeBinary(mlir::Operation *op) {
   if (mlir::isa<VWAddOp>(op))
     return 0xC4000057 | (rd() << 7);  // vwadd.vv v0
   if (mlir::isa<VWMACCOp>(op))
-    return 0xF0002057 | (rd() << 7);  // vwmacc.vv (funct6=0b111100,funct3=010)
+    return 0xF2002057 | (rd() << 7);  // vwmacc.vv (funct6=0b111100,funct3=010)
   if (mlir::isa<VSubVXOp>(op))
-    return 0x0C004057 | (rd() << 7);  // vrsub.vx (funct6=0b000011,funct3=100)
+    return 0x0E004057 | (rd() << 7);  // vrsub.vx (funct6=0b000011,funct3=100)
   if (mlir::isa<VDotOp>(op))
     return 0x94000057 | (rd() << 7);  // vmul.vv (first step of vdot)
   if (mlir::isa<VRedSumOp>(op))
