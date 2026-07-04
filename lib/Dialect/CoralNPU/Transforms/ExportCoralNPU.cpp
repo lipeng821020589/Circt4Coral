@@ -78,6 +78,7 @@ constexpr uint32_t SHT_SYMTAB = 2;
 constexpr uint32_t SHT_STRTAB = 3;
 constexpr uint32_t SHF_ALLOC = 2;
 constexpr uint32_t SHF_EXECINSTR = 4;
+constexpr uint32_t SHF_WRITE = 1;
 
 //===----------------------------------------------------------------------===//
 // Binary emitter
@@ -89,8 +90,7 @@ public:
 
   /// Emit a 32-bit instruction word in little-endian.
   void emit32(uint32_t word) {
-    os.write((char *)&word, 4);
-    textSection.push_back(word);
+    textSection.push_back(word);  // Buffered; writeELF() flushes to os
   }
 
   /// Encode and emit a Coral NPU operation as binary.
@@ -256,6 +256,7 @@ public:
 
   /// Write a complete ELF object file with the encoded text.
   void writeELF(llvm::StringRef filename) {
+    static constexpr uint32_t kTcmBase = 0x10000;
     // Build ELF header
     ELFHeader ehdr = {};
     ehdr.e_ident[0] = 0x7F;
@@ -271,23 +272,20 @@ public:
     ehdr.e_version = EV_CURRENT;
     ehdr.e_ehsize = sizeof(ELFHeader);
     ehdr.e_shentsize = sizeof(ELFSectionHeader);
-    ehdr.e_shnum = 4; // null, .text, .shstrtab, .symtab
+    ehdr.e_shnum = 5; // null, .text, .shstrtab, .symtab, .data
     ehdr.e_shstrndx = 2;
 
-    // Write ELF header
-    os.write(reinterpret_cast<const char *>(&ehdr), sizeof(ELFHeader));
-
-    // Section headers (written at end, offset computed)
+    // Compute layout first
     uint32_t textOff = sizeof(ELFHeader);
-    uint32_t textSize = textSection.size() * 4;
+    uint32_t textSize = (uint32_t)(textSection.size() * 4);
     uint32_t shstrOff = textOff + textSize;
 
     // .shstrtab section data
-    const char *shstrtab = "\0.text\0.shstrtab\0.symtab\0";
-    uint32_t shstrSize = 29;
+    const char *shstrtab = "\0.text\0.shstrtab\0.symtab\0.data\0";
+    uint32_t shstrSize = 31;  // 1+5+1+9+1+7+1+5+1 = 31 bytes
 
     // Section headers
-    ELFSectionHeader shdr[4] = {};
+    ELFSectionHeader shdr[5] = {};
 
     // Section 0: NULL
     // Section 1: .text
@@ -314,8 +312,22 @@ public:
     shdr[3].sh_entsize = 16;
     shdr[3].sh_addralign = 4;
 
-    // Update header with section info
-    ehdr.e_shoff = shstrOff + shstrSize;
+    // Section 4: .data — TCM slot layout (arg0@kTcmBase, arg1@kTcmBase+slot, ...)
+    uint32_t dataOff  = shstrOff + shstrSize;
+    uint32_t dataSize = (uint32_t)(uint32_t)dataSection.size();
+    shdr[4].sh_name   = 25; // ".data" at offset 25 in shstrtab
+    shdr[4].sh_type   = SHT_PROGBITS;
+    shdr[4].sh_flags  = SHF_ALLOC | SHF_WRITE;
+    shdr[4].sh_addr   = kTcmBase;
+    shdr[4].sh_offset = dataSize > 0 ? dataOff : 0;
+    shdr[4].sh_size   = dataSize;
+    shdr[4].sh_addralign = 4;
+
+    // Finalize header: e_shoff is now known
+    ehdr.e_shoff = dataOff + dataSize;
+
+    // Write ELF header (now that e_shoff is computed)
+    os.write(reinterpret_cast<const char *>(&ehdr), sizeof(ELFHeader));
 
     // Write .text section data
     os.write(reinterpret_cast<const char *>(textSection.data()), textSize);
@@ -323,16 +335,39 @@ public:
     // Write .shstrtab
     os.write(shstrtab, shstrSize);
 
-     // Write section headers
-    for (unsigned i = 1; i < 4; ++i)
+    // Write .data section (TCM slot layout, zero-initialized placeholders)
+    if (dataSize > 0)
+      os.write(reinterpret_cast<const char *>(dataSection.data()),
+               dataSize);
+
+    // Write section headers
+    for (unsigned i = 0; i < 5; ++i)
       os.write(reinterpret_cast<const char *>(&shdr[i]), sizeof(ELFSectionHeader));
+    os.flush();
   }
 
   size_t getTextSize() const { return textSection.size(); }
+  size_t getDataSize() const { return dataSection.size(); }
+
+  /// Reserve a TCM slot (4KB = 0x1000 bytes) in the .data section for the
+  /// given function argument. Each slot is pre-filled with zeros; the caller
+  /// can write actual data into the returned byte offset within dataSection.
+  size_t addDataSlot() {
+    size_t offset = dataSection.size();
+    dataSection.resize(offset + kTcmSlotBytes, 0);
+    return offset;
+  }
+
+  const std::vector<uint8_t>& getDataSection() const { return dataSection; }
 
 private:
   llvm::raw_ostream &os;
   std::vector<uint32_t> textSection;
+  std::vector<uint8_t>  dataSection;  // .data section: TCM slot layout
+
+  // TCM constants (must match TosaToCoralNPU.cpp)
+  static constexpr uint32_t kTcmBase      = 0x10000;
+  static constexpr uint32_t kTcmSlotBytes = 0x1000;   // 4KB per slot
 
   // Helper: get destination register from xreg annotation
   uint8_t getRd(mlir::Operation *op) {
@@ -364,6 +399,17 @@ struct ExportCoralNPUPass {
     BinaryEmitter emitter(os);
     unsigned pc = 0;
 
+    // Pre-pass: for each function arg (TCM slot), reserve a .data slot.
+    // This makes the exported ELF self-describing: the .data section holds
+    // zero-initialized placeholder memory for each input tensor, located at
+    // the TCM address where the compiler expects to find it.
+    module.walk([&](mlir::func::FuncOp funcOp) {
+      for (auto arg : funcOp.getArguments()) {
+        (void)arg;
+        emitter.addDataSlot();  // reserve 4KB slot; caller writes real data
+      }
+    });
+
     module.walk([&](mlir::Operation *op) {
       if (op->getDialect() &&
           op->getDialect()->getNamespace() == "coralnpu") {
@@ -371,9 +417,11 @@ struct ExportCoralNPUPass {
       }
     });
 
+    emitter.writeELF("");  // Write complete ELF (with .text + .data sections) to os
     llvm::errs() << "\n; Text section: " << emitter.getTextSize() << " instructions ("
        << (emitter.getTextSize() * 4) << " bytes)\n";
-    llvm::errs() << "; ELF file generation: use --export-coralnpu-elf=<filename>\n";
+    llvm::errs() << "; .data section: " << emitter.getDataSize() << " bytes ("
+       << (emitter.getDataSize() / 0x1000) << " TCM slots)\n";
   }
 };
 
