@@ -1290,6 +1290,38 @@ func.func @minimum(%a: tensor<4xi32>, %b: tensor<4xi32>) -> tensor<4xi32> {
         if elf_path.exists(): elf_path.unlink()
 
 
+
+def test_cast_widen_e2e():
+    print("\n=== TEST 19: tosa.cast i8->i32 widening passthrough ===")
+    mlir = """\
+func.func @cast_widen(%a: tensor<4xi8>) -> tensor<4xi32> {
+  %0 = tosa.cast %a : (tensor<4xi8>) -> tensor<4xi32>
+  func.return %0 : tensor<4xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu","--coralnpu-legalize","--coralnpu-regalloc","--emit-coralnpu-assembly"]
+    insns = extract_asm_instructions(run_circt_opt(mlir, passes))
+    # Values that fit in i8: [1, -2, 3, -4] stored as i32 words
+    a = [1, -2, 3, -4] + [0]*12
+    RESULT_ADDR = TCM_BASE + 8 * TCM_SLOT
+    prologue = [".section .text",".globl _start","_start:",
+                "    csrr  t0, mstatus","    li    t1, 0x600",
+                "    or    t0, t0, t1","    csrw  mstatus, t0"]
+    prologue += write_int32_to_asm_init(a, TCM_BASE + 0 * TCM_SLOT)
+    full_asm = "\n".join(prologue)+"\n"+"\n".join(insns)+"\n.Lexit:\n    ebreak\n"
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 16)
+        vals = list(struct.unpack("<4i", raw))
+        check_result("cast i8->i32 [1,-2,3,-4]", vals, [1, -2, 3, -4])
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
+
 # ── 主程序 ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1322,6 +1354,7 @@ if __name__ == "__main__":
     test_reduce_max_e2e()
     test_maximum_e2e()
     test_minimum_e2e()
+    test_cast_widen_e2e()
 
     print(f"\n{'='*50}")
     print(f"Results: {COUNTS['pass']} passed, {COUNTS['fail']} failed")
