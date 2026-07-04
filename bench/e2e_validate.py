@@ -1076,6 +1076,97 @@ func.func @mobilenet_dw_block(
             elf_path.unlink()
 
 
+
+def test_concat_e2e():
+    print("\n=== TEST 13: tosa.concat ([1,2,3,4]+[5,6,7,8] -> [1..8]) ===")
+    mlir = """\
+func.func @concat_e2e(%a: tensor<4xi32>, %b: tensor<4xi32>) -> tensor<8xi32> {
+  %0 = tosa.concat %a, %b {axis = 0 : i32}
+      : (tensor<4xi32>, tensor<4xi32>) -> tensor<8xi32>
+  func.return %0 : tensor<8xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+              "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+    circt_out = run_circt_opt(mlir, passes)
+    insns = extract_asm_instructions(circt_out)
+
+    a = [1, 2, 3, 4] + [0]*12
+    b = [5, 6, 7, 8] + [0]*12
+    # result slot = kResultSlot (8) for 2-arg function
+    RESULT_ADDR = TCM_BASE + 8 * TCM_SLOT  # 0x18000
+
+    prologue = [
+        ".section .text", ".globl _start", "_start:",
+        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    or    t0, t0, t1", "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(a, TCM_BASE + 0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(b, TCM_BASE + 1 * TCM_SLOT)
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        # Read 8 i32 values = 32 bytes from result slot
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 32)
+        vals = list(struct.unpack("<8i", raw))
+        # Expected: first tile = [1,2,3,4], second tile = [5,6,7,8]
+        expected = [1, 2, 3, 4, 5, 6, 7, 8]
+        check_result("concat([1,2,3,4],[5,6,7,8])", vals, expected)
+    except Exception as e:
+        print(f"  [ERROR] {e}")
+        COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists():
+            elf_path.unlink()
+
+
+def test_slice_e2e():
+    print("\n=== TEST 14: tosa.slice ([10,20,30,40,50,60,70,80][2:6]) ===")
+    mlir = """\
+func.func @slice_e2e(%a: tensor<8xi32>) -> tensor<4xi32> {
+  %start = tosa.const_shape {values = dense<[2]> : tensor<1xindex>} : () -> !tosa.shape<1>
+  %size  = tosa.const_shape {values = dense<[4]> : tensor<1xindex>} : () -> !tosa.shape<1>
+  %0 = tosa.slice %a, %start, %size
+      : (tensor<8xi32>, !tosa.shape<1>, !tosa.shape<1>) -> tensor<4xi32>
+  func.return %0 : tensor<4xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+              "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+    circt_out = run_circt_opt(mlir, passes)
+    insns = extract_asm_instructions(circt_out)
+
+    # input: indices 0..7 = [10,20,30,40,50,60,70,80]
+    a = [10, 20, 30, 40, 50, 60, 70, 80] + [0]*8
+    RESULT_ADDR = TCM_BASE + 8 * TCM_SLOT  # 0x18000 (1-arg -> kResultSlot=8)
+
+    prologue = [
+        ".section .text", ".globl _start", "_start:",
+        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    or    t0, t0, t1", "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(a, TCM_BASE + 0 * TCM_SLOT)
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 16)
+        vals = list(struct.unpack("<4i", raw))
+        expected = [30, 40, 50, 60]  # a[2:6]
+        check_result("slice([10..80], start=2, size=4)", vals, expected)
+    except Exception as e:
+        print(f"  [ERROR] {e}")
+        COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists():
+            elf_path.unlink()
+
+
 # ── 主程序 ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1102,6 +1193,8 @@ if __name__ == "__main__":
     test_sigmoid_lut()
     test_csr_outer_product()
     test_mobilenet_dw_block()
+    test_concat_e2e()
+    test_slice_e2e()
 
     print(f"\n{'='*50}")
     print(f"Results: {COUNTS['pass']} passed, {COUNTS['fail']} failed")

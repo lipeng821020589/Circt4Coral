@@ -658,6 +658,115 @@ struct TosaTransposeLowering : public mlir::OpRewritePattern<mlir::tosa::Transpo
   }
 };
 
+
+//===----------------------------------------------------------------------===//
+// tosa.concat → sequential per-input getTiles → storeTiles at successive offsets
+//
+// Strategy: load each input in turn and write its tiles to consecutive slots
+// in the result TCM region.  For the common axis=0 / 1D case this is a plain
+// memory copy; we reuse the existing vle32/vse32 infrastructure.
+//===----------------------------------------------------------------------===//
+
+struct TosaConcatLowering : public mlir::OpRewritePattern<mlir::tosa::ConcatOp> {
+  using mlir::OpRewritePattern<mlir::tosa::ConcatOp>::OpRewritePattern;
+
+  mlir::LogicalResult matchAndRewrite(mlir::tosa::ConcatOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto sew = pickVConfig(tensorElementType(op.getResult())).first;
+    rewriter.create<VSetVLOp>(loc, sew, LMUL::M1);
+
+    // Accumulate all result tiles in order; each input contributes its tiles
+    // contiguously to the output.
+    llvm::SmallVector<mlir::Value> allTiles;
+    int64_t totalElems = 0;
+    for (auto input : op.getInput1()) {
+      int64_t n = numElements(input);
+      auto tiles = getTiles(input, sew, rewriter, loc);
+      for (auto t : tiles)
+        allTiles.push_back(t);
+      totalElems += n;
+    }
+
+    // storeTiles writes to the result slot at kResultSlot using progressive
+    // addresses; the whole concatenated output lands there as a flat array.
+    storeTiles(allTiles, sew, totalElems, rewriter, loc);
+    rewriter.replaceOp(op, tileCarrier(op, allTiles, rewriter));
+    return mlir::success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// tosa.slice → vle32 of a contiguous sub-range of the input tensor
+//
+// Restriction (current): start and size must come from tosa.const_shape ops,
+// and we only handle axis=0 / flat-tensor slicing (start[0] = element offset).
+// Non-constant shapes fall back to a passthrough (no-op) for now.
+//===----------------------------------------------------------------------===//
+
+/// Try to extract a flat array of int64 values from a tosa.const_shape operand.
+static llvm::SmallVector<int64_t>
+getConstShapeValues(mlir::Value v) {
+  auto *defOp = v.getDefiningOp();
+  if (!defOp)
+    return {};
+  auto cso = mlir::dyn_cast<mlir::tosa::ConstShapeOp>(defOp);
+  if (!cso)
+    return {};
+  llvm::SmallVector<int64_t> out;
+  for (int64_t val : cso.getValues().getValues<int64_t>())
+    out.push_back(val);
+  return out;
+}
+
+struct TosaSliceLowering : public mlir::OpRewritePattern<mlir::tosa::SliceOp> {
+  using mlir::OpRewritePattern<mlir::tosa::SliceOp>::OpRewritePattern;
+
+  mlir::LogicalResult matchAndRewrite(mlir::tosa::SliceOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+
+    // Extract compile-time start and size.
+    auto startVals = getConstShapeValues(op.getStart());
+    auto sizeVals  = getConstShapeValues(op.getSize());
+    if (startVals.empty() || sizeVals.empty()) {
+      // Non-constant slice: fall back to passthrough (output = input).
+      rewriter.replaceOp(op, op.getInput1());
+      return mlir::success();
+    }
+
+    // Flat element offset and count (axis=0 semantics on flattened tensor).
+    int64_t elemOffset = startVals[0];
+    int64_t sliceElems = sizeVals[0];
+
+    auto sew = pickVConfig(tensorElementType(op.getResult())).first;
+    int64_t cap = vregCapacity(sew);
+    int64_t sewBytes = (sew == SEW::E8 ? 1 : sew == SEW::E16 ? 2 : 4);
+    rewriter.create<VSetVLOp>(loc, sew, LMUL::M1);
+
+    // Determine the input operand's TCM base address.
+    // If it originates from a BlockArgument, we can derive its slot precisely.
+    int64_t argSlot = 0;
+    if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(op.getInput1()))
+      argSlot = barg.getArgNumber();
+
+    int64_t byteOffset = elemOffset * sewBytes;
+    int64_t k = (sliceElems + cap - 1) / cap;
+
+    llvm::SmallVector<mlir::Value> res;
+    for (int64_t i = 0; i < k; ++i) {
+      int64_t elems = (i == k - 1) ? (sliceElems - i * cap) : cap;
+      int64_t addr  = kTcmBase + argSlot * kTcmSlot + byteOffset + i * kTileBytes;
+      auto addrV = createI32Const(loc, (int32_t)addr, rewriter);
+      auto nV    = createI32Const(loc, (int32_t)elems, rewriter);
+      res.push_back(rewriter.create<VLE32Op>(loc, addrV, nV).getResult());
+    }
+    storeTiles(res, sew, sliceElems, rewriter, loc);
+    rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
+    return mlir::success();
+  }
+};
+
 //===----------------------------------------------------------------------===//
 // tosa.conv2d → vle8 + outer_product + accread + vse32
 //===----------------------------------------------------------------------===//
@@ -1035,6 +1144,7 @@ struct TosaToCoralNPUPass
                      TosaClampLowering, TosaRescaleLowering,
                      TosaTableLowering, TosaSigmoidLowering>(ctx);
     tosaPatterns.add<TosaReshapeLowering, TosaTransposeLowering>(ctx);
+    tosaPatterns.add<TosaConcatLowering, TosaSliceLowering>(ctx);
     tosaPatterns.add<TosaConv2DLowering, TosaDepthwiseConv2DLowering>(ctx);
     tosaPatterns.add<TosaMatMulLowering>(ctx);
     tosaPatterns.add<TosaPadLowering, TosaAvgPool2dLowering,
