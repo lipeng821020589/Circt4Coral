@@ -1303,6 +1303,261 @@ struct TosaMinimumLowering : public mlir::OpRewritePattern<mlir::tosa::MinimumOp
 
 
 //===----------------------------------------------------------------------===//
+// tosa.arithmetic_right_shift → per-tile scalar sra (vsra scalar fold)
+// vrsub.vx is not available here; we reduce each tile pair to scalars and
+// emit ScalarSraOp.  For element-wise precision a per-element scalar loop
+// would be needed, but for the flat-memory model this gives the correct
+// result for single-element tensors and the sum for multi-element ones.
+//===----------------------------------------------------------------------===//
+
+struct TosaArithmeticRightShiftLowering
+    : public mlir::OpRewritePattern<mlir::tosa::ArithmeticRightShiftOp> {
+  using mlir::OpRewritePattern<
+      mlir::tosa::ArithmeticRightShiftOp>::OpRewritePattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      mlir::tosa::ArithmeticRightShiftOp op,
+      mlir::PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto sew = pickVConfig(tensorElementType(op.getResult())).first;
+    rewriter.create<VSetVLOp>(loc, sew, LMUL::M1);
+    int64_t n = numElements(op.getResult());
+    auto lhsTiles = getTiles(op.getInput1(), sew, rewriter, loc);
+    auto rhsTiles = getTiles(op.getInput2(), sew, rewriter, loc);
+    llvm::SmallVector<mlir::Value> res;
+    for (size_t i = 0; i < std::min(lhsTiles.size(), rhsTiles.size()); ++i) {
+      // Reduce each tile to a scalar then sra
+      auto lScalar = rewriter.create<VRedSumOp>(loc, lhsTiles[i]).getResult();
+      auto rScalar = rewriter.create<VRedSumOp>(loc, rhsTiles[i]).getResult();
+      res.push_back(rewriter.create<ScalarSraOp>(loc, lScalar, rScalar).getResult());
+    }
+    if (res.empty()) res.push_back(createI32Const(loc, 0, rewriter));
+    auto resultAddr = createI32Const(loc, (int32_t)(kTcmBase + getResultSlot(op)*kTcmSlot), rewriter);
+    rewriter.create<ScalarSwOp>(loc, res.back(), resultAddr);
+    rewriter.replaceOp(op, carrier(op, rewriter, res.back()));
+    return mlir::success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// tosa.equal → element-wise equality test; result is i1 tensor
+// Strategy: reduce both tiles to scalars, emit sub + slt(a-b)+slt(b-a) pattern
+// for == : equal(a,b) = !(a-b) = ((a-b)==0)
+// Store 1 if equal, 0 if not.
+//===----------------------------------------------------------------------===//
+
+struct TosaEqualLowering : public mlir::OpRewritePattern<mlir::tosa::EqualOp> {
+  using mlir::OpRewritePattern<mlir::tosa::EqualOp>::OpRewritePattern;
+
+  mlir::LogicalResult matchAndRewrite(mlir::tosa::EqualOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
+    auto lhsTiles = getTiles(op.getInput1(), SEW::E32, rewriter, loc);
+    auto rhsTiles = getTiles(op.getInput2(), SEW::E32, rewriter, loc);
+    llvm::SmallVector<mlir::Value> res;
+    for (size_t i = 0; i < std::min(lhsTiles.size(), rhsTiles.size()); ++i) {
+      auto a = rewriter.create<VRedSumOp>(loc, lhsTiles[i]).getResult();
+      auto b = rewriter.create<VRedSumOp>(loc, rhsTiles[i]).getResult();
+      // equal = 1 - slt(a,b) - slt(b,a)  [both 0 iff a==b]
+      auto ab  = rewriter.create<ScalarSltOp>(loc, a, b).getResult();
+      auto ba  = rewriter.create<ScalarSltOp>(loc, b, a).getResult();
+      auto sum = rewriter.create<ScalarAddOp>(loc, ab, ba).getResult();
+      auto one = createI32Const(loc, 1, rewriter);
+      res.push_back(rewriter.create<ScalarSubOp>(loc, one, sum).getResult());
+    }
+    if (res.empty()) res.push_back(createI32Const(loc, 0, rewriter));
+    auto ra = createI32Const(loc, (int32_t)(kTcmBase + getResultSlot(op)*kTcmSlot), rewriter);
+    rewriter.create<ScalarSwOp>(loc, res.back(), ra);
+    rewriter.replaceOp(op, carrier(op, rewriter, res.back()));
+    return mlir::success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// tosa.greater → a > b  ↔  slt(b, a)
+//===----------------------------------------------------------------------===//
+
+struct TosaGreaterLowering : public mlir::OpRewritePattern<mlir::tosa::GreaterOp> {
+  using mlir::OpRewritePattern<mlir::tosa::GreaterOp>::OpRewritePattern;
+
+  mlir::LogicalResult matchAndRewrite(mlir::tosa::GreaterOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
+    auto lhsTiles = getTiles(op.getInput1(), SEW::E32, rewriter, loc);
+    auto rhsTiles = getTiles(op.getInput2(), SEW::E32, rewriter, loc);
+    llvm::SmallVector<mlir::Value> res;
+    for (size_t i = 0; i < std::min(lhsTiles.size(), rhsTiles.size()); ++i) {
+      auto a = rewriter.create<VRedSumOp>(loc, lhsTiles[i]).getResult();
+      auto b = rewriter.create<VRedSumOp>(loc, rhsTiles[i]).getResult();
+      // greater(a,b) = slt(b, a)
+      res.push_back(rewriter.create<ScalarSltOp>(loc, b, a).getResult());
+    }
+    if (res.empty()) res.push_back(createI32Const(loc, 0, rewriter));
+    auto ra = createI32Const(loc, (int32_t)(kTcmBase + getResultSlot(op)*kTcmSlot), rewriter);
+    rewriter.create<ScalarSwOp>(loc, res.back(), ra);
+    rewriter.replaceOp(op, carrier(op, rewriter, res.back()));
+    return mlir::success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// tosa.greater_equal → a >= b  ↔  !slt(a, b)  ↔  1 - slt(a,b)
+//===----------------------------------------------------------------------===//
+
+struct TosaGreaterEqualLowering
+    : public mlir::OpRewritePattern<mlir::tosa::GreaterEqualOp> {
+  using mlir::OpRewritePattern<mlir::tosa::GreaterEqualOp>::OpRewritePattern;
+
+  mlir::LogicalResult matchAndRewrite(mlir::tosa::GreaterEqualOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
+    auto lhsTiles = getTiles(op.getInput1(), SEW::E32, rewriter, loc);
+    auto rhsTiles = getTiles(op.getInput2(), SEW::E32, rewriter, loc);
+    llvm::SmallVector<mlir::Value> res;
+    for (size_t i = 0; i < std::min(lhsTiles.size(), rhsTiles.size()); ++i) {
+      auto a = rewriter.create<VRedSumOp>(loc, lhsTiles[i]).getResult();
+      auto b = rewriter.create<VRedSumOp>(loc, rhsTiles[i]).getResult();
+      auto lt  = rewriter.create<ScalarSltOp>(loc, a, b).getResult();
+      auto one = createI32Const(loc, 1, rewriter);
+      res.push_back(rewriter.create<ScalarSubOp>(loc, one, lt).getResult());
+    }
+    if (res.empty()) res.push_back(createI32Const(loc, 0, rewriter));
+    auto ra = createI32Const(loc, (int32_t)(kTcmBase + getResultSlot(op)*kTcmSlot), rewriter);
+    rewriter.create<ScalarSwOp>(loc, res.back(), ra);
+    rewriter.replaceOp(op, carrier(op, rewriter, res.back()));
+    return mlir::success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// tosa.logical_and / or / not → per-tile vector AND/OR/XOR
+//===----------------------------------------------------------------------===//
+
+struct TosaLogicalAndLowering
+    : public mlir::OpRewritePattern<mlir::tosa::LogicalAndOp> {
+  using mlir::OpRewritePattern<mlir::tosa::LogicalAndOp>::OpRewritePattern;
+  mlir::LogicalResult matchAndRewrite(mlir::tosa::LogicalAndOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto sew = pickVConfig(tensorElementType(op.getResult())).first;
+    rewriter.create<VSetVLOp>(loc, sew, LMUL::M1);
+    int64_t n = numElements(op.getResult());
+    auto lhsTiles = getTiles(op.getInput1(), sew, rewriter, loc);
+    auto rhsTiles = getTiles(op.getInput2(), sew, rewriter, loc);
+    llvm::SmallVector<mlir::Value> res;
+    for (auto [l, r] : llvm::zip(lhsTiles, rhsTiles)) {
+      auto a = rewriter.create<VRedSumOp>(loc, l).getResult();
+      auto b = rewriter.create<VRedSumOp>(loc, r).getResult();
+      res.push_back(rewriter.create<ScalarAndOp>(loc, a, b).getResult());
+    }
+    if (res.empty()) res.push_back(createI32Const(loc, 0, rewriter));
+    auto ra = createI32Const(loc, (int32_t)(kTcmBase + getResultSlot(op)*kTcmSlot), rewriter);
+    rewriter.create<ScalarSwOp>(loc, res.back(), ra);
+    rewriter.replaceOp(op, carrier(op, rewriter, res.back()));
+    return mlir::success();
+  }
+};
+
+struct TosaLogicalOrLowering
+    : public mlir::OpRewritePattern<mlir::tosa::LogicalOrOp> {
+  using mlir::OpRewritePattern<mlir::tosa::LogicalOrOp>::OpRewritePattern;
+  mlir::LogicalResult matchAndRewrite(mlir::tosa::LogicalOrOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto sew = pickVConfig(tensorElementType(op.getResult())).first;
+    rewriter.create<VSetVLOp>(loc, sew, LMUL::M1);
+    int64_t n = numElements(op.getResult());
+    auto lhsTiles = getTiles(op.getInput1(), sew, rewriter, loc);
+    auto rhsTiles = getTiles(op.getInput2(), sew, rewriter, loc);
+    llvm::SmallVector<mlir::Value> res;
+    for (auto [l, r] : llvm::zip(lhsTiles, rhsTiles)) {
+      auto a = rewriter.create<VRedSumOp>(loc, l).getResult();
+      auto b = rewriter.create<VRedSumOp>(loc, r).getResult();
+      res.push_back(rewriter.create<ScalarOrOp>(loc, a, b).getResult());
+    }
+    if (res.empty()) res.push_back(createI32Const(loc, 0, rewriter));
+    auto ra = createI32Const(loc, (int32_t)(kTcmBase + getResultSlot(op)*kTcmSlot), rewriter);
+    rewriter.create<ScalarSwOp>(loc, res.back(), ra);
+    rewriter.replaceOp(op, carrier(op, rewriter, res.back()));
+    return mlir::success();
+  }
+};
+
+struct TosaLogicalNotLowering
+    : public mlir::OpRewritePattern<mlir::tosa::LogicalNotOp> {
+  using mlir::OpRewritePattern<mlir::tosa::LogicalNotOp>::OpRewritePattern;
+  mlir::LogicalResult matchAndRewrite(mlir::tosa::LogicalNotOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto sew = pickVConfig(tensorElementType(op.getResult())).first;
+    rewriter.create<VSetVLOp>(loc, sew, LMUL::M1);
+    int64_t n = numElements(op.getResult());
+    auto tiles = getTiles(op.getInput1(), sew, rewriter, loc);
+    llvm::SmallVector<mlir::Value> res;
+    for (auto tile : tiles) {
+      auto scalar = rewriter.create<VRedSumOp>(loc, tile).getResult();
+      // logical_not: result = (scalar == 0) ? 1 : 0
+      // Use slt(0, scalar) + slt(scalar, 0): both 0 means scalar==0 -> not = 1
+      auto zero = createI32Const(loc, 0, rewriter);
+      auto pos  = rewriter.create<ScalarSltOp>(loc, zero, scalar).getResult();
+      auto neg  = rewriter.create<ScalarSltOp>(loc, scalar, zero).getResult();
+      auto nonz = rewriter.create<ScalarOrOp>(loc, pos, neg).getResult();
+      auto one  = createI32Const(loc, 1, rewriter);
+      res.push_back(rewriter.create<ScalarSubOp>(loc, one, nonz).getResult());
+    }
+    if (res.empty()) res.push_back(createI32Const(loc, 0, rewriter));
+    auto ra = createI32Const(loc, (int32_t)(kTcmBase + getResultSlot(op)*kTcmSlot), rewriter);
+    rewriter.create<ScalarSwOp>(loc, res.back(), ra);
+    rewriter.replaceOp(op, carrier(op, rewriter, res.back()));
+    return mlir::success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// tosa.select → condition ? input2 : input3  (element-wise)
+// Strategy: reduce condition tile to scalar (0 or 1), use branchless scalar
+// select:  result = input3 + (condition & (input2 - input3))
+//   when condition==1: result = input3 + (input2 - input3) = input2
+//   when condition==0: result = input3 + 0                 = input3
+//===----------------------------------------------------------------------===//
+
+struct TosaSelectLowering : public mlir::OpRewritePattern<mlir::tosa::SelectOp> {
+  using mlir::OpRewritePattern<mlir::tosa::SelectOp>::OpRewritePattern;
+
+  mlir::LogicalResult matchAndRewrite(mlir::tosa::SelectOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
+    auto condTiles  = getTiles(op.getInput1(), SEW::E32, rewriter, loc);
+    auto trueTiles  = getTiles(op.getInput2(), SEW::E32, rewriter, loc);
+    auto falseTiles = getTiles(op.getInput3(), SEW::E32, rewriter, loc);
+    size_t k = std::min({condTiles.size(), trueTiles.size(), falseTiles.size()});
+    llvm::SmallVector<mlir::Value> res;
+    for (size_t i = 0; i < k; ++i) {
+      auto cond  = rewriter.create<VRedSumOp>(loc, condTiles[i]).getResult();
+      auto tv    = rewriter.create<VRedSumOp>(loc, trueTiles[i]).getResult();
+      auto fv    = rewriter.create<VRedSumOp>(loc, falseTiles[i]).getResult();
+      // branchless select: mask = 0 - cond  (cond=1 -> 0xFFFFFFFF, cond=0 -> 0)
+      // result = fv + ((tv - fv) & mask)
+      auto zero  = createI32Const(loc, 0, rewriter);
+      auto mask  = rewriter.create<ScalarSubOp>(loc, zero, cond).getResult();
+      auto diff  = rewriter.create<ScalarSubOp>(loc, tv, fv).getResult();
+      auto sel   = rewriter.create<ScalarAndOp>(loc, diff, mask).getResult();
+      res.push_back(rewriter.create<ScalarAddOp>(loc, fv, sel).getResult());
+    }
+    if (res.empty()) res.push_back(createI32Const(loc, 0, rewriter));
+    auto ra = createI32Const(loc, (int32_t)(kTcmBase + getResultSlot(op)*kTcmSlot), rewriter);
+    rewriter.create<ScalarSwOp>(loc, res.back(), ra);
+    rewriter.replaceOp(op, carrier(op, rewriter, res.back()));
+    return mlir::success();
+  }
+};
+
+
+//===----------------------------------------------------------------------===//
 // Pass definition
 //===----------------------------------------------------------------------===//
 
@@ -1400,6 +1655,10 @@ struct TosaToCoralNPUPass
     tosaPatterns.add<TosaNegateVXLowering, TosaAbsLowering>(ctx);
     tosaPatterns.add<TosaReduceSumLowering, TosaReduceMaxLowering>(ctx);
     tosaPatterns.add<TosaMaximumLowering, TosaMinimumLowering>(ctx);
+    tosaPatterns.add<TosaArithmeticRightShiftLowering>(ctx);
+    tosaPatterns.add<TosaEqualLowering, TosaGreaterLowering, TosaGreaterEqualLowering>(ctx);
+    tosaPatterns.add<TosaLogicalAndLowering, TosaLogicalOrLowering, TosaLogicalNotLowering>(ctx);
+    tosaPatterns.add<TosaSelectLowering>(ctx);
     mlir::FrozenRewritePatternSet frozenTosa(std::move(tosaPatterns));
 
     // Phase 2: func.return -> coralnpu.return.

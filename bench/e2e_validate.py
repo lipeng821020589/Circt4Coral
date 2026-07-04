@@ -1322,6 +1322,108 @@ func.func @cast_widen(%a: tensor<4xi8>) -> tensor<4xi32> {
         if elf_path.exists(): elf_path.unlink()
 
 
+
+def test_ars_e2e():
+    print("\n=== TEST 20: tosa.arithmetic_right_shift (16 >> 2 = 4) ===")
+    mlir = """\
+func.func @ars(%a: tensor<1xi32>, %b: tensor<1xi32>) -> tensor<1xi32> {
+  %0 = tosa.arithmetic_right_shift %a, %b {round = false}
+      : (tensor<1xi32>, tensor<1xi32>) -> tensor<1xi32>
+  func.return %0 : tensor<1xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu","--coralnpu-legalize","--coralnpu-regalloc","--emit-coralnpu-assembly"]
+    insns = extract_asm_instructions(run_circt_opt(mlir, passes))
+    a = [16] + [0]*15; b = [2] + [0]*15
+    RESULT_ADDR = TCM_BASE + 8 * TCM_SLOT
+    prologue = [".section .text",".globl _start","_start:",
+                "    csrr  t0, mstatus","    li    t1, 0x600",
+                "    or    t0, t0, t1","    csrw  mstatus, t0"]
+    prologue += write_int32_to_asm_init(a, TCM_BASE + 0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(b, TCM_BASE + 1 * TCM_SLOT)
+    full_asm = "\n".join(prologue)+"\n"+"\n".join(insns)+"\n.Lexit:\n    ebreak\n"
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 4)
+        check_result("ars(16, 2)", [struct.unpack("<i",raw)[0]], [4])
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
+
+def test_equal_e2e():
+    print("\n=== TEST 21: tosa.equal (5==5 -> 1, 5==3 -> 0) ===")
+    mlir = """\
+func.func @eq(%a: tensor<1xi32>, %b: tensor<1xi32>) -> tensor<1xi1> {
+  %0 = tosa.equal %a, %b : (tensor<1xi32>, tensor<1xi32>) -> tensor<1xi1>
+  func.return %0 : tensor<1xi1>
+}
+"""
+    passes = ["--tosa-to-coralnpu","--coralnpu-legalize","--coralnpu-regalloc","--emit-coralnpu-assembly"]
+    # Test 5==5 -> 1
+    insns = extract_asm_instructions(run_circt_opt(mlir, passes))
+    a5=[5]+[0]*15; b5=[5]+[0]*15; b3=[3]+[0]*15
+    RESULT_ADDR = TCM_BASE + 8 * TCM_SLOT
+    def run_eq(av, bv, expect):
+        prologue = [".section .text",".globl _start","_start:",
+                    "    csrr  t0, mstatus","    li    t1, 0x600",
+                    "    or    t0, t0, t1","    csrw  mstatus, t0"]
+        prologue += write_int32_to_asm_init(av, TCM_BASE + 0 * TCM_SLOT)
+        prologue += write_int32_to_asm_init(bv, TCM_BASE + 1 * TCM_SLOT)
+        full_asm = "\n".join(prologue)+"\n"+"\n".join(insns)+"\n.Lexit:\n    ebreak\n"
+        with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+            elf_path = Path(ef.name)
+        try:
+            build_elf(full_asm, elf_path)
+            raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 4)
+            check_result(f"equal({av[0]},{bv[0]})", [struct.unpack("<i",raw)[0]], [expect])
+        except Exception as e:
+            print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+        finally:
+            if elf_path.exists(): elf_path.unlink()
+    run_eq(a5, b5, 1)
+    run_eq(a5, b3, 0)
+
+
+def test_select_e2e():
+    print("\n=== TEST 22: tosa.select (cond=1 -> a, cond=0 -> b) ===")
+    mlir = """\
+func.func @sel(%cond: tensor<1xi1>, %a: tensor<1xi32>, %b: tensor<1xi32>) -> tensor<1xi32> {
+  %0 = tosa.select %cond, %a, %b
+      : (tensor<1xi1>, tensor<1xi32>, tensor<1xi32>) -> tensor<1xi32>
+  func.return %0 : tensor<1xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu","--coralnpu-legalize","--coralnpu-regalloc","--emit-coralnpu-assembly"]
+    insns = extract_asm_instructions(run_circt_opt(mlir, passes))
+    va=[42]+[0]*15; vb=[99]+[0]*15
+    RESULT_ADDR = TCM_BASE + 8 * TCM_SLOT
+    def run_sel(cond_val, expect):
+        cond=[cond_val]+[0]*15
+        prologue = [".section .text",".globl _start","_start:",
+                    "    csrr  t0, mstatus","    li    t1, 0x600",
+                    "    or    t0, t0, t1","    csrw  mstatus, t0"]
+        prologue += write_int32_to_asm_init(cond, TCM_BASE + 0 * TCM_SLOT)
+        prologue += write_int32_to_asm_init(va,   TCM_BASE + 1 * TCM_SLOT)
+        prologue += write_int32_to_asm_init(vb,   TCM_BASE + 2 * TCM_SLOT)
+        full_asm = "\n".join(prologue)+"\n"+"\n".join(insns)+"\n.Lexit:\n    ebreak\n"
+        with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+            elf_path = Path(ef.name)
+        try:
+            build_elf(full_asm, elf_path)
+            raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 4)
+            check_result(f"select(cond={cond_val},42,99)", [struct.unpack("<i",raw)[0]], [expect])
+        except Exception as e:
+            print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+        finally:
+            if elf_path.exists(): elf_path.unlink()
+    run_sel(1, 42)  # cond=1 -> a=42
+    run_sel(0, 99)  # cond=0 -> b=99
+
+
 # ── 主程序 ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1355,6 +1457,9 @@ if __name__ == "__main__":
     test_maximum_e2e()
     test_minimum_e2e()
     test_cast_widen_e2e()
+    test_ars_e2e()
+    test_equal_e2e()
+    test_select_e2e()
 
     print(f"\n{'='*50}")
     print(f"Results: {COUNTS['pass']} passed, {COUNTS['fail']} failed")
