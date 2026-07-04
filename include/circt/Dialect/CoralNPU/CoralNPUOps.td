@@ -304,6 +304,31 @@ def VMaxVXOp : CoralNPU_Op<"vmax_vx", [Pure]> {
   let assemblyFormat = "$vector attr-dict `:` type($result)";
 }
 
+
+def VMaxVVOp : CoralNPU_Op<"vmax_vv", [Pure, SameTypeOperands, SameOperandsAndResultType]> {
+  let summary = "Vector-vector signed max: vd[i] = max(vs1[i], vs2[i])";
+  let description = [{
+    Per-element signed maximum of two vector registers.
+    Used for element-wise maximum operations (tosa.maximum).
+    Maps to vmax.vv vD, vS1, vS2 (funct6=0b000111, funct3=000).
+  }];
+  let arguments = (ins I32:$lhs, I32:$rhs);
+  let results = (outs I32:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($result)";
+}
+
+def VMinVVOp : CoralNPU_Op<"vmin_vv", [Pure, SameTypeOperands, SameOperandsAndResultType]> {
+  let summary = "Vector-vector signed min: vd[i] = min(vs1[i], vs2[i])";
+  let description = [{
+    Per-element signed minimum of two vector registers.
+    Used for element-wise minimum operations (tosa.minimum).
+    Maps to vmin.vv vD, vS1, vS2 (funct6=0b000101, funct3=000).
+  }];
+  let arguments = (ins I32:$lhs, I32:$rhs);
+  let results = (outs I32:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($result)";
+}
+
 def VDotOp : CoralNPU_Op<"vdot", [Pure]> {
   let summary = "Vector dot product (4×int8→int32)";
   let description = [{

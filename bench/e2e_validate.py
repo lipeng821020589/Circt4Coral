@@ -1167,6 +1167,129 @@ func.func @slice_e2e(%a: tensor<8xi32>) -> tensor<4xi32> {
             elf_path.unlink()
 
 
+
+def test_reduce_sum_e2e():
+    print("\n=== TEST 15: tosa.reduce_sum ([3,1,4,1]) -> 9 ===")
+    mlir = """\
+func.func @reduce_sum(%a: tensor<4xi32>) -> tensor<1xi32> {
+  %0 = tosa.reduce_sum %a {axis = 0 : i32} : (tensor<4xi32>) -> tensor<1xi32>
+  func.return %0 : tensor<1xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu","--coralnpu-legalize","--coralnpu-regalloc","--emit-coralnpu-assembly"]
+    insns = extract_asm_instructions(run_circt_opt(mlir, passes))
+    a = [3, 1, 4, 1] + [0]*12
+    RESULT_ADDR = TCM_BASE + 8 * TCM_SLOT
+    prologue = [".section .text",".globl _start","_start:",
+                "    csrr  t0, mstatus","    li    t1, 0x600",
+                "    or    t0, t0, t1","    csrw  mstatus, t0"]
+    prologue += write_int32_to_asm_init(a, TCM_BASE + 0 * TCM_SLOT)
+    full_asm = "\n".join(prologue)+"\n"+"\n".join(insns)+"\n.Lexit:\n    ebreak\n"
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 4)
+        check_result("reduce_sum([3,1,4,1])", [struct.unpack("<i",raw)[0]], [9])
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
+
+def test_reduce_max_e2e():
+    print("\n=== TEST 16: tosa.reduce_max ([3,7,1,5]) -> 7 ===")
+    mlir = """\
+func.func @reduce_max(%a: tensor<4xi32>) -> tensor<1xi32> {
+  %0 = tosa.reduce_max %a {axis = 0 : i32} : (tensor<4xi32>) -> tensor<1xi32>
+  func.return %0 : tensor<1xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu","--coralnpu-legalize","--coralnpu-regalloc","--emit-coralnpu-assembly"]
+    insns = extract_asm_instructions(run_circt_opt(mlir, passes))
+    a = [3, 7, 1, 5] + [0]*12
+    RESULT_ADDR = TCM_BASE + 8 * TCM_SLOT
+    prologue = [".section .text",".globl _start","_start:",
+                "    csrr  t0, mstatus","    li    t1, 0x600",
+                "    or    t0, t0, t1","    csrw  mstatus, t0"]
+    prologue += write_int32_to_asm_init(a, TCM_BASE + 0 * TCM_SLOT)
+    full_asm = "\n".join(prologue)+"\n"+"\n".join(insns)+"\n.Lexit:\n    ebreak\n"
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 4)
+        check_result("reduce_max([3,7,1,5])", [struct.unpack("<i",raw)[0]], [7])
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
+
+def test_maximum_e2e():
+    print("\n=== TEST 17: tosa.maximum ([1,5,3,7],[4,2,6,0]) -> [4,5,6,7] ===")
+    mlir = """\
+func.func @maximum(%a: tensor<4xi32>, %b: tensor<4xi32>) -> tensor<4xi32> {
+  %0 = tosa.maximum %a, %b : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi32>
+  func.return %0 : tensor<4xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu","--coralnpu-legalize","--coralnpu-regalloc","--emit-coralnpu-assembly"]
+    insns = extract_asm_instructions(run_circt_opt(mlir, passes))
+    a = [1, 5, 3, 7] + [0]*12
+    b = [4, 2, 6, 0] + [0]*12
+    RESULT_ADDR = TCM_BASE + 8 * TCM_SLOT
+    prologue = [".section .text",".globl _start","_start:",
+                "    csrr  t0, mstatus","    li    t1, 0x600",
+                "    or    t0, t0, t1","    csrw  mstatus, t0"]
+    prologue += write_int32_to_asm_init(a, TCM_BASE + 0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(b, TCM_BASE + 1 * TCM_SLOT)
+    full_asm = "\n".join(prologue)+"\n"+"\n".join(insns)+"\n.Lexit:\n    ebreak\n"
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 16)
+        vals = list(struct.unpack("<4i", raw))
+        check_result("maximum([1,5,3,7],[4,2,6,0])", vals, [4, 5, 6, 7])
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
+
+def test_minimum_e2e():
+    print("\n=== TEST 18: tosa.minimum ([1,5,3,7],[4,2,6,0]) -> [1,2,3,0] ===")
+    mlir = """\
+func.func @minimum(%a: tensor<4xi32>, %b: tensor<4xi32>) -> tensor<4xi32> {
+  %0 = tosa.minimum %a, %b : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi32>
+  func.return %0 : tensor<4xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu","--coralnpu-legalize","--coralnpu-regalloc","--emit-coralnpu-assembly"]
+    insns = extract_asm_instructions(run_circt_opt(mlir, passes))
+    a = [1, 5, 3, 7] + [0]*12
+    b = [4, 2, 6, 0] + [0]*12
+    RESULT_ADDR = TCM_BASE + 8 * TCM_SLOT
+    prologue = [".section .text",".globl _start","_start:",
+                "    csrr  t0, mstatus","    li    t1, 0x600",
+                "    or    t0, t0, t1","    csrw  mstatus, t0"]
+    prologue += write_int32_to_asm_init(a, TCM_BASE + 0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(b, TCM_BASE + 1 * TCM_SLOT)
+    full_asm = "\n".join(prologue)+"\n"+"\n".join(insns)+"\n.Lexit:\n    ebreak\n"
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 16)
+        vals = list(struct.unpack("<4i", raw))
+        check_result("minimum([1,5,3,7],[4,2,6,0])", vals, [1, 2, 3, 0])
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
+
 # ── 主程序 ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1195,6 +1318,10 @@ if __name__ == "__main__":
     test_mobilenet_dw_block()
     test_concat_e2e()
     test_slice_e2e()
+    test_reduce_sum_e2e()
+    test_reduce_max_e2e()
+    test_maximum_e2e()
+    test_minimum_e2e()
 
     print(f"\n{'='*50}")
     print(f"Results: {COUNTS['pass']} passed, {COUNTS['fail']} failed")

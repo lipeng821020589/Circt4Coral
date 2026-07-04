@@ -246,6 +246,14 @@ static void emitInstruction(mlir::Operation *op, llvm::raw_ostream &os) {
     // vrsub.vx vD, vS, x0: vD[i] = 0 - vS[i]  (element-wise negate)
     os << "vrsub.vx " << getVReg(op, "vreg_out_0") << ", "
        << getVReg(op, "vreg_0") << ", x0\n";
+  else if (mlir::isa<VMaxVVOp>(op))
+    // vmax.vv vD, vS1, vS2: per-element signed max
+    os << "vmax.vv " << getVReg(op, "vreg_out_0") << ", "
+       << getVReg(op, "vreg_0") << ", " << getVReg(op, "vreg_1") << "\n";
+  else if (mlir::isa<VMinVVOp>(op))
+    // vmin.vv vD, vS1, vS2: per-element signed min
+    os << "vmin.vv " << getVReg(op, "vreg_out_0") << ", "
+       << getVReg(op, "vreg_0") << ", " << getVReg(op, "vreg_1") << "\n";
     else if (mlir::isa<VDotOp>(op)) {
     // RISC-V doesn't have a single vdot.vv; emulate with vmul + vredsum
     os << "vmul.vv  v0, " << getVReg(op, "vreg_0") << ", "
@@ -502,6 +510,10 @@ static uint32_t encodeBinary(mlir::Operation *op) {
     return 0xC4000057 | (rd() << 7);  // vwadd.vv v0
   if (mlir::isa<VWMACCOp>(op))
     return 0xF2002057 | (rd() << 7);  // vwmacc.vv (funct6=0b111100,funct3=010)
+  if (mlir::isa<VMaxVVOp>(op))
+    return 0x1C000057 | (rd() << 7);  // vmax.vv (funct6=0b000111,funct3=000,vm=1)
+  if (mlir::isa<VMinVVOp>(op))
+    return 0x14000057 | (rd() << 7);  // vmin.vv (funct6=0b000101,funct3=000,vm=1)
   if (mlir::isa<VSubVXOp>(op))
     return 0x0E004057 | (rd() << 7);  // vrsub.vx (funct6=0b000011,funct3=100)
   if (mlir::isa<VDotOp>(op))
@@ -588,7 +600,7 @@ struct CoralNPUEmitAssemblyPass
 
       for (auto &op : *block) {
         if (op.getDialect() && op.getDialect()->getNamespace() == "coralnpu") {
-          if (mlir::isa<VAddOp, VSubOp, VMulOp, VWAddOp, VWMACCOp, VSubVXOp, VDotOp,
+          if (mlir::isa<VAddOp, VSubOp, VMulOp, VWAddOp, VWMACCOp, VSubVXOp, VMaxVVOp, VMinVVOp, VDotOp,
                         VLE8Op, VLE16Op, VLE32Op, VSE8Op, VSE16Op, VSE32Op,
                         VRedSumOp, VRedMaxOp, VMaxVXOp>(&op)) {
             llvm::outs() << "vsetivli x0, 16, e32, m1, ta, ma  # auto vsetvl\n";

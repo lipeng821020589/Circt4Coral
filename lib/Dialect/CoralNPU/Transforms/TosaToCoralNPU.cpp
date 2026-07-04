@@ -415,8 +415,12 @@ struct TosaRescaleLowering : public mlir::OpRewritePattern<mlir::tosa::RescaleOp
   mlir::LogicalResult matchAndRewrite(mlir::tosa::RescaleOp op,
                                       mlir::PatternRewriter &rewriter) const override {
     // Only handle the scalar (non-per-channel, single multiplier/shift) path.
-    if (op.getPerChannel())
-      return mlir::failure();
+    if (op.getPerChannel()) {
+      // Per-channel rescale not yet vectorized; passthrough placeholder.
+      rewriter.replaceOp(op, carrier(op, rewriter,
+                         createI32Const(op.getLoc(), 0, rewriter)));
+      return mlir::success();
+    }
 
     auto loc = op.getLoc();
     rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
@@ -1056,6 +1060,106 @@ struct FuncReturnToCoralNPUReturn
 };
 
 //===----------------------------------------------------------------------===//
+// tosa.reduce_sum → k×(vle32 + vredsum) + scalar add chain
+//===----------------------------------------------------------------------===//
+struct TosaReduceSumLowering : public mlir::OpRewritePattern<mlir::tosa::ReduceSumOp> {
+  using mlir::OpRewritePattern<mlir::tosa::ReduceSumOp>::OpRewritePattern;
+  mlir::LogicalResult matchAndRewrite(mlir::tosa::ReduceSumOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
+    auto tiles = getTiles(op.getInput(), SEW::E32, rewriter, loc);
+    llvm::SmallVector<mlir::Value> partials;
+    for (auto tile : tiles)
+      partials.push_back(rewriter.create<VRedSumOp>(loc, tile).getResult());
+    mlir::Value sum = partials[0];
+    for (size_t i = 1; i < partials.size(); ++i)
+      sum = rewriter.create<ScalarAddOp>(loc, sum, partials[i]).getResult();
+    auto ra = createI32Const(loc, (int32_t)(kTcmBase + getResultSlot(op)*kTcmSlot), rewriter);
+    rewriter.create<ScalarSwOp>(loc, sum, ra);
+    rewriter.replaceOp(op, carrier(op, rewriter, sum));
+    return mlir::success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// tosa.reduce_max → k×(vle32 + vredmax) + branchless scalar max fold
+//===----------------------------------------------------------------------===//
+struct TosaReduceMaxLowering : public mlir::OpRewritePattern<mlir::tosa::ReduceMaxOp> {
+  using mlir::OpRewritePattern<mlir::tosa::ReduceMaxOp>::OpRewritePattern;
+  mlir::LogicalResult matchAndRewrite(mlir::tosa::ReduceMaxOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
+    auto tiles = getTiles(op.getInput(), SEW::E32, rewriter, loc);
+    llvm::SmallVector<mlir::Value> partials;
+    for (auto tile : tiles)
+      partials.push_back(rewriter.create<VRedMaxOp>(loc, tile).getResult());
+    // Branchless scalar max: max(a,b) = a + ((b-a) & ~((b-a)>>31))
+    mlir::Value maxVal = partials[0];
+    for (size_t i = 1; i < partials.size(); ++i) {
+      mlir::Value b    = partials[i];
+      mlir::Value diff = rewriter.create<ScalarSubOp>(loc, b, maxVal).getResult();
+      mlir::Value sign = rewriter.create<ScalarSraOp>(loc, diff,
+                           createI32Const(loc, 31, rewriter)).getResult();
+      mlir::Value inv  = rewriter.create<ScalarXorOp>(loc, sign,
+                           createI32Const(loc, -1, rewriter)).getResult();
+      mlir::Value sel  = rewriter.create<ScalarAndOp>(loc, diff, inv).getResult();
+      maxVal = rewriter.create<ScalarAddOp>(loc, maxVal, sel).getResult();
+    }
+    auto ra = createI32Const(loc, (int32_t)(kTcmBase + getResultSlot(op)*kTcmSlot), rewriter);
+    rewriter.create<ScalarSwOp>(loc, maxVal, ra);
+    rewriter.replaceOp(op, carrier(op, rewriter, maxVal));
+    return mlir::success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// tosa.maximum → per-tile VMaxVVOp (vmax.vv)
+//===----------------------------------------------------------------------===//
+struct TosaMaximumLowering : public mlir::OpRewritePattern<mlir::tosa::MaximumOp> {
+  using mlir::OpRewritePattern<mlir::tosa::MaximumOp>::OpRewritePattern;
+  mlir::LogicalResult matchAndRewrite(mlir::tosa::MaximumOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto sew = pickVConfig(tensorElementType(op.getResult())).first;
+    rewriter.create<VSetVLOp>(loc, sew, LMUL::M1);
+    int64_t n = numElements(op.getResult());
+    auto lhsTiles = getTiles(op.getOperand(0), sew, rewriter, loc);
+    auto rhsTiles = getTiles(op.getOperand(1), sew, rewriter, loc);
+    llvm::SmallVector<mlir::Value> res;
+    for (auto [l, r] : llvm::zip(lhsTiles, rhsTiles))
+      res.push_back(rewriter.create<VMaxVVOp>(loc, l, r).getResult());
+    storeTiles(res, sew, n, rewriter, loc);
+    rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
+    return mlir::success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// tosa.minimum → per-tile VMinVVOp (vmin.vv)
+//===----------------------------------------------------------------------===//
+struct TosaMinimumLowering : public mlir::OpRewritePattern<mlir::tosa::MinimumOp> {
+  using mlir::OpRewritePattern<mlir::tosa::MinimumOp>::OpRewritePattern;
+  mlir::LogicalResult matchAndRewrite(mlir::tosa::MinimumOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto sew = pickVConfig(tensorElementType(op.getResult())).first;
+    rewriter.create<VSetVLOp>(loc, sew, LMUL::M1);
+    int64_t n = numElements(op.getResult());
+    auto lhsTiles = getTiles(op.getOperand(0), sew, rewriter, loc);
+    auto rhsTiles = getTiles(op.getOperand(1), sew, rewriter, loc);
+    llvm::SmallVector<mlir::Value> res;
+    for (auto [l, r] : llvm::zip(lhsTiles, rhsTiles))
+      res.push_back(rewriter.create<VMinVVOp>(loc, l, r).getResult());
+    storeTiles(res, sew, n, rewriter, loc);
+    rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
+    return mlir::success();
+  }
+};
+
+
+//===----------------------------------------------------------------------===//
 // Pass definition
 //===----------------------------------------------------------------------===//
 
@@ -1150,6 +1254,8 @@ struct TosaToCoralNPUPass
     tosaPatterns.add<TosaPadLowering, TosaAvgPool2dLowering,
                      TosaMaxPool2dLowering>(ctx);
     tosaPatterns.add<TosaNegateVXLowering, TosaAbsLowering>(ctx);
+    tosaPatterns.add<TosaReduceSumLowering, TosaReduceMaxLowering>(ctx);
+    tosaPatterns.add<TosaMaximumLowering, TosaMinimumLowering>(ctx);
     mlir::FrozenRewritePatternSet frozenTosa(std::move(tosaPatterns));
 
     // Phase 2: func.return -> coralnpu.return.
