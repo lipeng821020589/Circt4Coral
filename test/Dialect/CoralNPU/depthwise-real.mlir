@@ -7,7 +7,8 @@
 // Each channel is processed as a dot product:
 //   out[c] = sum_{kh,kw}(in[c,kh,kw] * wt[kh,kw,c,0]) + bias[c]
 //
-// Lowering: per-tile VMulOp + VRedSumOp → scalar fold → bias load → sw.
+// Lowering (v0.4.0+): per-tile VWMACCOp (vwmacc.vv, int8 widening MAC)
+// + VRedSumOp → scalar fold → bias load → sw.
 //===----------------------------------------------------------------------===//
 
 // 1x1x4x4 input, 1x1x4x1 weight (pointwise depthwise): single tile pair.
@@ -15,15 +16,15 @@
 // CHECK: coralnpu.vsetvl e32, m1
 // CHECK: %[[IN0:.*]] = coralnpu.vle32
 // CHECK: %[[WT0:.*]] = coralnpu.vle32
-// CHECK: %[[MUL0:.*]] = coralnpu.vmul %[[IN0]], %[[WT0]]
-// CHECK: %[[S0:.*]] = coralnpu.vredsum %[[MUL0]]
+// CHECK: %[[ACC0:.*]] = coralnpu.vwmacc %[[IN0]], %[[WT0]]
+// CHECK: %[[S0:.*]] = coralnpu.vredsum %[[ACC0]]
 // CHECK: %{{.*}} = coralnpu.lw
 // CHECK: %{{.*}} = coralnpu.add %[[S0]]
 // CHECK: coralnpu.sw
 // ASM-LABEL: # CoralNPU Assembly
 // ASM: vle32.v
 // ASM: vle32.v
-// ASM: vmul.vv
+// ASM: vwmacc.vv
 // ASM: vmv.v.i
 // ASM: vredsum.vs
 // ASM: vmv.x.s

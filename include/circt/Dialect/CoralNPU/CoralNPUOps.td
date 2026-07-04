@@ -242,6 +242,33 @@ def VWAddOp : CoralNPU_Op<"vwadd", [Pure]> {
   let assemblyFormat = "(`stripmine` `=` $stripmine^)? $lhs `,` $rhs attr-dict `:` type($result)";
 }
 
+
+def VWMACCOp : CoralNPU_Op<"vwmacc", [Pure]> {
+  let summary = "Vector widening multiply-accumulate (int8 × int8 → int16 accumulate)";
+  let description = [{
+    Widening multiply-accumulate: acc[i] += lhs[i] * rhs[i]
+    where lhs and rhs are int8 elements and acc is int16/int32.
+    Maps to vwmacc.vv vD, vS1, vS2 (funct6=0b111100).
+    Used in depthwise_conv2d for bandwidth-efficient int8 MAC.
+  }];
+  let arguments = (ins I32:$lhs, I32:$rhs, I32:$acc,
+                   DefaultValuedAttr<ConfinedAttr<I32Attr, [IntMinValue<1>, IntMaxValue<4>]>, "1">:$stripmine);
+  let results = (outs I32:$result);
+  let assemblyFormat = "(`stripmine` `=` $stripmine^)? $lhs `,` $rhs `,` $acc attr-dict `:` type($result)";
+}
+
+def VSubVXOp : CoralNPU_Op<"vsub_vx", [Pure]> {
+  let summary = "Vector subtract from scalar: vd[i] = rs1 - vs2[i]  (vsub.vx)";
+  let description = [{
+    Subtracts each vector element from a scalar: result[i] = scalar - vector[i].
+    When scalar = x0 (zero), this implements element-wise negation.
+    Maps to vrsub.vx vD, vS, xS (RISC-V reversed-subtraction, funct6=0b000011).
+  }];
+  let arguments = (ins I32:$scalar, I32:$vector);
+  let results = (outs I32:$result);
+  let assemblyFormat = "$scalar `,` $vector attr-dict `:` type($result)";
+}
+
 def VRedSumOp : CoralNPU_Op<"vredsum", [Pure]> {
   let summary = "Vector reduction sum (vector→scalar)";
   let description = [{

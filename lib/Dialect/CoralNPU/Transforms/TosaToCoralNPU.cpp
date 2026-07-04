@@ -720,12 +720,16 @@ struct TosaDepthwiseConv2DLowering
     auto inTiles  = getTiles(op.getOperand(0), SEW::E32, rewriter, loc);
     auto wtTiles  = getTiles(op.getOperand(1), SEW::E32, rewriter, loc);
 
-    // Element-wise multiply each tile pair, then reduce-sum each product tile.
+    // Use VWMACCOp (vwmacc.vv) for bandwidth-efficient int8 MAC:
+    // acc[i] += in[i] * wt[i] with 8-bit inputs widening to 32-bit accumulator.
+    // Then reduce each acc tile to a scalar partial sum via VRedSumOp.
+    mlir::Value zeroAcc = createI32Const(loc, 0, rewriter);
     llvm::SmallVector<mlir::Value> partials;
     size_t numTiles = std::min(inTiles.size(), wtTiles.size());
     for (size_t i = 0; i < numTiles; ++i) {
-      auto prod = rewriter.create<VMulOp>(loc, inTiles[i], wtTiles[i], 1);
-      partials.push_back(rewriter.create<VRedSumOp>(loc, prod.getResult()).getResult());
+      // vwmacc.vv: accumulate in*wt into zeroAcc
+      auto acc = rewriter.create<VWMACCOp>(loc, inTiles[i], wtTiles[i], zeroAcc, 1);
+      partials.push_back(rewriter.create<VRedSumOp>(loc, acc.getResult()).getResult());
     }
 
     // Fold tile partial sums into one scalar.
@@ -947,6 +951,65 @@ struct FuncReturnToCoralNPUReturn
 // Pass definition
 //===----------------------------------------------------------------------===//
 
+
+//===----------------------------------------------------------------------===//
+// tosa.negate → per-tile vrsub.vx vD, vS, x0  (vD[i] = 0 - vS[i])
+//===----------------------------------------------------------------------===//
+
+struct TosaNegateVXLowering
+    : public mlir::OpRewritePattern<mlir::tosa::NegateOp> {
+  using mlir::OpRewritePattern<mlir::tosa::NegateOp>::OpRewritePattern;
+
+  mlir::LogicalResult matchAndRewrite(mlir::tosa::NegateOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto sew = pickVConfig(tensorElementType(op.getResult())).first;
+    rewriter.create<VSetVLOp>(loc, sew, LMUL::M1);
+    int64_t n = numElements(op.getResult());
+    auto tiles = getTiles(op.getInput1(), sew, rewriter, loc);
+    llvm::SmallVector<mlir::Value> res;
+    for (auto &t : tiles) {
+      auto zero = createI32Const(loc, 0, rewriter);
+      res.push_back(rewriter.create<VSubVXOp>(loc, zero, t).getResult());
+    }
+    storeTiles(res, sew, n, rewriter, loc);
+    rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
+    return mlir::success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// tosa.abs → abs(x) = max(x,0) + max(-x,0) via VSubVXOp + VMaxVXOp + VAddOp
+//===----------------------------------------------------------------------===//
+
+struct TosaAbsLowering
+    : public mlir::OpRewritePattern<mlir::tosa::AbsOp> {
+  using mlir::OpRewritePattern<mlir::tosa::AbsOp>::OpRewritePattern;
+
+  mlir::LogicalResult matchAndRewrite(mlir::tosa::AbsOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto sew = pickVConfig(tensorElementType(op.getResult())).first;
+    rewriter.create<VSetVLOp>(loc, sew, LMUL::M1);
+    int64_t n = numElements(op.getResult());
+    auto tiles = getTiles(op.getInput1(), sew, rewriter, loc);
+    llvm::SmallVector<mlir::Value> res;
+    for (auto &t : tiles) {
+      // pos_part = relu(x)  = max(x, 0)
+      auto pos = rewriter.create<VMaxVXOp>(loc, t).getResult();
+      // neg_part = relu(-x) = max(-x, 0);  neg = vrsub.vx t, x0
+      auto zero = createI32Const(loc, 0, rewriter);
+      auto neg      = rewriter.create<VSubVXOp>(loc, zero, t).getResult();
+      auto neg_part = rewriter.create<VMaxVXOp>(loc, neg).getResult();
+      // abs(x) = pos_part + neg_part  (only one is nonzero for any given i)
+      res.push_back(rewriter.create<VAddOp>(loc, pos, neg_part, 1).getResult());
+    }
+    storeTiles(res, sew, n, rewriter, loc);
+    rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
+    return mlir::success();
+  }
+};
+
 struct TosaToCoralNPUPass
     : public impl::TosaToCoralNPUBase<TosaToCoralNPUPass> {
   void runOnOperation() override {
@@ -977,6 +1040,7 @@ struct TosaToCoralNPUPass
     tosaPatterns.add<TosaMatMulLowering>(ctx);
     tosaPatterns.add<TosaPadLowering, TosaAvgPool2dLowering,
                      TosaMaxPool2dLowering>(ctx);
+    tosaPatterns.add<TosaNegateVXLowering, TosaAbsLowering>(ctx);
     mlir::FrozenRewritePatternSet frozenTosa(std::move(tosaPatterns));
 
     // Phase 2: func.return -> coralnpu.return.

@@ -238,7 +238,15 @@ static void emitInstruction(mlir::Operation *op, llvm::raw_ostream &os) {
     // widening add: vd (2*SEW) = vs1 (SEW) + vs2 (SEW)
     os << "vwadd.vv " << getVReg(op, "vreg_out_0") << ", "
        << getVReg(op, "vreg_0") << ", " << getVReg(op, "vreg_1") << "\n";
-  else if (mlir::isa<VDotOp>(op)) {
+  else if (mlir::isa<VWMACCOp>(op))
+    // vwmacc.vv vD, vS1, vS2: acc[i] += vS1[i]*vS2[i] (int8->int32 widening MAC)
+    os << "vwmacc.vv " << getVReg(op, "vreg_out_0") << ", "
+       << getVReg(op, "vreg_0") << ", " << getVReg(op, "vreg_1") << "\n";
+  else if (mlir::isa<VSubVXOp>(op))
+    // vrsub.vx vD, vS, x0: vD[i] = 0 - vS[i]  (element-wise negate)
+    os << "vrsub.vx " << getVReg(op, "vreg_out_0") << ", "
+       << getVReg(op, "vreg_0") << ", x0\n";
+    else if (mlir::isa<VDotOp>(op)) {
     // RISC-V doesn't have a single vdot.vv; emulate with vmul + vredsum
     os << "vmul.vv  v0, " << getVReg(op, "vreg_0") << ", "
        << getVReg(op, "vreg_1") << "  # vdot step 1: element-wise mul\n"
@@ -492,6 +500,10 @@ static uint32_t encodeBinary(mlir::Operation *op) {
     return 0x94000057 | (rd() << 7);  // vmul.vv v0 (approx)
   if (mlir::isa<VWAddOp>(op))
     return 0xC4000057 | (rd() << 7);  // vwadd.vv v0
+  if (mlir::isa<VWMACCOp>(op))
+    return 0xF0002057 | (rd() << 7);  // vwmacc.vv (funct6=0b111100,funct3=010)
+  if (mlir::isa<VSubVXOp>(op))
+    return 0x0C004057 | (rd() << 7);  // vrsub.vx (funct6=0b000011,funct3=100)
   if (mlir::isa<VDotOp>(op))
     return 0x94000057 | (rd() << 7);  // vmul.vv (first step of vdot)
   if (mlir::isa<VRedSumOp>(op))
@@ -576,7 +588,7 @@ struct CoralNPUEmitAssemblyPass
 
       for (auto &op : *block) {
         if (op.getDialect() && op.getDialect()->getNamespace() == "coralnpu") {
-          if (mlir::isa<VAddOp, VSubOp, VMulOp, VWAddOp, VDotOp,
+          if (mlir::isa<VAddOp, VSubOp, VMulOp, VWAddOp, VWMACCOp, VSubVXOp, VDotOp,
                         VLE8Op, VLE16Op, VLE32Op, VSE8Op, VSE16Op, VSE32Op,
                         VRedSumOp, VRedMaxOp, VMaxVXOp>(&op)) {
             llvm::outs() << "vsetivli x0, 16, e32, m1, ta, ma  # auto vsetvl\n";

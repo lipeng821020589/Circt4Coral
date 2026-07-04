@@ -12,7 +12,7 @@
 
 // CHECK-LABEL: @dw_rescale
 // Depthwise part:
-// CHECK: coralnpu.vmul
+// CHECK: coralnpu.vwmacc
 // CHECK: coralnpu.vredsum
 // CHECK: coralnpu.sw
 // Rescale part (must follow the sw from depthwise):
@@ -22,7 +22,7 @@
 // CHECK: coralnpu.sw
 
 // ASM-LABEL: # CoralNPU Assembly
-// ASM: vmul.vv
+// ASM: vwmacc.vv
 // ASM: vredsum.vs
 // ASM: vmv.x.s
 // ASM: sw
