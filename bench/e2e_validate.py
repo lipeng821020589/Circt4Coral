@@ -1001,6 +1001,81 @@ func.func @demo_outer_product() -> i32 {
             elf_path.unlink()
 
 
+
+def test_mobilenet_dw_block():
+    print("\n=== TEST 12: MobileNet depthwise block (dw->rescale->relu) ===")
+    mlir = """\
+func.func @mobilenet_dw_block(
+  %in: tensor<1x1x1x4xi8>, %wt: tensor<1x1x4x1xi8>,
+  %bias: tensor<4xi32>, %mult: tensor<1xi32>, %shift: tensor<1xi8>,
+  %izp: tensor<1xi8>, %wzp: tensor<1xi8>,
+  %izp32: tensor<1xi32>, %ozp: tensor<1xi8>
+) -> tensor<1x1x1x4xi8> {
+  %dw = tosa.depthwise_conv2d %in, %wt, %bias, %izp, %wzp {
+    acc_type = i32, dilation = array<i64: 1, 1>,
+    pad = array<i64: 0, 0, 0, 0>, stride = array<i64: 1, 1>
+  } : (tensor<1x1x1x4xi8>, tensor<1x1x4x1xi8>, tensor<4xi32>,
+       tensor<1xi8>, tensor<1xi8>) -> tensor<1x1x1x4xi32>
+  %rs = tosa.rescale %dw, %mult, %shift, %izp32, %ozp {
+    input_unsigned = false, output_unsigned = false, per_channel = false,
+    rounding_mode = #tosa.rounding_mode<SINGLE_ROUND>, scale32 = true
+  } : (tensor<1x1x1x4xi32>, tensor<1xi32>, tensor<1xi8>, tensor<1xi32>,
+       tensor<1xi8>) -> tensor<1x1x1x4xi8>
+  %rl = tosa.clamp %rs {min_val = 0 : i8, max_val = 127 : i8}
+      : (tensor<1x1x1x4xi8>) -> tensor<1x1x1x4xi8>
+  func.return %rl : tensor<1x1x1x4xi8>
+}
+"""
+    passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+              "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+    circt_out = run_circt_opt(mlir, passes)
+    insns = extract_asm_instructions(circt_out)
+
+    # slot layout: 9 args (0..8) -> result slot = 9 = 0x19000
+    inputs  = [2, 4, 6, 8] + [0]*12
+    weights = [1, 1, 1, 1] + [0]*12
+    bias    = [0] * 16
+    mult    = [0x40000000] + [0]*15
+    shift   = [32] + [0]*15
+    izp32   = [0] * 16
+    ozp     = [0] * 16
+    RESULT_ADDR = TCM_BASE + 9 * TCM_SLOT  # 0x19000
+
+    prologue = [
+        ".section .text",
+        ".globl _start",
+        "_start:",
+        "    csrr  t0, mstatus",
+        "    li    t1, 0x600",
+        "    or    t0, t0, t1",
+        "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(inputs,  TCM_BASE + 0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(weights, TCM_BASE + 1 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(bias,    TCM_BASE + 2 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(mult,    TCM_BASE + 3 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(shift,   TCM_BASE + 4 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(izp32,   TCM_BASE + 7 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(ozp,     TCM_BASE + 8 * TCM_SLOT)
+
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 4)
+        actual = struct.unpack("<i", raw)[0]
+        # dw(in=[2,4,6,8], wt=[1]*4) = 20; rescale(20)=5; relu(5)=5
+        check_result("dw->rescale->relu: acc=20->rescale=5->relu=5", [actual], [5])
+    except Exception as e:
+        print(f"  [ERROR] {e}")
+        COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists():
+            elf_path.unlink()
+
+
 # ── 主程序 ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1026,6 +1101,7 @@ if __name__ == "__main__":
     test_dw_rescale_chain()
     test_sigmoid_lut()
     test_csr_outer_product()
+    test_mobilenet_dw_block()
 
     print(f"\n{'='*50}")
     print(f"Results: {COUNTS['pass']} passed, {COUNTS['fail']} failed")
