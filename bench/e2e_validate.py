@@ -1426,6 +1426,73 @@ func.func @sel(%cond: tensor<1xi1>, %a: tensor<1xi32>, %b: tensor<1xi32>) -> ten
 
 # ── 主程序 ────────────────────────────────────────────────────────────────────
 
+
+def test_const_add_e2e():
+    print("\n=== TEST 23: tosa.const bias add ([10,20,30,40]+[1,2,3,4]=[11,22,33,44]) ===")
+    mlir = (
+        "func.func @const_add(%a: tensor<4xi32>) -> tensor<4xi32> {\n"
+        "  %bias = \"tosa.const\"() {values = dense<[1, 2, 3, 4]> : tensor<4xi32>} : () -> tensor<4xi32>\n"
+        "  %0 = tosa.add %a, %bias : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi32>\n"
+        "  func.return %0 : tensor<4xi32>\n"
+        "}\n"
+    )
+    passes = ["--tosa-to-coralnpu","--coralnpu-legalize","--coralnpu-regalloc","--emit-coralnpu-assembly"]
+    insns = extract_asm_instructions(run_circt_opt(mlir, passes))
+    a    = [10, 20, 30, 40] + [0]*12
+    bias = [1, 2, 3, 4]     + [0]*12
+    RESULT_ADDR = TCM_BASE + 8 * TCM_SLOT
+    prologue = [".section .text", ".globl _start", "_start:",
+                "    csrr  t0, mstatus", "    li    t1, 0x600",
+                "    or    t0, t0, t1", "    csrw  mstatus, t0"]
+    prologue += write_int32_to_asm_init(a,    TCM_BASE + 0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(bias, TCM_BASE + 1 * TCM_SLOT)
+    full_asm = "\n".join(prologue)+"\n"+"\n".join(insns)+"\n.Lexit:\n    ebreak\n"
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 16)
+        vals = list(struct.unpack("<4i", raw))
+        check_result("const_add([10,20,30,40]+[1,2,3,4])", vals, [11, 22, 33, 44])
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
+
+def test_const_tiled_e2e():
+    print("\n=== TEST 24: tosa.const tiled (8xi32, k=2 tiles, bias add) ===")
+    mlir = (
+        "func.func @const_tiled(%a: tensor<8xi32>) -> tensor<8xi32> {\n"
+        "  %bias = \"tosa.const\"() {values = dense<[1,2,3,4,5,6,7,8]> : tensor<8xi32>} : () -> tensor<8xi32>\n"
+        "  %0 = tosa.add %a, %bias : (tensor<8xi32>, tensor<8xi32>) -> tensor<8xi32>\n"
+        "  func.return %0 : tensor<8xi32>\n"
+        "}\n"
+    )
+    passes = ["--tosa-to-coralnpu","--coralnpu-legalize","--coralnpu-regalloc","--emit-coralnpu-assembly"]
+    insns = extract_asm_instructions(run_circt_opt(mlir, passes))
+    a    = [10,20,30,40,50,60,70,80] + [0]*8
+    bias = [1,2,3,4,5,6,7,8]        + [0]*8
+    RESULT_ADDR = TCM_BASE + 8 * TCM_SLOT
+    prologue = [".section .text", ".globl _start", "_start:",
+                "    csrr  t0, mstatus", "    li    t1, 0x600",
+                "    or    t0, t0, t1", "    csrw  mstatus, t0"]
+    prologue += write_int32_to_asm_init(a,    TCM_BASE + 0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(bias, TCM_BASE + 1 * TCM_SLOT)
+    full_asm = "\n".join(prologue)+"\n"+"\n".join(insns)+"\n.Lexit:\n    ebreak\n"
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 32)
+        vals = list(struct.unpack("<8i", raw))
+        check_result("const_tiled_add([10..80]+[1..8])", vals, [11,22,33,44,55,66,77,88])
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
+
 if __name__ == "__main__":
     print("CoralNPU E2E Validation")
     print(f"  circt-opt : {CIRCT_OPT}")
@@ -1460,6 +1527,8 @@ if __name__ == "__main__":
     test_ars_e2e()
     test_equal_e2e()
     test_select_e2e()
+    test_const_add_e2e()
+    test_const_tiled_e2e()
 
     print(f"\n{'='*50}")
     print(f"Results: {COUNTS['pass']} passed, {COUNTS['fail']} failed")

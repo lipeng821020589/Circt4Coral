@@ -12,6 +12,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Support/LLVM.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Tools/mlir-translate/Translation.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -358,6 +359,13 @@ public:
     return offset;
   }
 
+  /// Write  raw bytes into the .data section at .
+  void writeDataBytes(size_t byteOffset, const uint8_t *data, size_t len) {
+    if (byteOffset + len > dataSection.size())
+      dataSection.resize(byteOffset + len, 0);
+    std::memcpy(dataSection.data() + byteOffset, data, len);
+  }
+
   const std::vector<uint8_t>& getDataSection() const { return dataSection; }
 
 private:
@@ -391,6 +399,8 @@ private:
 // Export translation pass
 //===----------------------------------------------------------------------===//
 
+static constexpr size_t kTcmSlotBytesLocal = 0x1000;
+
 struct ExportCoralNPUPass {
   void runOnOperation(mlir::ModuleOp module, llvm::raw_ostream &os) {
     llvm::errs() << "; Coral NPU ELF Binary Export\n";
@@ -403,12 +413,49 @@ struct ExportCoralNPUPass {
     // This makes the exported ELF self-describing: the .data section holds
     // zero-initialized placeholder memory for each input tensor, located at
     // the TCM address where the compiler expects to find it.
+    // Track how many total slots were reserved for arg slots
+    // so const slots (added after args) go to the right offset.
     module.walk([&](mlir::func::FuncOp funcOp) {
       for (auto arg : funcOp.getArguments()) {
         (void)arg;
         emitter.addDataSlot();  // reserve 4KB slot; caller writes real data
       }
     });
+
+    // Fill const-data slots from coralnpu.const_data module attribute.
+    // TosaConstLowering stores each tosa.const's i32 values under
+    // slot_N -> DenseIntElementsAttr so ExportELF can write real bytes.
+    if (auto dictAttr = module->getDiscardableAttr("coralnpu.const_data")) {
+      auto dict = mlir::cast<mlir::DictionaryAttr>(dictAttr);
+      for (auto &entry : dict) {
+        // key = slot_N; parse N to get absolute slot index
+        llvm::StringRef key = entry.getName().getValue();
+        if (!key.starts_with("slot_"))
+          continue;
+        unsigned slotIdx = 0;
+        key.drop_front(5).getAsInteger(10, slotIdx);
+
+        // Ensure we have enough slots reserved in dataSection
+        while (emitter.getDataSize() < (size_t)(slotIdx + 1) * kTcmSlotBytesLocal)
+          emitter.addDataSlot();
+
+        // Write the i32 values into the slot
+        auto dense = mlir::cast<mlir::DenseIntElementsAttr>(entry.getValue());
+        size_t byteOffset = (size_t)slotIdx * kTcmSlotBytesLocal;
+        size_t elemIdx = 0;
+        for (auto v : dense.getValues<mlir::APInt>()) {
+          int32_t word = (int32_t)v.getSExtValue();
+          uint8_t bytes[4];
+          bytes[0] = (word >>  0) & 0xFF;
+          bytes[1] = (word >>  8) & 0xFF;
+          bytes[2] = (word >> 16) & 0xFF;
+          bytes[3] = (word >> 24) & 0xFF;
+          size_t off = byteOffset + elemIdx * 4;
+          emitter.writeDataBytes(off, bytes, 4);
+          ++elemIdx;
+        }
+      }
+    }
 
     module.walk([&](mlir::Operation *op) {
       if (op->getDialect() &&

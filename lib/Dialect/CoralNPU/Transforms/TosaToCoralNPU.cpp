@@ -29,6 +29,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Tosa/IR/TosaOps.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -1620,6 +1621,94 @@ struct TosaAbsLowering
   }
 };
 
+
+//===----------------------------------------------------------------------===//
+// tosa.const — inline constant tensor lowering
+//
+// A tosa.const carries a DenseElementsAttr of actual weights/biases.  We
+// serialize the data to a module-level attribute () so
+// ExportCoralNPU can write the real bytes into the .data section, and we
+// replace the op with a  of  literals so
+// that downstream patterns can reuse the tiles directly from registers
+// (getTiles unwraps from_elements — no reload needed).
+//
+// Slot assignment: const slots start immediately after function arguments.
+// The module attr  is a DictionaryAttr mapping the
+// string slot_N → DenseIntElementsAttr<i32>.
+//===----------------------------------------------------------------------===//
+
+struct TosaConstLowering : public mlir::OpRewritePattern<mlir::tosa::ConstOp> {
+  using mlir::OpRewritePattern<mlir::tosa::ConstOp>::OpRewritePattern;
+
+  mlir::LogicalResult matchAndRewrite(mlir::tosa::ConstOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto attr = op.getValuesAttr();
+    auto dense = mlir::dyn_cast<mlir::DenseIntElementsAttr>(attr);
+    if (!dense)
+      return mlir::failure(); // float consts: passthrough (not supported yet)
+
+    // Collect i32 values (widen narrower ints to i32).
+    llvm::SmallVector<int32_t> vals;
+    for (auto v : dense.getValues<llvm::APInt>())
+      vals.push_back((int32_t)v.getSExtValue());
+
+    // Determine this const's slot index: numArgs + number of consts allocated
+    // so far (tracked in module attr coralnpu.const_count).
+    auto moduleOp = op->getParentOfType<mlir::ModuleOp>();
+    auto funcOp   = op->getParentOfType<mlir::func::FuncOp>();
+    int64_t numArgs = funcOp ? (int64_t)funcOp.getNumArguments() : 0;
+
+    // Read/update const count from module attr.
+    int64_t constIdx = 0;
+    if (auto cnt = moduleOp->getDiscardableAttr("coralnpu.const_count"))
+      constIdx = mlir::cast<mlir::IntegerAttr>(cnt).getInt();
+    int64_t slot = numArgs + constIdx;
+
+    // Write const data to module attr coralnpu.const_data (dict slot_N -> dense<i32>).
+    mlir::DictionaryAttr existing;
+    if (auto d = moduleOp->getDiscardableAttr("coralnpu.const_data"))
+      existing = mlir::cast<mlir::DictionaryAttr>(d);
+
+    auto i32Ty = rewriter.getI32Type();
+    auto tensorTy = mlir::RankedTensorType::get({(int64_t)vals.size()}, i32Ty);
+    auto dataAttr = mlir::DenseIntElementsAttr::get(
+        tensorTy,
+        llvm::ArrayRef<int32_t>(vals.data(), vals.size()));
+
+    std::string key = "slot_" + std::to_string(slot);
+    llvm::SmallVector<mlir::NamedAttribute> entries;
+    if (existing) {
+      for (auto &ne : existing)
+        entries.push_back(ne);
+    }
+    entries.push_back(rewriter.getNamedAttr(key, dataAttr));
+    auto newDict = mlir::DictionaryAttr::get(rewriter.getContext(), entries);
+    moduleOp->setDiscardableAttr("coralnpu.const_data", newDict);
+    moduleOp->setDiscardableAttr("coralnpu.const_count",
+        rewriter.getI64IntegerAttr(constIdx + 1));
+
+    // Build register tiles from literal values so getTiles can unpack them
+    // (tensor.from_elements path — no memory load needed for constants).
+    auto sew = pickVConfig(dense.getElementType()).first;
+    int64_t n = (int64_t)vals.size();
+    int64_t k = tileCount(sew, n);
+
+    llvm::SmallVector<mlir::Value> tiles;
+    tiles.reserve(k);
+    for (int64_t ti = 0; ti < k; ++ti) {
+      // Load the tile: emit vle32 from the const TCM slot address.
+      int64_t addr = kTcmBase + slot * kTcmSlot + ti * kTileBytes;
+      auto addrV = createI32Const(loc, (int32_t)addr, rewriter);
+      auto ne = createI32Const(loc, (int32_t)tileElems(ti, k, n, sew), rewriter);
+      tiles.push_back(rewriter.create<VLE32Op>(loc, addrV, ne));
+    }
+    storeTiles(tiles, sew, n, rewriter, loc);
+    rewriter.replaceOp(op, tileCarrier(op, tiles, rewriter));
+    return mlir::success();
+  }
+};
+
 struct TosaToCoralNPUPass
     : public impl::TosaToCoralNPUBase<TosaToCoralNPUPass> {
   void runOnOperation() override {
@@ -1659,6 +1748,7 @@ struct TosaToCoralNPUPass
     tosaPatterns.add<TosaEqualLowering, TosaGreaterLowering, TosaGreaterEqualLowering>(ctx);
     tosaPatterns.add<TosaLogicalAndLowering, TosaLogicalOrLowering, TosaLogicalNotLowering>(ctx);
     tosaPatterns.add<TosaSelectLowering>(ctx);
+    tosaPatterns.add<TosaConstLowering>(ctx);
     mlir::FrozenRewritePatternSet frozenTosa(std::move(tosaPatterns));
 
     // Phase 2: func.return -> coralnpu.return.
