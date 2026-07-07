@@ -24,8 +24,8 @@ import struct
 from pathlib import Path
 
 # ── 路径 ──────────────────────────────────────────────────────────────────────
-CIRCT_OPT = Path("/home/radxa/Circt4Coral/build/bin/circt-opt")
-SPIKE     = Path("/home/radxa/riscv-isa-sim/build/spike")
+CIRCT_OPT = Path("/home/radxa/Work/Circt4Coral/build/bin/circt-opt")
+SPIKE     = Path("/home/radxa/Work/riscv-isa-sim/build/spike")
 AS        = "riscv64-unknown-elf-as"
 LD        = "riscv64-unknown-elf-ld"
 OBJCOPY   = "riscv64-unknown-elf-objcopy"
@@ -356,7 +356,7 @@ func.func @test_add8(%arg0: tensor<8xi32>, %arg1: tensor<8xi32>) -> tensor<8xi32
 def test_avgpool():
     print("\n=== TEST 3: avg_pool2d (tensor<1x2x2x2xi32>, N=8, area=4) ===")
     # 直接读取 115 上已有的 avgpool-emit.mlir（已验证能通过 lit）
-    mlir_path = Path("/home/radxa/Circt4Coral/test/Dialect/CoralNPU/avgpool-emit.mlir")
+    mlir_path = Path("/home/radxa/Work/Circt4Coral/test/Dialect/CoralNPU/avgpool-emit.mlir")
     if not mlir_path.exists():
         print("  [SKIP] avgpool-emit.mlir not found")
         return
@@ -1493,6 +1493,124 @@ def test_const_tiled_e2e():
         if elf_path.exists(): elf_path.unlink()
 
 
+
+def test_conv2d_e2e():
+    print("\n=== TEST 25: tosa.conv2d pointwise 1x1x1x4 spike E2E ===")
+    mlir = """\
+func.func @pw_conv(
+  %in: tensor<1x1x1x4xi8>, %wt: tensor<1x1x1x4xi8>,
+  %bias: tensor<1xi32>, %izp: tensor<1xi8>, %wzp: tensor<1xi8>
+) -> tensor<1x1x1x1xi32> {
+  %0 = tosa.conv2d %in, %wt, %bias, %izp, %wzp {
+    acc_type = i32, dilation = array<i64: 1, 1>,
+    pad = array<i64: 0, 0, 0, 0>, stride = array<i64: 1, 1>
+  } : (tensor<1x1x1x4xi8>, tensor<1x1x1x4xi8>, tensor<1xi32>,
+       tensor<1xi8>, tensor<1xi8>) -> tensor<1x1x1x1xi32>
+  func.return %0 : tensor<1x1x1x1xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+              "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+    insns = extract_asm_instructions(run_circt_opt(mlir, passes))
+    # 5 args → result_slot = max(kResultSlot=8, 5) = 8 → 0x18000
+    RESULT_ADDR_25 = TCM_BASE + 8 * TCM_SLOT
+    in_vals   = [1, 2, 3, 4] + [0]*12
+    wt_vals   = [1, 1, 1, 1] + [0]*12   # OC=1 single row
+    bias_vals = [0]*16
+    izp_vals  = [0]*16
+    wzp_vals  = [0]*16
+    prologue = [
+        ".section .text", ".globl _start", "_start:",
+        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    or    t0, t0, t1",  "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(in_vals,   TCM_BASE + 0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(wt_vals,   TCM_BASE + 1 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(bias_vals, TCM_BASE + 2 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(izp_vals,  TCM_BASE + 3 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(wzp_vals,  TCM_BASE + 4 * TCM_SLOT)
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR_25, 4)
+        actual = struct.unpack("<i", raw)[0]
+        check_result("conv2d OC=1: in=[1,2,3,4] wt=[1,1,1,1] -> sum=10", [actual], [10])
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
+
+def test_conv2d_rescale_e2e():
+    print("\n=== TEST 26: tosa.conv2d + rescale + relu quantized block ===")
+    mlir = """\
+func.func @pw_conv_rescale(
+  %in: tensor<1x1x1x4xi8>, %wt: tensor<1x1x1x4xi8>,
+  %bias: tensor<1xi32>, %izp: tensor<1xi8>, %wzp: tensor<1xi8>,
+  %mult: tensor<1xi32>, %shift: tensor<1xi8>,
+  %izp32: tensor<1xi32>, %ozp: tensor<1xi8>
+) -> tensor<1x1x1x1xi8> {
+  %conv = tosa.conv2d %in, %wt, %bias, %izp, %wzp {
+    acc_type = i32, dilation = array<i64: 1, 1>,
+    pad = array<i64: 0, 0, 0, 0>, stride = array<i64: 1, 1>
+  } : (tensor<1x1x1x4xi8>, tensor<1x1x1x4xi8>, tensor<1xi32>,
+       tensor<1xi8>, tensor<1xi8>) -> tensor<1x1x1x1xi32>
+  %rs = tosa.rescale %conv, %mult, %shift, %izp32, %ozp {
+    input_unsigned = false, output_unsigned = false, per_channel = false,
+    rounding_mode = #tosa.rounding_mode<SINGLE_ROUND>, scale32 = true
+  } : (tensor<1x1x1x1xi32>, tensor<1xi32>, tensor<1xi8>, tensor<1xi32>,
+       tensor<1xi8>) -> tensor<1x1x1x1xi8>
+  %rl = tosa.clamp %rs {min_val = 0 : i8, max_val = 127 : i8}
+      : (tensor<1x1x1x1xi8>) -> tensor<1x1x1x1xi8>
+  func.return %rl : tensor<1x1x1x1xi8>
+}
+"""
+    passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+              "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+    insns = extract_asm_instructions(run_circt_opt(mlir, passes))
+    # 9 args → result_slot = 9 → 0x19000
+    RESULT_ADDR_26 = TCM_BASE + 9 * TCM_SLOT
+    in_vals    = [100, 0, 0, 0] + [0]*12
+    wt_vals    = [1, 0, 0, 0] + [0]*12   # only first IC contributes
+    bias_vals  = [0]*16
+    izp_vals   = [0]*16
+    wzp_vals   = [0]*16
+    mult_vals  = [0x40000000] + [0]*15   # scale=0.25 in Q30
+    shift_vals = [32]         + [0]*15   # shift=32 matches TEST 8
+    izp32_vals = [0]*16
+    ozp_vals   = [0]*16
+    prologue = [
+        ".section .text", ".globl _start", "_start:",
+        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    or    t0, t0, t1",  "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(in_vals,    TCM_BASE + 0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(wt_vals,    TCM_BASE + 1 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(bias_vals,  TCM_BASE + 2 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(izp_vals,   TCM_BASE + 3 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(wzp_vals,   TCM_BASE + 4 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(mult_vals,  TCM_BASE + 5 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(shift_vals, TCM_BASE + 6 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(izp32_vals, TCM_BASE + 7 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(ozp_vals,   TCM_BASE + 8 * TCM_SLOT)
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR_26, 4)
+        actual = struct.unpack("<i", raw)[0]
+        check_result("conv2d+rescale+relu: conv=100 rescale(100,Q30/32)=25 relu=25",
+                     [actual], [25])
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
 if __name__ == "__main__":
     print("CoralNPU E2E Validation")
     print(f"  circt-opt : {CIRCT_OPT}")
@@ -1529,6 +1647,8 @@ if __name__ == "__main__":
     test_select_e2e()
     test_const_add_e2e()
     test_const_tiled_e2e()
+    test_conv2d_e2e()
+    test_conv2d_rescale_e2e()
 
     print(f"\n{'='*50}")
     print(f"Results: {COUNTS['pass']} passed, {COUNTS['fail']} failed")

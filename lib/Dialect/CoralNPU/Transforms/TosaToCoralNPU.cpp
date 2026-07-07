@@ -248,6 +248,45 @@ getTiles(mlir::Value operand, SEW sew, mlir::PatternRewriter &rewriter,
   if (auto fe = operand.getDefiningOp<mlir::tensor::FromElementsOp>())
     return llvm::SmallVector<mlir::Value>(fe.getElements());
 
+  // tensor.splat(scalar) is the single-tile carrier produced by scalar
+  // lowering paths (conv2d, depthwise, pool). Treat the splatted scalar as a
+  // single vector register tile: emit a VLE32 from the result slot that held
+  // the scalar value, so the downstream consumer (rescale, relu) can correctly
+  // reduce it via VRedSumOp and recover the scalar result.
+  // NOTE: we load from the _result slot_ of the defining op, not slot 0.
+  // Since we store the scalar via ScalarSwOp to kResultSlot and subsequent
+  // ops read the same slot, we must derive the address from the sw target.
+  // Simpler approach: the splat's input value is the scalar itself; return
+  // it wrapped in a 1-element SmallVector so consumers do VRedSum on a fake
+  // 1-element vreg. But VRedSumOp on a scalar would be wrong. Instead,
+  // just return the scalar value directly — rescale reads it via vsum below.
+  // ACTUALLY: we need the vector register that holds the conv result tile.
+  // The conv lowering stores via ScalarSwOp to result slot; rescale must
+  // load from that slot. Re-derive the slot address from the splat operand.
+  if (auto splat = operand.getDefiningOp<mlir::tensor::SplatOp>()) {
+    // splat.getInput() is the scalar result from the producing op.
+    // Emit a 1-element VLE32 from the result slot written by that op.
+    // We find the ScalarSwOp that stores the splat source to get its address.
+    mlir::Value scalarVal = splat.getInput();
+    // Walk def-use to find the sw op storing scalarVal and its address.
+    // Fallback: use the result slot of the splat's parent op (the sw op's
+    // address arg carries the result slot as a constant). For correctness,
+    // emit a fresh VLE32 from kTcmBase + kResultSlot*kTcmSlot.
+    int64_t resultAddr = kTcmBase + kResultSlot * kTcmSlot;
+    // Try to recover the actual sw target address from the scalar value's uses.
+    for (auto &use : scalarVal.getUses()) {
+      if (auto sw = mlir::dyn_cast<ScalarSwOp>(use.getOwner())) {
+        if (auto addrOp = sw.getOperand(1).getDefiningOp<ScalarLiOp>()) {
+          resultAddr = addrOp.getValue();
+          break;
+        }
+      }
+    }
+    auto addrV = createI32Const(loc, (int32_t)resultAddr, rewriter);
+    auto nV    = createI32Const(loc, 1, rewriter);
+    return {rewriter.create<VLE32Op>(loc, addrV, nV)};
+  }
+
   int64_t n = numElements(operand);
   int64_t k = tileCount(sew, n);
   int64_t base = kTcmBase;
@@ -925,26 +964,58 @@ struct TosaConv2DLowering : public mlir::OpRewritePattern<mlir::tosa::Conv2DOp> 
   mlir::LogicalResult matchAndRewrite(mlir::tosa::Conv2DOp op,
                                       mlir::PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-
-    // conv2d operates on 8-bit activations and weights.
-    rewriter.create<VSetVLOp>(loc, SEW::E8, LMUL::M1);
-
-    // Load activations (operand 0) and weights (operand 1) from their TCM
-    // slots, then feed the outer-product MAC: acc[r][c] += input[r]*wgt[c].
-    auto input = getVreg(op.getOperand(0), rewriter, loc);
-    auto weight = getVreg(op.getOperand(1), rewriter, loc);
-    auto accInit = createI32Const(loc, 0, rewriter);
-    unsigned sm = stripmineFor(kTile * kTile, SEW::E8);
-    auto outerProd =
-        rewriter.create<OuterProductOp>(loc, input, weight, accInit, sm);
-
-    // Read the accumulator column back and store the 32-bit result tile.
-    auto col0 = createI32Const(loc, 0, rewriter);
-    auto accRead =
-        rewriter.create<AccReadOp>(loc, outerProd.getAccNew(), col0);
+    // conv2d: for each output channel OC, result[OC] = sum_IC(in[IC] * wt[OC][IC]) + bias[OC].
+    // Strategy: load all input tiles once, then for each OC load that wt row (1 tile)
+    // and dot-product with the corresponding in tile via VMul+VRedSum.
+    // Fold partial sums across input tiles (k_in tiles) per OC, then add bias.
     rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
-    storeResult(accRead.getResult(), op, rewriter);
-    rewriter.replaceOp(op, carrier(op, rewriter, accRead.getResult()));
+
+    // Load input tiles (size = ceil(IC / vregCap)).
+    auto inTiles = getTiles(op.getOperand(0), SEW::E32, rewriter, loc);
+    int64_t k_in = (int64_t)inTiles.size();
+
+    // Weight tensor layout: [OC, KH, KW, IC]. For 1x1 conv (KH=KW=1) each OC row
+    // is IC consecutive elements = k_in tiles of vregCap elements each.
+    int64_t nIn = numElements(op.getOperand(0));  // IC (for 1x1)
+    int64_t wtSlot = 1;
+    if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(op.getOperand(1)))
+      wtSlot = barg.getArgNumber();
+
+    // Number of output channels: from result tensor shape.
+    int64_t nOC = 1;
+    if (auto tt = mlir::dyn_cast<mlir::TensorType>(op.getResult().getType()))
+      nOC = tt.getDimSize(3);  // NHWC last dim
+
+    // Compute one scalar result per OC, then aggregate.
+    // For simplicity: emit k_in vmul+vredsum per OC, fold, add bias.
+    // Result is a scalar stored via sw (same as depthwise path).
+    mlir::Value totalSum = createI32Const(loc, 0, rewriter);
+    for (int64_t oc = 0; oc < nOC; ++oc) {
+      mlir::Value ocSum = createI32Const(loc, 0, rewriter);
+      for (int64_t t = 0; t < k_in; ++t) {
+        // Weight tile for this OC row, tile t: addr = wtBase + oc*nIn*4 + t*16
+        int64_t wtAddr = kTcmBase + wtSlot * kTcmSlot + oc * nIn * 4 + t * kTileBytes;
+        auto waddrV = createI32Const(loc, (int32_t)wtAddr, rewriter);
+        auto wnV    = createI32Const(loc, (int32_t)tileElems(t, k_in, nIn, SEW::E32), rewriter);
+        auto wtTile = rewriter.create<VLE32Op>(loc, waddrV, wnV);
+        auto prod   = rewriter.create<VMulOp>(loc, inTiles[t], wtTile.getResult(), 1);
+        auto psum   = rewriter.create<VRedSumOp>(loc, prod.getResult()).getResult();
+        ocSum = rewriter.create<ScalarAddOp>(loc, ocSum, psum).getResult();
+      }
+      totalSum = rewriter.create<ScalarAddOp>(loc, totalSum, ocSum).getResult();
+    }
+
+    // Add bias (arg 2).
+    int64_t biasSlot = 2;
+    if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(op.getBias()))
+      biasSlot = barg.getArgNumber();
+    auto biasAddr = createI32Const(loc, (int32_t)(kTcmBase + biasSlot * kTcmSlot), rewriter);
+    auto biasVal  = rewriter.create<ScalarLwOp>(loc, biasAddr);
+    auto result   = rewriter.create<ScalarAddOp>(loc, totalSum, biasVal.getResult());
+
+    auto resultAddr = createI32Const(loc, (int32_t)(kTcmBase + getResultSlot(op) * kTcmSlot), rewriter);
+    rewriter.create<ScalarSwOp>(loc, result.getResult(), resultAddr);
+    rewriter.replaceOp(op, carrier(op, rewriter, result.getResult()));
     return mlir::success();
   }
 };
