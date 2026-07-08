@@ -26,6 +26,7 @@
 
 #include "circt/Dialect/CoralNPU/CoralNPUPasses.h"
 #include "circt/Dialect/CoralNPU/CoralNPUOps.h"
+#include "circt/Dialect/CoralNPU/CoralNPUTypes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Tosa/IR/TosaOps.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -55,6 +56,12 @@ namespace {
 static mlir::Value createI32Const(mlir::Location loc, int32_t val,
                                    mlir::PatternRewriter &rewriter) {
   return rewriter.create<ScalarLiOp>(loc, rewriter.getI32IntegerAttr(val));
+}
+
+/// Direction-B helper: return the canonical VRegType for E32/M1 vectors.
+/// All VLE32/VMul/VAdd etc. ops now produce !coralnpu.vreg<e32, m1>.
+static mlir::Type vregE32(mlir::MLIRContext *ctx) {
+  return VRegType::get(ctx, SEW::E32, LMUL::M1);
 }
 
 /// Pick a sensible vsetvl config based on the input tensor element type.
@@ -208,7 +215,7 @@ static mlir::Value getVreg(mlir::Value tensorVal,
     addr = kTcmBase + barg.getArgNumber() * kTcmSlot;
   auto addrV = createI32Const(loc, (int32_t)addr, rewriter);
   auto nV = createI32Const(loc, (int32_t)n, rewriter);
-  return rewriter.create<VLE32Op>(loc, addrV, nV);
+  return rewriter.create<VLE32Op>(loc, vregE32(loc.getContext()), addrV, nV);
 }
 
 //===----------------------------------------------------------------------===//
@@ -284,7 +291,7 @@ getTiles(mlir::Value operand, SEW sew, mlir::PatternRewriter &rewriter,
     }
     auto addrV = createI32Const(loc, (int32_t)resultAddr, rewriter);
     auto nV    = createI32Const(loc, 1, rewriter);
-    return {rewriter.create<VLE32Op>(loc, addrV, nV)};
+    return {rewriter.create<VLE32Op>(loc, vregE32(loc.getContext()), addrV, nV)};
   }
 
   int64_t n = numElements(operand);
@@ -298,7 +305,7 @@ getTiles(mlir::Value operand, SEW sew, mlir::PatternRewriter &rewriter,
   for (int64_t i = 0; i < k; ++i) {
     auto addrV = createI32Const(loc, (int32_t)(base + i * kTileBytes), rewriter);
     auto nV = createI32Const(loc, (int32_t)tileElems(i, k, n, sew), rewriter);
-    tiles.push_back(rewriter.create<VLE32Op>(loc, addrV, nV));
+    tiles.push_back(rewriter.create<VLE32Op>(loc, vregE32(loc.getContext()), addrV, nV));
   }
   return tiles;
 }
@@ -320,19 +327,21 @@ static void storeTiles(llvm::ArrayRef<mlir::Value> vregs, SEW sew,
 }
 
 /// Build the multi-tile carrier for an element-wise result: a
-/// `tensor.from_elements(v0..v_{k-1})` of type `tensor<kxi32>`. This is the
-/// single-vreg `tensor.splat` carrier generalized to k registers; a consumer
-/// unpacks it in `getTiles`. `replaceOp` is a plain RAUW (no type check), and
-/// `func.return` is rewritten to an i32 status word in phase 2, so the
-/// carrier's `tensor<kxi32>` type never needs to match the original
-/// `tensor<NxT>`.
+/// `tensor.from_elements(v0..v_{k-1})` of type `tensor<k x !coralnpu.vreg>`.
+/// Direction-B: element type is VRegType for compile-time type safety; the
+/// tensor itself is a placeholder (func.return rewrites it to i32 in phase 2).
+/// Note: VLE32Op results are now VRegType, so FromElementsOp infers the
+/// element type correctly from the operands.
 static mlir::Value tileCarrier(mlir::Operation *op,
                                llvm::ArrayRef<mlir::Value> vregs,
                                mlir::PatternRewriter &rewriter) {
   auto loc = op->getLoc();
-  auto i32 = rewriter.getI32Type();
+  // Derive element type from the first vreg operand (all must match).
+  // After direction-B, VLE32Op produces VRegType, so this is VRegType.
+  auto elemTy = vregs.empty() ? VRegType::get(loc.getContext(), SEW::E32, LMUL::M1)
+                              : vregs[0].getType();
   auto carrierTy =
-      mlir::RankedTensorType::get({(int64_t)vregs.size()}, i32);
+      mlir::RankedTensorType::get({(int64_t)vregs.size()}, elemTy);
   return rewriter.create<mlir::tensor::FromElementsOp>(loc, carrierTy, vregs);
 }
 
@@ -351,7 +360,7 @@ static mlir::Value loadTile(mlir::Value tensorVal, int64_t elemOffset,
   int64_t addr = kTcmBase + slot * kTcmSlot + elemOffset * 4 /*i32 bytes*/;
   auto addrV = createI32Const(loc, (int32_t)addr, rewriter);
   auto nV = createI32Const(loc, (int32_t)nElems, rewriter);
-  return rewriter.create<VLE32Op>(loc, addrV, nV);
+  return rewriter.create<VLE32Op>(loc, vregE32(loc.getContext()), addrV, nV);
 }
 
 /// Store an `nElems` tile to the result slot at `elemOffset`.
@@ -397,7 +406,7 @@ struct TosaAddLowering : public mlir::OpRewritePattern<mlir::tosa::AddOp> {
     auto rhsTiles = getTiles(op.getOperand(1), sew, rewriter, loc);
     llvm::SmallVector<mlir::Value> res;
     for (auto [l, r] : llvm::zip(lhsTiles, rhsTiles))
-      res.push_back(rewriter.create<VAddOp>(loc, l, r, /*stripmine=*/1));
+      res.push_back(rewriter.create<VAddOp>(loc, vregE32(loc.getContext()), l, r, /*stripmine=*/1));
     storeTiles(res, sew, n, rewriter, loc);
     rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
     return mlir::success();
@@ -417,7 +426,7 @@ struct TosaSubLowering : public mlir::OpRewritePattern<mlir::tosa::SubOp> {
     auto rhsTiles = getTiles(op.getOperand(1), sew, rewriter, loc);
     llvm::SmallVector<mlir::Value> res;
     for (auto [l, r] : llvm::zip(lhsTiles, rhsTiles))
-      res.push_back(rewriter.create<VSubOp>(loc, l, r, /*stripmine=*/1));
+      res.push_back(rewriter.create<VSubOp>(loc, vregE32(loc.getContext()), l, r, /*stripmine=*/1));
     storeTiles(res, sew, n, rewriter, loc);
     rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
     return mlir::success();
@@ -437,7 +446,7 @@ struct TosaMulLowering : public mlir::OpRewritePattern<mlir::tosa::MulOp> {
     auto rhsTiles = getTiles(op.getOperand(1), sew, rewriter, loc);
     llvm::SmallVector<mlir::Value> res;
     for (auto [l, r] : llvm::zip(lhsTiles, rhsTiles))
-      res.push_back(rewriter.create<VMulOp>(loc, l, r, /*stripmine=*/1));
+      res.push_back(rewriter.create<VMulOp>(loc, vregE32(loc.getContext()), l, r, /*stripmine=*/1));
     storeTiles(res, sew, n, rewriter, loc);
     rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
     return mlir::success();
@@ -714,7 +723,7 @@ struct TosaRescaleLowering : public mlir::OpRewritePattern<mlir::tosa::RescaleOp
     for (int64_t t = 0; t < k_out; ++t) {
       auto addrV = createI32Const(loc, (int32_t)(resultBase + t * kTileBytes), rewriter);
       auto nV    = createI32Const(loc, (int32_t)tileElems(t, k_out, nElems, SEW::E32), rewriter);
-      outTiles.push_back(rewriter.create<VLE32Op>(loc, addrV, nV).getResult());
+      outTiles.push_back(rewriter.create<VLE32Op>(loc, vregE32(loc.getContext()), addrV, nV).getResult());
     }
     rewriter.replaceOp(op, tileCarrier(op, outTiles, rewriter));
     return mlir::success();
@@ -829,7 +838,7 @@ struct TosaClampLowering : public mlir::OpRewritePattern<mlir::tosa::ClampOp> {
     auto tiles = getTiles(op.getInput(), sew, rewriter, loc);
     llvm::SmallVector<mlir::Value> res;
     for (auto tile : tiles)
-      res.push_back(rewriter.create<VMaxVXOp>(loc, tile).getResult());
+      res.push_back(rewriter.create<VMaxVXOp>(loc, vregE32(loc.getContext()), tile).getResult());
     storeTiles(res, sew, n, rewriter, loc);
     rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
     return mlir::success();
@@ -968,7 +977,7 @@ struct TosaSliceLowering : public mlir::OpRewritePattern<mlir::tosa::SliceOp> {
       int64_t addr  = kTcmBase + argSlot * kTcmSlot + byteOffset + i * kTileBytes;
       auto addrV = createI32Const(loc, (int32_t)addr, rewriter);
       auto nV    = createI32Const(loc, (int32_t)elems, rewriter);
-      res.push_back(rewriter.create<VLE32Op>(loc, addrV, nV).getResult());
+      res.push_back(rewriter.create<VLE32Op>(loc, vregE32(loc.getContext()), addrV, nV).getResult());
     }
     storeTiles(res, sew, sliceElems, rewriter, loc);
     rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
@@ -1031,8 +1040,8 @@ struct TosaConv2DLowering : public mlir::OpRewritePattern<mlir::tosa::Conv2DOp> 
         int64_t wtAddr = kTcmBase + wtSlot * kTcmSlot + oc * nIn * 4 + t * kTileBytes;
         auto waddrV = createI32Const(loc, (int32_t)wtAddr, rewriter);
         auto wnV    = createI32Const(loc, (int32_t)tileElems(t, k_in, nIn, SEW::E32), rewriter);
-        auto wtTile = rewriter.create<VLE32Op>(loc, waddrV, wnV);
-        auto prod   = rewriter.create<VMulOp>(loc, inTiles[t], wtTile.getResult(), 1);
+        auto wtTile = rewriter.create<VLE32Op>(loc, vregE32(loc.getContext()), waddrV, wnV);
+        auto prod   = rewriter.create<VMulOp>(loc, vregE32(loc.getContext()), inTiles[t], wtTile.getResult(), 1);
         auto psum   = rewriter.create<VRedSumOp>(loc, prod.getResult()).getResult();
         ocSum = rewriter.create<ScalarAddOp>(loc, ocSum, psum).getResult();
       }
@@ -1052,7 +1061,7 @@ struct TosaConv2DLowering : public mlir::OpRewritePattern<mlir::tosa::Conv2DOp> 
     for (int64_t t = 0; t < k_oc; ++t) {
       auto addrV = createI32Const(loc, (int32_t)(resultBase + t * kTileBytes), rewriter);
       auto nV    = createI32Const(loc, (int32_t)tileElems(t, k_oc, nOC, SEW::E32), rewriter);
-      ocTiles.push_back(rewriter.create<VLE32Op>(loc, addrV, nV).getResult());
+      ocTiles.push_back(rewriter.create<VLE32Op>(loc, vregE32(loc.getContext()), addrV, nV).getResult());
     }
     rewriter.replaceOp(op, tileCarrier(op, ocTiles, rewriter));
     return mlir::success();
@@ -1094,7 +1103,7 @@ struct TosaDepthwiseConv2DLowering
     llvm::SmallVector<mlir::Value> partials;
     size_t numTiles = std::min(inTiles.size(), wtTiles.size());
     for (size_t i = 0; i < numTiles; ++i) {
-      auto prod = rewriter.create<VMulOp>(loc, inTiles[i], wtTiles[i], 1);
+      auto prod = rewriter.create<VMulOp>(loc, vregE32(loc.getContext()), inTiles[i], wtTiles[i], 1);
       partials.push_back(rewriter.create<VRedSumOp>(loc, prod.getResult()).getResult());
     }
 
@@ -1192,7 +1201,7 @@ struct TosaPadLowering : public mlir::OpRewritePattern<mlir::tosa::PadOp> {
     auto loc = op.getLoc();
     rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
     auto c0 = createI32Const(loc, 0, rewriter);
-    auto vle = rewriter.create<VLE32Op>(loc, c0, c0);
+    auto vle = rewriter.create<VLE32Op>(loc, vregE32(loc.getContext()), c0, c0);
     rewriter.create<VSE32Op>(loc, vle.getResult(), c0, c0);
     rewriter.replaceOp(op, carrier(op, rewriter, vle.getResult()));
     return mlir::success();
@@ -1383,7 +1392,7 @@ struct TosaMaximumLowering : public mlir::OpRewritePattern<mlir::tosa::MaximumOp
     auto rhsTiles = getTiles(op.getOperand(1), sew, rewriter, loc);
     llvm::SmallVector<mlir::Value> res;
     for (auto [l, r] : llvm::zip(lhsTiles, rhsTiles))
-      res.push_back(rewriter.create<VMaxVVOp>(loc, l, r).getResult());
+      res.push_back(rewriter.create<VMaxVVOp>(loc, vregE32(loc.getContext()), l, r).getResult());
     storeTiles(res, sew, n, rewriter, loc);
     rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
     return mlir::success();
@@ -1405,7 +1414,7 @@ struct TosaMinimumLowering : public mlir::OpRewritePattern<mlir::tosa::MinimumOp
     auto rhsTiles = getTiles(op.getOperand(1), sew, rewriter, loc);
     llvm::SmallVector<mlir::Value> res;
     for (auto [l, r] : llvm::zip(lhsTiles, rhsTiles))
-      res.push_back(rewriter.create<VMinVVOp>(loc, l, r).getResult());
+      res.push_back(rewriter.create<VMinVVOp>(loc, vregE32(loc.getContext()), l, r).getResult());
     storeTiles(res, sew, n, rewriter, loc);
     rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
     return mlir::success();
@@ -1691,7 +1700,7 @@ struct TosaNegateVXLowering
     llvm::SmallVector<mlir::Value> res;
     for (auto &t : tiles) {
       auto zero = createI32Const(loc, 0, rewriter);
-      res.push_back(rewriter.create<VSubVXOp>(loc, zero, t).getResult());
+      res.push_back(rewriter.create<VSubVXOp>(loc, vregE32(loc.getContext()), zero, t).getResult());
     }
     storeTiles(res, sew, n, rewriter, loc);
     rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
@@ -1717,13 +1726,13 @@ struct TosaAbsLowering
     llvm::SmallVector<mlir::Value> res;
     for (auto &t : tiles) {
       // pos_part = relu(x)  = max(x, 0)
-      auto pos = rewriter.create<VMaxVXOp>(loc, t).getResult();
+      auto pos = rewriter.create<VMaxVXOp>(loc, vregE32(loc.getContext()), t).getResult();
       // neg_part = relu(-x) = max(-x, 0);  neg = vrsub.vx t, x0
       auto zero = createI32Const(loc, 0, rewriter);
-      auto neg      = rewriter.create<VSubVXOp>(loc, zero, t).getResult();
-      auto neg_part = rewriter.create<VMaxVXOp>(loc, neg).getResult();
+      auto neg      = rewriter.create<VSubVXOp>(loc, vregE32(loc.getContext()), zero, t).getResult();
+      auto neg_part = rewriter.create<VMaxVXOp>(loc, vregE32(loc.getContext()), neg).getResult();
       // abs(x) = pos_part + neg_part  (only one is nonzero for any given i)
-      res.push_back(rewriter.create<VAddOp>(loc, pos, neg_part, 1).getResult());
+      res.push_back(rewriter.create<VAddOp>(loc, vregE32(loc.getContext()), pos, neg_part, 1).getResult());
     }
     storeTiles(res, sew, n, rewriter, loc);
     rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
@@ -1811,7 +1820,7 @@ struct TosaConstLowering : public mlir::OpRewritePattern<mlir::tosa::ConstOp> {
       int64_t addr = kTcmBase + slot * kTcmSlot + ti * kTileBytes;
       auto addrV = createI32Const(loc, (int32_t)addr, rewriter);
       auto ne = createI32Const(loc, (int32_t)tileElems(ti, k, n, sew), rewriter);
-      tiles.push_back(rewriter.create<VLE32Op>(loc, addrV, ne));
+      tiles.push_back(rewriter.create<VLE32Op>(loc, vregE32(loc.getContext()), addrV, ne));
     }
     storeTiles(tiles, sew, n, rewriter, loc);
     rewriter.replaceOp(op, tileCarrier(op, tiles, rewriter));

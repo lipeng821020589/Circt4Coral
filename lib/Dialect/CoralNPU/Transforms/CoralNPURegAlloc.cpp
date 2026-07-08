@@ -28,6 +28,7 @@
 
 #include "circt/Dialect/CoralNPU/CoralNPUPasses.h"
 #include "circt/Dialect/CoralNPU/CoralNPUOps.h"
+#include "circt/Dialect/CoralNPU/CoralNPUTypes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
@@ -231,15 +232,19 @@ static void computeLiveness(mlir::Operation *root,
     lr.value = valuePos.first;
     lr.start = valuePos.second;
     lr.end = it->second + 1; // half-open
-    // Determine if this value is vector-typed by checking the defining op.
-    // Vector-producing ops: VLE*, VSE*, VAdd, VSub, VMul, VWAdd, VDot, VRedSum,
-    // VSetVL, OuterProduct, AConv, AccRead.
+    // Direction-B: determine vector vs scalar by value type.
+    // Values whose type is !coralnpu.vreg<...> are vector; all others scalar.
+    // Fall back to the op-based heuristic for values that still carry i32
+    // (e.g. ops not yet migrated to VRegType).
     auto *defOp = valuePos.first.getDefiningOp();
-    lr.isVector = mlir::isa<VLE8Op, VLE16Op, VLE32Op,
-                            VSE8Op, VSE16Op, VSE32Op,
-                            VAddOp, VSubOp, VMulOp, VWAddOp, VDotOp, VRedSumOp, VRedMaxOp, VMaxVXOp,
-                            VSetVLOp,
-                            OuterProductOp, AConvOp, AccReadOp>(defOp);
+    bool typeIsVReg = mlir::isa<VRegType>(valuePos.first.getType());
+    bool opIsVector  = mlir::isa<VLE8Op, VLE16Op, VLE32Op,
+                                 VSE8Op, VSE16Op, VSE32Op,
+                                 VAddOp, VSubOp, VMulOp, VWAddOp, VDotOp,
+                                 VRedSumOp, VRedMaxOp, VMaxVXOp,
+                                 VSetVLOp,
+                                 OuterProductOp, AConvOp, AccReadOp>(defOp);
+    lr.isVector = typeIsVReg || opIsVector;
     out.push_back(lr);
   }
 }

@@ -12,6 +12,20 @@
 // are provided by the parent CoralNPU.td which includes this file.
 
 //===----------------------------------------------------------------------===//
+// Type constraints for vector / scalar registers
+//===----------------------------------------------------------------------===//
+
+// !coralnpu.vreg<sew, lmul> — typed vector register; direction-B migration target.
+def CoralNPU_VReg : Type<
+    CPred<"::mlir::isa<::circt::coralnpu::VRegType>($_self)">,
+    "!coralnpu.vreg">;
+
+// During the direction-B migration, vector Op arguments accept either the
+// old i32 carrier or the new !coralnpu.vreg type.  Once all producers emit
+// VRegType the i32 branch can be removed.
+def CoralNPU_VRegOrI32 : AnyTypeOf<[I32, CoralNPU_VReg]>;
+
+//===----------------------------------------------------------------------===//
 // Scalar operations
 //===----------------------------------------------------------------------===//
 
@@ -169,7 +183,7 @@ def VLE8Op : CoralNPU_Op<"vle8", []> {
 def VLE32Op : CoralNPU_Op<"vle32", []> {
   let summary = "Vector load of 32-bit elements from memory";
   let arguments = (ins I32:$addr, I32:$n);
-  let results = (outs I32:$result);
+  let results = (outs CoralNPU_VReg:$result);
   let assemblyFormat = "$addr `,` $n attr-dict `:` type($result)";
 }
 
@@ -182,7 +196,7 @@ def VSE8Op : CoralNPU_Op<"vse8", []> {
 
 def VSE32Op : CoralNPU_Op<"vse32", []> {
   let summary = "Vector store of 32-bit elements to memory";
-  let arguments = (ins I32:$value, I32:$addr, I32:$n);
+  let arguments = (ins CoralNPU_VRegOrI32:$value, I32:$addr, I32:$n);
   let results = (outs);
   let assemblyFormat = "$value `,` $addr `,` $n attr-dict `:` type($value)";
 }
@@ -190,13 +204,13 @@ def VSE32Op : CoralNPU_Op<"vse32", []> {
 def VLE16Op : CoralNPU_Op<"vle16", []> {
   let summary = "Vector load of 16-bit elements from memory";
   let arguments = (ins I32:$addr, I32:$n);
-  let results = (outs I32:$result);
+  let results = (outs CoralNPU_VReg:$result);
   let assemblyFormat = "$addr `,` $n attr-dict `:` type($result)";
 }
 
 def VSE16Op : CoralNPU_Op<"vse16", []> {
   let summary = "Vector store of 16-bit elements to memory";
-  let arguments = (ins I32:$value, I32:$addr, I32:$n);
+  let arguments = (ins CoralNPU_VRegOrI32:$value, I32:$addr, I32:$n);
   let results = (outs);
   let assemblyFormat = "$value `,` $addr `,` $n attr-dict `:` type($value)";
 }
@@ -205,30 +219,31 @@ def VSE16Op : CoralNPU_Op<"vse16", []> {
 // Vector arithmetic operations (with stripmine support)
 //===----------------------------------------------------------------------===//
 
-def VAddOp : CoralNPU_Op<"vadd", [Pure, SameTypeOperands, SameOperandsAndResultType]> {
+def VAddOp : CoralNPU_Op<"vadd", [Pure]> {
   let summary = "Vector element-wise addition";
   let description = [{
     SIMD vector addition. The `stripmine` attribute controls how many times
     the hardware issues this instruction (1/2/4), allowing a single dispatch
     to produce multiple serialized SIMD operations.
+    Direction-B: result type is !coralnpu.vreg; args accept i32 or vreg.
   }];
-  let arguments = (ins I32:$lhs, I32:$rhs, DefaultValuedAttr<ConfinedAttr<I32Attr, [IntMinValue<1>, IntMaxValue<4>]>, "1">:$stripmine);
-  let results = (outs I32:$result);
-  let assemblyFormat = "(`stripmine` `=` $stripmine^)? $lhs `,` $rhs attr-dict `:` type($result)";
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs,
+                   DefaultValuedAttr<ConfinedAttr<I32Attr, [IntMinValue<1>, IntMaxValue<4>]>, "1">:$stripmine);
+  let results = (outs CoralNPU_VReg:$result);
 }
 
-def VSubOp : CoralNPU_Op<"vsub", [Pure, SameTypeOperands, SameOperandsAndResultType]> {
+def VSubOp : CoralNPU_Op<"vsub", [Pure]> {
   let summary = "Vector element-wise subtraction";
-  let arguments = (ins I32:$lhs, I32:$rhs, DefaultValuedAttr<ConfinedAttr<I32Attr, [IntMinValue<1>, IntMaxValue<4>]>, "1">:$stripmine);
-  let results = (outs I32:$result);
-  let assemblyFormat = "(`stripmine` `=` $stripmine^)? $lhs `,` $rhs attr-dict `:` type($result)";
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs,
+                   DefaultValuedAttr<ConfinedAttr<I32Attr, [IntMinValue<1>, IntMaxValue<4>]>, "1">:$stripmine);
+  let results = (outs CoralNPU_VReg:$result);
 }
 
-def VMulOp : CoralNPU_Op<"vmul", [Pure, SameTypeOperands, SameOperandsAndResultType]> {
+def VMulOp : CoralNPU_Op<"vmul", [Pure]> {
   let summary = "Vector element-wise multiplication";
-  let arguments = (ins I32:$lhs, I32:$rhs, DefaultValuedAttr<ConfinedAttr<I32Attr, [IntMinValue<1>, IntMaxValue<4>]>, "1">:$stripmine);
-  let results = (outs I32:$result);
-  let assemblyFormat = "(`stripmine` `=` $stripmine^)? $lhs `,` $rhs attr-dict `:` type($result)";
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs,
+                   DefaultValuedAttr<ConfinedAttr<I32Attr, [IntMinValue<1>, IntMaxValue<4>]>, "1">:$stripmine);
+  let results = (outs CoralNPU_VReg:$result);
 }
 
 def VWAddOp : CoralNPU_Op<"vwadd", [Pure]> {
@@ -237,11 +252,10 @@ def VWAddOp : CoralNPU_Op<"vwadd", [Pure]> {
     Widening vector addition. Takes narrower elements and produces wider results.
     e.g., two e8 vectors produce an e16 result; two e16 vectors produce e32.
   }];
-  let arguments = (ins I32:$lhs, I32:$rhs, DefaultValuedAttr<ConfinedAttr<I32Attr, [IntMinValue<1>, IntMaxValue<4>]>, "1">:$stripmine);
-  let results = (outs I32:$result);
-  let assemblyFormat = "(`stripmine` `=` $stripmine^)? $lhs `,` $rhs attr-dict `:` type($result)";
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs,
+                   DefaultValuedAttr<ConfinedAttr<I32Attr, [IntMinValue<1>, IntMaxValue<4>]>, "1">:$stripmine);
+  let results = (outs CoralNPU_VReg:$result);
 }
-
 
 def VWMACCOp : CoralNPU_Op<"vwmacc", [Pure]> {
   let summary = "Vector widening multiply-accumulate (int8 × int8 → int16 accumulate)";
@@ -251,10 +265,9 @@ def VWMACCOp : CoralNPU_Op<"vwmacc", [Pure]> {
     Maps to vwmacc.vv vD, vS1, vS2 (funct6=0b111100).
     Used in depthwise_conv2d for bandwidth-efficient int8 MAC.
   }];
-  let arguments = (ins I32:$lhs, I32:$rhs, I32:$acc,
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs, AnyType:$acc,
                    DefaultValuedAttr<ConfinedAttr<I32Attr, [IntMinValue<1>, IntMaxValue<4>]>, "1">:$stripmine);
-  let results = (outs I32:$result);
-  let assemblyFormat = "(`stripmine` `=` $stripmine^)? $lhs `,` $rhs `,` $acc attr-dict `:` type($result)";
+  let results = (outs CoralNPU_VReg:$result);
 }
 
 def VSubVXOp : CoralNPU_Op<"vsub_vx", [Pure]> {
@@ -264,9 +277,8 @@ def VSubVXOp : CoralNPU_Op<"vsub_vx", [Pure]> {
     When scalar = x0 (zero), this implements element-wise negation.
     Maps to vrsub.vx vD, vS, xS (RISC-V reversed-subtraction, funct6=0b000011).
   }];
-  let arguments = (ins I32:$scalar, I32:$vector);
-  let results = (outs I32:$result);
-  let assemblyFormat = "$scalar `,` $vector attr-dict `:` type($result)";
+  let arguments = (ins I32:$scalar, AnyType:$vector);
+  let results = (outs CoralNPU_VReg:$result);
 }
 
 def VRedSumOp : CoralNPU_Op<"vredsum", [Pure]> {
@@ -275,9 +287,8 @@ def VRedSumOp : CoralNPU_Op<"vredsum", [Pure]> {
     Reduces all elements of a vector register to a single scalar sum.
     Used as the building block for pooling operations.
   }];
-  let arguments = (ins I32:$vector);
+  let arguments = (ins AnyType:$vector);
   let results = (outs I32:$result);
-  let assemblyFormat = "$vector attr-dict `:` type($result)";
 }
 
 def VRedMaxOp : CoralNPU_Op<"vredmax", [Pure]> {
@@ -287,9 +298,8 @@ def VRedMaxOp : CoralNPU_Op<"vredmax", [Pure]> {
     Used as the building block for max_pool2d operations.
     Maps to vredmax.vs (signed) on RISC-V.
   }];
-  let arguments = (ins I32:$vector);
+  let arguments = (ins AnyType:$vector);
   let results = (outs I32:$result);
-  let assemblyFormat = "$vector attr-dict `:` type($result)";
 }
 
 def VMaxVXOp : CoralNPU_Op<"vmax_vx", [Pure]> {
@@ -299,34 +309,30 @@ def VMaxVXOp : CoralNPU_Op<"vmax_vx", [Pure]> {
     When the scalar is zero (x0), this implements ReLU.
     Maps to vmax.vx v_out, v_in, x0.
   }];
-  let arguments = (ins I32:$vector);
-  let results = (outs I32:$result);
-  let assemblyFormat = "$vector attr-dict `:` type($result)";
+  let arguments = (ins AnyType:$vector);
+  let results = (outs CoralNPU_VReg:$result);
 }
 
-
-def VMaxVVOp : CoralNPU_Op<"vmax_vv", [Pure, SameTypeOperands, SameOperandsAndResultType]> {
+def VMaxVVOp : CoralNPU_Op<"vmax_vv", [Pure]> {
   let summary = "Vector-vector signed max: vd[i] = max(vs1[i], vs2[i])";
   let description = [{
     Per-element signed maximum of two vector registers.
     Used for element-wise maximum operations (tosa.maximum).
     Maps to vmax.vv vD, vS1, vS2 (funct6=0b000111, funct3=000).
   }];
-  let arguments = (ins I32:$lhs, I32:$rhs);
-  let results = (outs I32:$result);
-  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($result)";
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
+  let results = (outs CoralNPU_VReg:$result);
 }
 
-def VMinVVOp : CoralNPU_Op<"vmin_vv", [Pure, SameTypeOperands, SameOperandsAndResultType]> {
+def VMinVVOp : CoralNPU_Op<"vmin_vv", [Pure]> {
   let summary = "Vector-vector signed min: vd[i] = min(vs1[i], vs2[i])";
   let description = [{
     Per-element signed minimum of two vector registers.
     Used for element-wise minimum operations (tosa.minimum).
     Maps to vmin.vv vD, vS1, vS2 (funct6=0b000101, funct3=000).
   }];
-  let arguments = (ins I32:$lhs, I32:$rhs);
-  let results = (outs I32:$result);
-  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($result)";
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
+  let results = (outs CoralNPU_VReg:$result);
 }
 
 def VDotOp : CoralNPU_Op<"vdot", [Pure]> {
@@ -336,9 +342,9 @@ def VDotOp : CoralNPU_Op<"vdot", [Pure]> {
     Used as the building block for outer-product MAC:
       result[i] += lhs[i*4+0]*rhs[i*4+0] + ... + lhs[i*4+3]*rhs[i*4+3]
   }];
-  let arguments = (ins I32:$lhs, I32:$rhs, DefaultValuedAttr<ConfinedAttr<I32Attr, [IntMinValue<1>, IntMaxValue<4>]>, "1">:$stripmine);
-  let results = (outs I32:$result);
-  let assemblyFormat = "(`stripmine` `=` $stripmine^)? $lhs `,` $rhs attr-dict `:` type($result)";
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs,
+                   DefaultValuedAttr<ConfinedAttr<I32Attr, [IntMinValue<1>, IntMaxValue<4>]>, "1">:$stripmine);
+  let results = (outs CoralNPU_VReg:$result);
 }
 
 //===----------------------------------------------------------------------===//

@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Dialect/CoralNPU/CoralNPUOps.h"
+#include "circt/Dialect/CoralNPU/CoralNPUTypes.h"
 #include "circt/Dialect/CoralNPU/CoralNPUPasses.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -24,6 +25,11 @@
 
 using namespace circt;
 using namespace circt::coralnpu;
+/// Direction-B helper: return VRegType<e32, m1>.
+static mlir::Type vregE32(mlir::MLIRContext *ctx) {
+  return ::circt::coralnpu::VRegType::get(ctx, ::circt::coralnpu::SEW::E32, ::circt::coralnpu::LMUL::M1);
+}
+
 
 namespace circt {
 namespace coralnpu {
@@ -117,11 +123,11 @@ struct AffineForToCoralNPU : public mlir::OpRewritePattern<mlir::affine::AffineF
 
       // Map arith op → coralnpu vector op
       if (mlir::isa<mlir::arith::AddIOp>(inner))
-        rewriter.create<VAddOp>(innerLoc, c0, c0);
+        rewriter.create<VAddOp>(innerLoc, vregE32(innerLoc.getContext()), c0, c0);
       else if (mlir::isa<mlir::arith::SubIOp>(inner))
-        rewriter.create<VSubOp>(innerLoc, c0, c0);
+        rewriter.create<VSubOp>(innerLoc, vregE32(innerLoc.getContext()), c0, c0);
       else if (mlir::isa<mlir::arith::MulIOp>(inner))
-        rewriter.create<VMulOp>(innerLoc, c0, c0);
+        rewriter.create<VMulOp>(innerLoc, vregE32(innerLoc.getContext()), c0, c0);
     });
 
     // Keep the original loop (simplified: don't erase, just annotate)
@@ -154,8 +160,8 @@ struct SCFForToCoralNPU : public mlir::OpRewritePattern<mlir::scf::ForOp> {
     rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
 
     auto c0 = rewriter.create<ScalarLiOp>(loc, rewriter.getI32IntegerAttr(0));
-    rewriter.create<VAddOp>(loc, c0, c0);
-    rewriter.create<VMulOp>(loc, c0, c0);
+    rewriter.create<VAddOp>(loc, vregE32(loc.getContext()), c0, c0);
+    rewriter.create<VMulOp>(loc, vregE32(loc.getContext()), c0, c0);
 
     return mlir::success();
   }
@@ -189,7 +195,7 @@ struct LoopToCoralNPUPass
       // Insert vector configuration and vector ops before the loop
       builder.create<VSetVLOp>(loc, SEW::E32, LMUL::M4);
       auto c0 = builder.create<ScalarLiOp>(loc, builder.getI32IntegerAttr(0));
-      builder.create<VAddOp>(loc, c0, c0);
+      builder.create<VAddOp>(loc, vregE32(loc.getContext()), c0, c0);
 
       report.loopsVectorized++;
       report.opsGenerated += 2;
@@ -208,7 +214,7 @@ struct LoopToCoralNPUPass
 
       builder.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
       auto c0 = builder.create<ScalarLiOp>(loc, builder.getI32IntegerAttr(0));
-      builder.create<VMulOp>(loc, c0, c0);
+      builder.create<VMulOp>(loc, vregE32(loc.getContext()), c0, c0);
 
       report.loopsVectorized++;
       report.opsGenerated += 2;
