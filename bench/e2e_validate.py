@@ -1765,6 +1765,78 @@ def test_conv2d_oc2_e2e():
     finally:
         if elf_path.exists(): elf_path.unlink()
 
+
+
+def test_conv2d_oc2_rescale_relu_e2e():
+    print("\n=== TEST 29: tosa.conv2d OC=2 + rescale + relu — multi-channel quantized block ===")
+    mlir = """func.func @pw_conv_oc2_rescale_relu(
+  %in: tensor<1x1x1x4xi8>, %wt: tensor<2x1x1x4xi8>,
+  %bias: tensor<2xi32>, %izp: tensor<1xi8>, %wzp: tensor<1xi8>,
+  %mult: tensor<1xi32>, %shift: tensor<1xi8>,
+  %izp32: tensor<1xi32>, %ozp: tensor<1xi8>
+) -> tensor<1x1x1x2xi8> {
+  %conv = tosa.conv2d %in, %wt, %bias, %izp, %wzp {
+    acc_type = i32, dilation = array<i64: 1, 1>,
+    pad = array<i64: 0, 0, 0, 0>, stride = array<i64: 1, 1>
+  } : (tensor<1x1x1x4xi8>, tensor<2x1x1x4xi8>, tensor<2xi32>,
+       tensor<1xi8>, tensor<1xi8>) -> tensor<1x1x1x2xi32>
+  %rs = tosa.rescale %conv, %mult, %shift, %izp32, %ozp {
+    input_unsigned = false, output_unsigned = false, per_channel = false,
+    rounding_mode = #tosa.rounding_mode<SINGLE_ROUND>, scale32 = true
+  } : (tensor<1x1x1x2xi32>, tensor<1xi32>, tensor<1xi8>, tensor<1xi32>,
+       tensor<1xi8>) -> tensor<1x1x1x2xi8>
+  %rl = tosa.clamp %rs {min_val = 0 : i8, max_val = 127 : i8}
+      : (tensor<1x1x1x2xi8>) -> tensor<1x1x1x2xi8>
+  func.return %rl : tensor<1x1x1x2xi8>
+}
+"""
+    passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+              "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+    insns = extract_asm_instructions(run_circt_opt(mlir, passes))
+
+    # 9 args -> result_slot = max(8,9) = 9 -> 0x19000; read 2*i32 = 8 bytes
+    RESULT_ADDR_29 = TCM_BASE + 9 * TCM_SLOT   # 0x19000
+
+    # conv oc0: dot([4,4,4,4],[1,1,1,1])=16; rescale(16,Q30/32)=4; relu=4
+    # conv oc1: dot([4,4,4,4],[2,2,2,2])=32; rescale(32,Q30/32)=8; relu=8
+    in_vals     = [4, 4, 4, 4]            + [0]*12   # slot 0
+    wt_vals     = [1, 1, 1, 1, 2, 2, 2, 2] + [0]*8    # slot 1: oc0=[1]*4 oc1=[2]*4
+    bias_vals   = [0, 0]                  + [0]*14   # slot 2
+    izp_vals    = [0]*16                             # slot 3 (unused)
+    wzp_vals    = [0]*16                             # slot 4 (unused)
+    mult_vals   = [0x40000000]            + [0]*15   # slot 5
+    shift_vals  = [32]                    + [0]*15   # slot 6
+    izp32_vals  = [0]*16                             # slot 7
+    ozp_vals    = [0]*16                             # slot 8
+
+    prologue = [
+        ".section .text", ".globl _start", "_start:",
+        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    or    t0, t0, t1",  "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(in_vals,    TCM_BASE + 0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(wt_vals,    TCM_BASE + 1 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(bias_vals,  TCM_BASE + 2 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(mult_vals,  TCM_BASE + 5 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(shift_vals, TCM_BASE + 6 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(izp32_vals, TCM_BASE + 7 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(ozp_vals,   TCM_BASE + 8 * TCM_SLOT)
+
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR_29, 8)
+        vals = list(struct.unpack("<2i", raw))
+        # oc0: 16->rs=4->relu=4; oc1: 32->rs=8->relu=8
+        check_result("conv2d OC=2 + rescale + relu: [4, 8]", vals, [4, 8])
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
 if __name__ == "__main__":
     print("CoralNPU E2E Validation")
     print(f"  circt-opt : {CIRCT_OPT}")
@@ -1805,6 +1877,7 @@ if __name__ == "__main__":
     test_conv2d_rescale_e2e()
     test_mobilenet_dw_pw_block_e2e()
     test_conv2d_oc2_e2e()
+    test_conv2d_oc2_rescale_relu_e2e()
 
     print(f"\n{'='*50}")
     print(f"Results: {COUNTS['pass']} passed, {COUNTS['fail']} failed")
