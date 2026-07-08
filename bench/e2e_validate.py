@@ -1837,6 +1837,118 @@ def test_conv2d_oc2_rescale_relu_e2e():
     finally:
         if elf_path.exists(): elf_path.unlink()
 
+
+
+def test_mobilenet_full_oc2_e2e():
+    print("\n=== TEST 30: Full MobileNet block OC=2 (dw->rs->relu->pw_OC2->rs) ===")
+    mlir = """func.func @mobilenet_full_oc2(
+  %in: tensor<1x1x1x4xi8>, %wt_dw: tensor<1x1x4x1xi8>,
+  %bias_dw: tensor<4xi32>, %mult: tensor<1xi32>, %shift: tensor<1xi8>,
+  %izp: tensor<1xi8>, %wzp: tensor<1xi8>,
+  %izp32: tensor<1xi32>, %ozp: tensor<1xi8>,
+  %wt_pw: tensor<2x1x1x4xi8>, %bias_pw: tensor<2xi32>,
+  %izp_pw: tensor<1xi8>, %wzp_pw: tensor<1xi8>,
+  %mult2: tensor<1xi32>, %shift2: tensor<1xi8>,
+  %izp32_2: tensor<1xi32>, %ozp2: tensor<1xi8>
+) -> tensor<1x1x1x2xi8> {
+  %dw = tosa.depthwise_conv2d %in, %wt_dw, %bias_dw, %izp, %wzp {
+    acc_type = i32, dilation = array<i64: 1, 1>,
+    pad = array<i64: 0, 0, 0, 0>, stride = array<i64: 1, 1>
+  } : (tensor<1x1x1x4xi8>, tensor<1x1x4x1xi8>, tensor<4xi32>,
+       tensor<1xi8>, tensor<1xi8>) -> tensor<1x1x1x4xi32>
+  %rs = tosa.rescale %dw, %mult, %shift, %izp32, %ozp {
+    input_unsigned = false, output_unsigned = false, per_channel = false,
+    rounding_mode = #tosa.rounding_mode<SINGLE_ROUND>, scale32 = true
+  } : (tensor<1x1x1x4xi32>, tensor<1xi32>, tensor<1xi8>, tensor<1xi32>,
+       tensor<1xi8>) -> tensor<1x1x1x4xi8>
+  %rl = tosa.clamp %rs {min_val = 0 : i8, max_val = 127 : i8}
+      : (tensor<1x1x1x4xi8>) -> tensor<1x1x1x4xi8>
+  %pw = tosa.conv2d %rl, %wt_pw, %bias_pw, %izp_pw, %wzp_pw {
+    acc_type = i32, dilation = array<i64: 1, 1>,
+    pad = array<i64: 0, 0, 0, 0>, stride = array<i64: 1, 1>
+  } : (tensor<1x1x1x4xi8>, tensor<2x1x1x4xi8>, tensor<2xi32>,
+       tensor<1xi8>, tensor<1xi8>) -> tensor<1x1x1x2xi32>
+  %rs2 = tosa.rescale %pw, %mult2, %shift2, %izp32_2, %ozp2 {
+    input_unsigned = false, output_unsigned = false, per_channel = false,
+    rounding_mode = #tosa.rounding_mode<SINGLE_ROUND>, scale32 = true
+  } : (tensor<1x1x1x2xi32>, tensor<1xi32>, tensor<1xi8>, tensor<1xi32>,
+       tensor<1xi8>) -> tensor<1x1x1x2xi8>
+  func.return %rs2 : tensor<1x1x1x2xi8>
+}
+"""
+    passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+              "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+    insns = extract_asm_instructions(run_circt_opt(mlir, passes))
+
+    # 17 args (0..16) -> result_slot = max(8,17) = 17 -> 0x21000; read 2*i32
+    RESULT_ADDR_30 = TCM_BASE + 17 * TCM_SLOT   # 0x21000
+
+    # Numerical trace (spike memory is zero-initialised):
+    #   dw: vmul([16,0,0,0],[1,0,0,0])=[16,0,0,0], vredsum=16, +bias=16
+    #       sw(16, 0x21000)              ← only slot17+0 written
+    #   rescale1: per-element lw(0x21000+i*4):
+    #       lw(0x21000)=16 -> rs=4; lw(+4)=0 -> 0; lw(+8)=0 -> 0; lw(+12)=0 -> 0
+    #       sw([4,0,0,0] to 0x21000..); VLE32(0x21000,4)=[4,0,0,0]
+    #   relu: vmax.vx([4,0,0,0],0)=[4,0,0,0]  (register, tileCarrier)
+    #   pw_conv OC=2, inTiles from relu vreg=[4,0,0,0]:
+    #       oc0 wt=[1,1,1,1]: vmul sum=4, +bias=4, sw(4,0x21000)
+    #       oc1 wt=[2,2,2,2]: vmul sum=8, +bias=8, sw(8,0x21004)
+    #       VLE32(0x21000,2)=[4,8]
+    #   rescale2: lw(0x21000)=4->1; lw(0x21004)=8->2
+    #       sw([1,2] to 0x21000..); VLE32(0x21000,2)=[1,2]
+    #   Read 0x21000: [1, 2]
+
+    in_vals     = [16, 0, 0, 0]              + [0]*12   # slot 0
+    wt_dw_vals  = [1, 0, 0, 0]              + [0]*12   # slot 1
+    bias_dw     = [0]*16                               # slot 2
+    mult_vals   = [0x40000000]              + [0]*15   # slot 3
+    shift_vals  = [32]                      + [0]*15   # slot 4
+    # slots 5,6 (izp, wzp i8) left zero
+    izp32_vals  = [0]*16                               # slot 7
+    ozp_vals    = [0]*16                               # slot 8
+    wt_pw_vals  = [1, 1, 1, 1, 2, 2, 2, 2] + [0]*8    # slot 9: oc0=[1]*4 oc1=[2]*4
+    bias_pw     = [0]*16                               # slot 10
+    # slots 11,12 (izp_pw, wzp_pw) left zero
+    mult2_vals  = [0x40000000]              + [0]*15   # slot 13
+    shift2_vals = [32]                      + [0]*15   # slot 14
+    izp32_2     = [0]*16                               # slot 15
+    ozp2_vals   = [0]*16                               # slot 16
+
+    prologue = [
+        ".section .text", ".globl _start", "_start:",
+        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    or    t0, t0, t1",  "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(in_vals,     TCM_BASE +  0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(wt_dw_vals,  TCM_BASE +  1 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(bias_dw,     TCM_BASE +  2 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(mult_vals,   TCM_BASE +  3 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(shift_vals,  TCM_BASE +  4 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(izp32_vals,  TCM_BASE +  7 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(ozp_vals,    TCM_BASE +  8 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(wt_pw_vals,  TCM_BASE +  9 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(bias_pw,     TCM_BASE + 10 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(mult2_vals,  TCM_BASE + 13 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(shift2_vals, TCM_BASE + 14 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(izp32_2,     TCM_BASE + 15 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(ozp2_vals,   TCM_BASE + 16 * TCM_SLOT)
+
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR_30, 8)
+        vals = list(struct.unpack("<2i", raw))
+        # dw=16 -> rs=4 -> relu=4; pw oc0=4->1, oc1=8->2
+        check_result("full MobileNet OC=2: dw=16->rs=4->relu=[4,0,0,0]->pw=[4,8]->rs=[1,2]",
+                     vals, [1, 2])
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
 if __name__ == "__main__":
     print("CoralNPU E2E Validation")
     print(f"  circt-opt : {CIRCT_OPT}")
@@ -1878,6 +1990,7 @@ if __name__ == "__main__":
     test_mobilenet_dw_pw_block_e2e()
     test_conv2d_oc2_e2e()
     test_conv2d_oc2_rescale_relu_e2e()
+    test_mobilenet_full_oc2_e2e()
 
     print(f"\n{'='*50}")
     print(f"Results: {COUNTS['pass']} passed, {COUNTS['fail']} failed")

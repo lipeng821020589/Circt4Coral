@@ -994,11 +994,18 @@ struct TosaConv2DLowering : public mlir::OpRewritePattern<mlir::tosa::Conv2DOp> 
 
     // Load input tiles (size = ceil(IC / vregCap)).
     auto inTiles = getTiles(op.getOperand(0), SEW::E32, rewriter, loc);
-    int64_t k_in = (int64_t)inTiles.size();
+
+    // Derive IC from the weight type [OC, KH, KW, IC] — op.getOperand(0) may
+    // already be a tileCarrier (tensor<kxi32>) after earlier lowerings, so
+    // numElements(op.getOperand(0)) would return the tile count, not IC.
+    // The weight operand always retains its original TOSA type.
+    int64_t nIn = 1;
+    if (auto wTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getOperand(1).getType()))
+      nIn = wTy.getDimSize(3);  // weight layout [OC, KH, KW, IC], IC is dim 3
+    int64_t k_in = tileCount(SEW::E32, nIn);
 
     // Weight tensor layout: [OC, KH, KW, IC]. For 1x1 conv (KH=KW=1) each OC row
     // is IC consecutive elements = k_in tiles of vregCap elements each.
-    int64_t nIn = numElements(op.getOperand(0));  // IC (for 1x1)
     int64_t wtSlot = 1;
     if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(op.getOperand(1)))
       wtSlot = barg.getArgNumber();
