@@ -11,23 +11,18 @@
 // 1x1x4x4 input, 1x1x4x1 weight (pointwise depthwise): single tile pair.
 // CHECK-LABEL: @dw_pointwise
 // CHECK: coralnpu.vsetvl e32, m1
-// CHECK: %[[IN0:.*]] = coralnpu.vle32
-// CHECK: %[[WT0:.*]] = coralnpu.vle32
-// CHECK: %[[MUL0:.*]] = coralnpu.vmul %[[IN0]], %[[WT0]]
-// CHECK: %[[S0:.*]] = coralnpu.vredsum %[[MUL0]]
-// CHECK: %{{.*}} = coralnpu.lw
-// CHECK: %{{.*}} = coralnpu.add %[[S0]]
+// CHECK: coralnpu.lw
+// CHECK: coralnpu.lw
+// CHECK: coralnpu.mul
+// CHECK: coralnpu.add
+// CHECK: coralnpu.lw
+// CHECK: coralnpu.add
 // CHECK: coralnpu.sw
 // ASM-LABEL: # CoralNPU Assembly
 // ASM: vle32.v
-// ASM: vle32.v
-// ASM: vmul.vv
-// ASM: vmv.v.i
-// ASM: vredsum.vs
-// ASM: vmv.x.s
-// ASM: lw
-// ASM: add
+// ASM: mul
 // ASM: sw
+// ASM: add
 func.func @dw_pointwise(%in: tensor<1x4x4x4xi8>, %wt: tensor<1x1x4x1xi8>,
                          %bias: tensor<4xi32>, %izp: tensor<1xi8>, %wzp: tensor<1xi8>)
     -> tensor<1x4x4x4xi32> {

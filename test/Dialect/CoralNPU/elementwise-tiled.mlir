@@ -13,7 +13,7 @@
 // CHECK: coralnpu.li 65584 : i32
 // CHECK: coralnpu.vle32
 
-// CHECK-COUNT-4: coralnpu.vadd %{{.*}}, %{{.*}} : i32
+// CHECK-COUNT-4: coralnpu.vadd %{{.*}}, %{{.*}} : (!coralnpu.vreg<e32, m1>, !coralnpu.vreg<e32, m1>) -> !coralnpu.vreg<e32, m1>
 
 // CHECK: coralnpu.li 98304 : i32
 // CHECK: coralnpu.vse32

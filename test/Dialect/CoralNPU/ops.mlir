@@ -43,22 +43,22 @@ func.func @test_scalar_ops() {
 func.func @test_vector_ops(%arg0: i32, %arg1: i32) {
   // CHECK: coralnpu.vsetvl e32, m1
   coralnpu.vsetvl e32, m1
-  // CHECK: coralnpu.vle32 %arg0, %arg1 : i32
-  %0 = coralnpu.vle32 %arg0, %arg1 : i32
-  // CHECK: coralnpu.vadd %0, %0 : i32
-  %1 = coralnpu.vadd %0, %0 : i32
-  // CHECK: coralnpu.vse32 %1, %arg0, %arg1 : i32
-  coralnpu.vse32 %1, %arg0, %arg1 : i32
+  // CHECK: coralnpu.vle32 %arg0, %arg1 : !coralnpu.vreg<e32, m1>
+  %0 = coralnpu.vle32 %arg0, %arg1 : !coralnpu.vreg<e32, m1>
+  // CHECK: coralnpu.vadd %0, %0 : (!coralnpu.vreg<e32, m1>, !coralnpu.vreg<e32, m1>) -> !coralnpu.vreg<e32, m1>
+  %1 = coralnpu.vadd %0, %0 : (!coralnpu.vreg<e32, m1>, !coralnpu.vreg<e32, m1>) -> !coralnpu.vreg<e32, m1>
+  // CHECK: coralnpu.vse32 %1, %arg0, %arg1 : !coralnpu.vreg<e32, m1>
+  coralnpu.vse32 %1, %arg0, %arg1 : !coralnpu.vreg<e32, m1>
   // CHECK: coralnpu.vsetvl e16, m2
   coralnpu.vsetvl e16, m2
-  // CHECK: coralnpu.vle16 %arg0, %arg1 : i32
-  %2 = coralnpu.vle16 %arg0, %arg1 : i32
-  // CHECK: coralnpu.vse16 %2, %arg0, %arg1 : i32
-  coralnpu.vse16 %2, %arg0, %arg1 : i32
-  // CHECK: coralnpu.vsub %0, %0 : i32
-  %3 = coralnpu.vsub %0, %0 : i32
-  // CHECK: coralnpu.vmul %3, %3 : i32
-  %4 = coralnpu.vmul %3, %3 : i32
+  // CHECK: coralnpu.vle16 %arg0, %arg1 : !coralnpu.vreg<e32, m1>
+  %2 = coralnpu.vle16 %arg0, %arg1 : !coralnpu.vreg<e32, m1>
+  // CHECK: coralnpu.vse16 %2, %arg0, %arg1 : !coralnpu.vreg<e32, m1>
+  coralnpu.vse16 %2, %arg0, %arg1 : !coralnpu.vreg<e32, m1>
+  // CHECK: coralnpu.vsub %0, %0 : (!coralnpu.vreg<e32, m1>, !coralnpu.vreg<e32, m1>) -> !coralnpu.vreg<e32, m1>
+  %3 = coralnpu.vsub %0, %0 : (!coralnpu.vreg<e32, m1>, !coralnpu.vreg<e32, m1>) -> !coralnpu.vreg<e32, m1>
+  // CHECK: coralnpu.vmul %3, %3 : (!coralnpu.vreg<e32, m1>, !coralnpu.vreg<e32, m1>) -> !coralnpu.vreg<e32, m1>
+  %4 = coralnpu.vmul %3, %3 : (!coralnpu.vreg<e32, m1>, !coralnpu.vreg<e32, m1>) -> !coralnpu.vreg<e32, m1>
   coralnpu.return
 }
 
@@ -67,20 +67,20 @@ func.func @test_stripmine(%arg0: i32, %arg1: i32) {
   coralnpu.vsetvl e8, m2
   // CHECK: coralnpu.vle8 %arg0, %arg1 : i32
   %0 = coralnpu.vle8 %arg0, %arg1 : i32
-  // CHECK: coralnpu.vadd stripmine = 4 %0, %0 : i32
-  %1 = coralnpu.vadd stripmine = 4 %0, %0 : i32
-  // CHECK: coralnpu.vdot stripmine = 2 %1, %1 : i32
-  %2 = coralnpu.vdot stripmine = 2 %1, %1 : i32
-  // CHECK: coralnpu.vwadd stripmine = 2 %2, %2 : i32
-  %3 = coralnpu.vwadd stripmine = 2 %2, %2 : i32
-  coralnpu.vse8 %3, %arg0, %arg1 : i32
+  // CHECK: coralnpu.vadd stripmine = 4 %arg0, %arg0 : (i32, i32) -> !coralnpu.vreg<e32, m1>
+  %1 = coralnpu.vadd stripmine = 4 %arg0, %arg0 : (i32, i32) -> !coralnpu.vreg<e32, m1>
+  // CHECK: coralnpu.vdot stripmine = 2 %1, %1 : (!coralnpu.vreg<e32, m1>, !coralnpu.vreg<e32, m1>) -> !coralnpu.vreg<e32, m1>
+  %2 = coralnpu.vdot stripmine = 2 %1, %1 : (!coralnpu.vreg<e32, m1>, !coralnpu.vreg<e32, m1>) -> !coralnpu.vreg<e32, m1>
+  // CHECK: coralnpu.vwadd stripmine = 2 %2, %2 : (!coralnpu.vreg<e32, m1>, !coralnpu.vreg<e32, m1>) -> !coralnpu.vreg<e32, m1>
+  %3 = coralnpu.vwadd stripmine = 2 %2, %2 : (!coralnpu.vreg<e32, m1>, !coralnpu.vreg<e32, m1>) -> !coralnpu.vreg<e32, m1>
+  coralnpu.vse8 %arg0, %arg0, %arg1 : i32
   coralnpu.return
 }
 
 // CHECK-LABEL: func.func @test_reduction
-func.func @test_reduction(%arg0: i32) {
-  // CHECK: coralnpu.vredsum %arg0 : i32
-  %0 = coralnpu.vredsum %arg0 : i32
+func.func @test_reduction(%arg0: !coralnpu.vreg<e32, m1>) {
+  // CHECK: coralnpu.vredsum %arg0 : (!coralnpu.vreg<e32, m1>) -> i32
+  %0 = coralnpu.vredsum %arg0 : (!coralnpu.vreg<e32, m1>) -> i32
   coralnpu.return %0 : i32
 }
 

@@ -21,14 +21,14 @@
 // CHECK: %[[A1:.*]] = coralnpu.vle32
 // CHECK: %[[B0:.*]] = coralnpu.vle32
 // CHECK: %[[B1:.*]] = coralnpu.vle32
-// CHECK: %[[S0:.*]] = coralnpu.vadd %[[A0]], %[[B0]] : i32
-// CHECK: %[[S1:.*]] = coralnpu.vadd %[[A1]], %[[B1]] : i32
+// CHECK: %[[S0:.*]] = coralnpu.vadd %[[A0]], %[[B0]] : (!coralnpu.vreg<e32, m1>, !coralnpu.vreg<e32, m1>) -> !coralnpu.vreg<e32, m1>
+// CHECK: %[[S1:.*]] = coralnpu.vadd %[[A1]], %[[B1]] : (!coralnpu.vreg<e32, m1>, !coralnpu.vreg<e32, m1>) -> !coralnpu.vreg<e32, m1>
 // CHECK: coralnpu.vse32 %[[S0]]
 // CHECK: coralnpu.vse32 %[[S1]]
 // CHECK: %[[C0:.*]] = coralnpu.vle32
 // CHECK: %[[C1:.*]] = coralnpu.vle32
-// CHECK: %[[T0:.*]] = coralnpu.vadd %[[S0]], %[[C0]] : i32
-// CHECK: %[[T1:.*]] = coralnpu.vadd %[[S1]], %[[C1]] : i32
+// CHECK: %[[T0:.*]] = coralnpu.vadd %[[S0]], %[[C0]] : (!coralnpu.vreg<e32, m1>, !coralnpu.vreg<e32, m1>) -> !coralnpu.vreg<e32, m1>
+// CHECK: %[[T1:.*]] = coralnpu.vadd %[[S1]], %[[C1]] : (!coralnpu.vreg<e32, m1>, !coralnpu.vreg<e32, m1>) -> !coralnpu.vreg<e32, m1>
 // CHECK: coralnpu.vse32 %[[T0]]
 // CHECK: coralnpu.vse32 %[[T1]]
 

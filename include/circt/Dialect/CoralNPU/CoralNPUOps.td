@@ -219,6 +219,11 @@ def VSE16Op : CoralNPU_Op<"vse16", []> {
 // Vector arithmetic operations (with stripmine support)
 //===----------------------------------------------------------------------===//
 
+// Direction-B assembly format for binary vector ops with optional stripmine:
+//   coralnpu.vadd %lhs, %rhs : (!coralnpu.vreg<e32,m1>, !coralnpu.vreg<e32,m1>) -> !coralnpu.vreg<e32,m1>
+//   coralnpu.vadd stripmine = 4 %lhs, %rhs : (...) -> ...
+// functional-type(operands, results) prints all operand types then result types.
+
 def VAddOp : CoralNPU_Op<"vadd", [Pure]> {
   let summary = "Vector element-wise addition";
   let description = [{
@@ -230,6 +235,7 @@ def VAddOp : CoralNPU_Op<"vadd", [Pure]> {
   let arguments = (ins AnyType:$lhs, AnyType:$rhs,
                    DefaultValuedAttr<ConfinedAttr<I32Attr, [IntMinValue<1>, IntMaxValue<4>]>, "1">:$stripmine);
   let results = (outs CoralNPU_VReg:$result);
+  let assemblyFormat = "(`stripmine` `=` $stripmine^)? $lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
 def VSubOp : CoralNPU_Op<"vsub", [Pure]> {
@@ -237,6 +243,7 @@ def VSubOp : CoralNPU_Op<"vsub", [Pure]> {
   let arguments = (ins AnyType:$lhs, AnyType:$rhs,
                    DefaultValuedAttr<ConfinedAttr<I32Attr, [IntMinValue<1>, IntMaxValue<4>]>, "1">:$stripmine);
   let results = (outs CoralNPU_VReg:$result);
+  let assemblyFormat = "(`stripmine` `=` $stripmine^)? $lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
 def VMulOp : CoralNPU_Op<"vmul", [Pure]> {
@@ -244,6 +251,7 @@ def VMulOp : CoralNPU_Op<"vmul", [Pure]> {
   let arguments = (ins AnyType:$lhs, AnyType:$rhs,
                    DefaultValuedAttr<ConfinedAttr<I32Attr, [IntMinValue<1>, IntMaxValue<4>]>, "1">:$stripmine);
   let results = (outs CoralNPU_VReg:$result);
+  let assemblyFormat = "(`stripmine` `=` $stripmine^)? $lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
 def VWAddOp : CoralNPU_Op<"vwadd", [Pure]> {
@@ -255,6 +263,7 @@ def VWAddOp : CoralNPU_Op<"vwadd", [Pure]> {
   let arguments = (ins AnyType:$lhs, AnyType:$rhs,
                    DefaultValuedAttr<ConfinedAttr<I32Attr, [IntMinValue<1>, IntMaxValue<4>]>, "1">:$stripmine);
   let results = (outs CoralNPU_VReg:$result);
+  let assemblyFormat = "(`stripmine` `=` $stripmine^)? $lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
 def VWMACCOp : CoralNPU_Op<"vwmacc", [Pure]> {
@@ -268,6 +277,7 @@ def VWMACCOp : CoralNPU_Op<"vwmacc", [Pure]> {
   let arguments = (ins AnyType:$lhs, AnyType:$rhs, AnyType:$acc,
                    DefaultValuedAttr<ConfinedAttr<I32Attr, [IntMinValue<1>, IntMaxValue<4>]>, "1">:$stripmine);
   let results = (outs CoralNPU_VReg:$result);
+  let assemblyFormat = "(`stripmine` `=` $stripmine^)? $lhs `,` $rhs `,` $acc attr-dict `:` functional-type(operands, results)";
 }
 
 def VSubVXOp : CoralNPU_Op<"vsub_vx", [Pure]> {
@@ -279,6 +289,7 @@ def VSubVXOp : CoralNPU_Op<"vsub_vx", [Pure]> {
   }];
   let arguments = (ins I32:$scalar, AnyType:$vector);
   let results = (outs CoralNPU_VReg:$result);
+  let assemblyFormat = "$scalar `,` $vector attr-dict `:` functional-type(operands, results)";
 }
 
 def VRedSumOp : CoralNPU_Op<"vredsum", [Pure]> {
@@ -289,6 +300,7 @@ def VRedSumOp : CoralNPU_Op<"vredsum", [Pure]> {
   }];
   let arguments = (ins AnyType:$vector);
   let results = (outs I32:$result);
+  let assemblyFormat = "$vector attr-dict `:` functional-type(operands, results)";
 }
 
 def VRedMaxOp : CoralNPU_Op<"vredmax", [Pure]> {
@@ -300,6 +312,7 @@ def VRedMaxOp : CoralNPU_Op<"vredmax", [Pure]> {
   }];
   let arguments = (ins AnyType:$vector);
   let results = (outs I32:$result);
+  let assemblyFormat = "$vector attr-dict `:` functional-type(operands, results)";
 }
 
 def VMaxVXOp : CoralNPU_Op<"vmax_vx", [Pure]> {
@@ -311,6 +324,7 @@ def VMaxVXOp : CoralNPU_Op<"vmax_vx", [Pure]> {
   }];
   let arguments = (ins AnyType:$vector);
   let results = (outs CoralNPU_VReg:$result);
+  let assemblyFormat = "$vector attr-dict `:` functional-type(operands, results)";
 }
 
 def VMaxVVOp : CoralNPU_Op<"vmax_vv", [Pure]> {
@@ -322,6 +336,7 @@ def VMaxVVOp : CoralNPU_Op<"vmax_vv", [Pure]> {
   }];
   let arguments = (ins AnyType:$lhs, AnyType:$rhs);
   let results = (outs CoralNPU_VReg:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
 def VMinVVOp : CoralNPU_Op<"vmin_vv", [Pure]> {
@@ -333,6 +348,7 @@ def VMinVVOp : CoralNPU_Op<"vmin_vv", [Pure]> {
   }];
   let arguments = (ins AnyType:$lhs, AnyType:$rhs);
   let results = (outs CoralNPU_VReg:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
 def VDotOp : CoralNPU_Op<"vdot", [Pure]> {
@@ -345,6 +361,7 @@ def VDotOp : CoralNPU_Op<"vdot", [Pure]> {
   let arguments = (ins AnyType:$lhs, AnyType:$rhs,
                    DefaultValuedAttr<ConfinedAttr<I32Attr, [IntMinValue<1>, IntMaxValue<4>]>, "1">:$stripmine);
   let results = (outs CoralNPU_VReg:$result);
+  let assemblyFormat = "(`stripmine` `=` $stripmine^)? $lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
 //===----------------------------------------------------------------------===//

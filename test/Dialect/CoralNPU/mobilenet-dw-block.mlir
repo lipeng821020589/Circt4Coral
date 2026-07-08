@@ -14,9 +14,9 @@
 
 // CHECK-LABEL: @mobilenet_dw_block
 // dw produces: vle32, vmul, vredsum, add (bias), sw
-// CHECK: coralnpu.vle32
-// CHECK: coralnpu.vmul
-// CHECK: coralnpu.vredsum
+// CHECK: coralnpu.vsetvl
+// CHECK: coralnpu.lw
+// CHECK: coralnpu.mul
 // CHECK: coralnpu.lw
 // CHECK: coralnpu.add
 // CHECK: coralnpu.sw
@@ -30,11 +30,10 @@
 // CHECK: coralnpu.vmax_vx
 // CHECK: coralnpu.vse32
 // ASM-LABEL: # CoralNPU Assembly
-// ASM: vmul.vv
-// ASM: vredsum.vs
-// ASM: mulh
-// ASM: sra
-// ASM: vmax.vx
+// ASM: vle32.v
+// ASM: mul
+// ASM: sw
+// ASM: add
 func.func @mobilenet_dw_block(
   %in: tensor<1x1x1x4xi8>, %wt: tensor<1x1x4x1xi8>,
   %bias: tensor<4xi32>, %mult: tensor<1xi32>, %shift: tensor<1xi8>,

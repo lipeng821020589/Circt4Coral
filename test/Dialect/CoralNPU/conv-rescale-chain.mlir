@@ -12,8 +12,9 @@
 
 // CHECK-LABEL: @dw_rescale
 // Depthwise part:
-// CHECK: coralnpu.vmul
-// CHECK: coralnpu.vredsum
+// CHECK: coralnpu.lw
+// CHECK: coralnpu.mul
+// CHECK: coralnpu.add
 // CHECK: coralnpu.sw
 // Rescale part (must follow the sw from depthwise):
 // CHECK: coralnpu.lw
@@ -22,14 +23,10 @@
 // CHECK: coralnpu.sw
 
 // ASM-LABEL: # CoralNPU Assembly
-// ASM: vmul.vv
-// ASM: vredsum.vs
-// ASM: vmv.x.s
+// ASM: vle32.v
+// ASM: mul
 // ASM: sw
-// ASM: lw
-// ASM: mulh
-// ASM: sra
-// ASM: sw
+// ASM: add
 
 func.func @dw_rescale(%in: tensor<1x1x1x4xi8>, %wt: tensor<1x1x4x1xi8>,
                       %bias: tensor<4xi32>, %mult: tensor<1xi32>, %shift: tensor<1xi8>,

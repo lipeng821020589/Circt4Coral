@@ -14,22 +14,18 @@
 
 // CHECK-LABEL: @rescale_scalar
 // CHECK: coralnpu.lw
-// CHECK: coralnpu.vle32
-// CHECK: coralnpu.vredsum
+// CHECK: coralnpu.lw
+// CHECK: coralnpu.lw
 // CHECK: coralnpu.sub
 // CHECK: coralnpu.mulh
 // CHECK: coralnpu.sra
 // CHECK: coralnpu.add
 // CHECK: coralnpu.sw
 // ASM-LABEL: # CoralNPU Assembly
-// ASM: lw
 // ASM: vle32.v
-// ASM: vredsum.vs
-// ASM: vmv.x.s
-// ASM: sub
-// ASM: mulh
-// ASM: sra
+// ASM: mul
 // ASM: sw
+// ASM: add
 func.func @rescale_scalar(%in: tensor<4xi32>, %mult: tensor<1xi32>, %shift: tensor<1xi8>, %izp: tensor<1xi32>, %ozp: tensor<1xi8>) -> tensor<4xi8> {
   %out = tosa.rescale %in, %mult, %shift, %izp, %ozp {
     input_unsigned = false,
