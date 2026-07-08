@@ -2147,6 +2147,135 @@ def test_two_mobilenet_blocks_e2e():
     finally:
         if elf_path.exists(): elf_path.unlink()
 
+
+
+def test_weight_injection_e2e():
+    """
+    TEST 32: Verify write_weights.patch_elf_data injection mechanism.
+
+    Strategy: build an ELF the normal way (with prologue sw to init slots),
+    run it to confirm the baseline result, then build a second ELF *without*
+    the prologue sw (weights come only from .data section patched by
+    patch_elf_data), confirm same result.  This proves the ELF .data weight
+    injection path is functionally equivalent to the prologue sw path.
+    """
+    print("\n=== TEST 32: ELF .data weight injection (conv2d OC=1, no prologue sw) ===")
+
+    import os
+    import sys
+    sys.path.insert(0, '/home/radxa/Work/Circt4Coral/tools')
+    from write_weights import patch_elf_data
+
+    mlir = """func.func @pw_conv(
+  %in: tensor<1x1x1x4xi8>, %wt: tensor<1x1x1x4xi8>,
+  %bias: tensor<1xi32>, %izp: tensor<1xi8>, %wzp: tensor<1xi8>
+) -> tensor<1x1x1x1xi32> {
+  %0 = tosa.conv2d %in, %wt, %bias, %izp, %wzp {
+    acc_type = i32, dilation = array<i64: 1, 1>,
+    pad = array<i64: 0, 0, 0, 0>, stride = array<i64: 1, 1>
+  } : (tensor<1x1x1x4xi8>, tensor<1x1x1x4xi8>, tensor<1xi32>,
+       tensor<1xi8>, tensor<1xi8>) -> tensor<1x1x1x1xi32>
+  func.return %0 : tensor<1x1x1x1xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+              "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+    insns = extract_asm_instructions(run_circt_opt(mlir, passes))
+
+    # result_slot = max(8, 5) = 8 → 0x18000
+    RESULT_ADDR_32 = TCM_BASE + 8 * TCM_SLOT
+
+    # ── A: standard path (prologue sw injects data) ───────────────────────────
+    in_vals   = [1, 2, 3, 4]    + [0]*12
+    wt_vals   = [1, 1, 1, 1]    + [0]*12
+    bias_vals = [0]*16
+    prologue_std = [
+        ".section .text", ".globl _start", "_start:",
+        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    or    t0, t0, t1",  "    csrw  mstatus, t0",
+    ]
+    prologue_std += write_int32_to_asm_init(in_vals,   TCM_BASE + 0 * TCM_SLOT)
+    prologue_std += write_int32_to_asm_init(wt_vals,   TCM_BASE + 1 * TCM_SLOT)
+    prologue_std += write_int32_to_asm_init(bias_vals, TCM_BASE + 2 * TCM_SLOT)
+    asm_std = "\n".join(prologue_std) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_std = Path(ef.name)
+    try:
+        build_elf(asm_std, elf_std)
+        raw_std = run_spike_and_read_mem(elf_std, RESULT_ADDR_32, 4)
+        baseline = struct.unpack("<i", raw_std)[0]
+    finally:
+        if elf_std.exists(): elf_std.unlink()
+
+    # ── B: data-injection path (no prologue sw, weights from .data) ──────────
+    # Build ELF with empty prologue (mstatus enable only), then patch .data
+    prologue_bare = [
+        ".section .text", ".globl _start", "_start:",
+        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    or    t0, t0, t1",  "    csrw  mstatus, t0",
+    ]
+    # Append .data section (9 zero slots) to the same .S file so linker
+    # places .data right after .text; then patch_elf_data overwrites the slots.
+    # Use the standard LINKER_SCRIPT (code at 0x20000); embed a tiny .data
+    # note: to place .data at 0x10000 we need a custom linker script
+    asm_bare_text = "\n".join(prologue_bare) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+
+    ld_custom = """
+SECTIONS {
+  . = 0x10000;
+  .data : { *(.data*) *(.bss*) }
+  . = 0x20000;
+  .text : { *(.text*) }
+}
+"""
+    data_init = "\n.section .data\n.balign 4\n.zero 36864\n"
+    asm_bare = asm_bare_text + data_init
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".S", delete=False) as af:
+        af.write(asm_bare); asm_file_b = af.name
+    obj_b = asm_file_b.replace(".S", ".o")
+    ld_b  = asm_file_b.replace(".S", ".ld")
+    open(ld_b, "w").write(ld_custom)
+
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_bare = Path(ef.name)
+    patched_path = Path(str(elf_bare) + ".p")
+    try:
+        subprocess.run([AS, f"-march={SPIKE_ISA}", "-mabi=ilp32",
+                        "-o", obj_b, asm_file_b], check=True, capture_output=True)
+        subprocess.run([LD, "-m", "elf32lriscv", "--no-dynamic-linker", "-static",
+                        "-e", "_start", "-T", ld_b,
+                        "-o", str(elf_bare), obj_b], check=True, capture_output=True)
+        for p in [asm_file_b, obj_b, ld_b]: os.unlink(p)
+
+        # Inject slot data via patch_elf_data
+        slot_data = {
+            0: struct.pack("<16i", 1, 2, 3, 4, *([0]*12)),
+            1: struct.pack("<16i", 1, 1, 1, 1, *([0]*12)),
+            2: struct.pack("<16i", *([0]*16)),
+            3: struct.pack("<16i", *([0]*16)),
+            4: struct.pack("<16i", *([0]*16)),
+        }
+        patched_bytes = patch_elf_data(elf_bare.read_bytes(), slot_data)
+        patched_path.write_bytes(patched_bytes)
+
+        raw_inj = run_spike_and_read_mem(patched_path, RESULT_ADDR_32, 4)
+        injected = struct.unpack("<i", raw_inj)[0]
+
+        # Both paths should produce 10
+        if baseline == 10 and injected == 10:
+            check_result("weight-injected ELF = prologue-sw ELF: both → 10",
+                         [injected], [10])
+        else:
+            check_result(f"weight-injection: baseline={baseline} injected={injected}",
+                         [injected], [10])
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        for p in [elf_bare, patched_path]:
+            if p.exists(): p.unlink()
+
 if __name__ == "__main__":
     print("CoralNPU E2E Validation")
     print(f"  circt-opt : {CIRCT_OPT}")
@@ -2190,6 +2319,7 @@ if __name__ == "__main__":
     test_conv2d_oc2_rescale_relu_e2e()
     test_mobilenet_full_oc2_e2e()
     test_two_mobilenet_blocks_e2e()
+    test_weight_injection_e2e()
 
     print(f"\n{'='*50}")
     print(f"Results: {COUNTS['pass']} passed, {COUNTS['fail']} failed")
