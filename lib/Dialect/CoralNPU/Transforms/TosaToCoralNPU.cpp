@@ -986,14 +986,19 @@ struct TosaConv2DLowering : public mlir::OpRewritePattern<mlir::tosa::Conv2DOp> 
     if (auto tt = mlir::dyn_cast<mlir::TensorType>(op.getResult().getType()))
       nOC = tt.getDimSize(3);  // NHWC last dim
 
-    // Compute one scalar result per OC, then aggregate.
-    // For simplicity: emit k_in vmul+vredsum per OC, fold, add bias.
-    // Result is a scalar stored via sw (same as depthwise path).
-    mlir::Value totalSum = createI32Const(loc, 0, rewriter);
+    // Compute one scalar result per OC; store each at resultBase + oc*4.
+    // Then reload all nOC results as vector tile(s) and return a tileCarrier
+    // so that downstream rescale/clamp can use getTiles() correctly.
+    int64_t biasSlot = 2;
+    if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(op.getBias()))
+      biasSlot = barg.getArgNumber();
+    int64_t resultBase = kTcmBase + getResultSlot(op) * kTcmSlot;
+
+    mlir::Value lastResult = createI32Const(loc, 0, rewriter);
     for (int64_t oc = 0; oc < nOC; ++oc) {
       mlir::Value ocSum = createI32Const(loc, 0, rewriter);
       for (int64_t t = 0; t < k_in; ++t) {
-        // Weight tile for this OC row, tile t: addr = wtBase + oc*nIn*4 + t*16
+        // wt layout [OC, KH, KW, IC]: OC row oc starts at oc*nIn elements.
         int64_t wtAddr = kTcmBase + wtSlot * kTcmSlot + oc * nIn * 4 + t * kTileBytes;
         auto waddrV = createI32Const(loc, (int32_t)wtAddr, rewriter);
         auto wnV    = createI32Const(loc, (int32_t)tileElems(t, k_in, nIn, SEW::E32), rewriter);
@@ -1002,20 +1007,25 @@ struct TosaConv2DLowering : public mlir::OpRewritePattern<mlir::tosa::Conv2DOp> 
         auto psum   = rewriter.create<VRedSumOp>(loc, prod.getResult()).getResult();
         ocSum = rewriter.create<ScalarAddOp>(loc, ocSum, psum).getResult();
       }
-      totalSum = rewriter.create<ScalarAddOp>(loc, totalSum, ocSum).getResult();
+      // Add bias[oc]: bias slot is a flat array of i32, one per OC.
+      auto biasAddr = createI32Const(loc, (int32_t)(kTcmBase + biasSlot * kTcmSlot + oc * 4), rewriter);
+      auto biasVal  = rewriter.create<ScalarLwOp>(loc, biasAddr).getResult();
+      auto ocResult = rewriter.create<ScalarAddOp>(loc, ocSum, biasVal).getResult();
+      // Store to resultBase + oc*4 (consecutive i32 layout).
+      auto addrV = createI32Const(loc, (int32_t)(resultBase + oc * 4), rewriter);
+      rewriter.create<ScalarSwOp>(loc, ocResult, addrV);
+      lastResult = ocResult;
     }
 
-    // Add bias (arg 2).
-    int64_t biasSlot = 2;
-    if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(op.getBias()))
-      biasSlot = barg.getArgNumber();
-    auto biasAddr = createI32Const(loc, (int32_t)(kTcmBase + biasSlot * kTcmSlot), rewriter);
-    auto biasVal  = rewriter.create<ScalarLwOp>(loc, biasAddr);
-    auto result   = rewriter.create<ScalarAddOp>(loc, totalSum, biasVal.getResult());
-
-    auto resultAddr = createI32Const(loc, (int32_t)(kTcmBase + getResultSlot(op) * kTcmSlot), rewriter);
-    rewriter.create<ScalarSwOp>(loc, result.getResult(), resultAddr);
-    rewriter.replaceOp(op, carrier(op, rewriter, result.getResult()));
+    // Reload the nOC results from TCM as vector tile(s) and build tileCarrier.
+    int64_t k_oc = tileCount(SEW::E32, nOC);
+    llvm::SmallVector<mlir::Value> ocTiles;
+    for (int64_t t = 0; t < k_oc; ++t) {
+      auto addrV = createI32Const(loc, (int32_t)(resultBase + t * kTileBytes), rewriter);
+      auto nV    = createI32Const(loc, (int32_t)tileElems(t, k_oc, nOC, SEW::E32), rewriter);
+      ocTiles.push_back(rewriter.create<VLE32Op>(loc, addrV, nV).getResult());
+    }
+    rewriter.replaceOp(op, tileCarrier(op, ocTiles, rewriter));
     return mlir::success();
   }
 };

@@ -1711,6 +1711,60 @@ def test_mobilenet_dw_pw_block_e2e():
     finally:
         if elf_path.exists(): elf_path.unlink()
 
+
+
+def test_conv2d_oc2_e2e():
+    print("\n=== TEST 28: tosa.conv2d OC=2 pointwise — multi-channel output ===")
+    mlir = """func.func @pw_conv_oc2(
+  %in: tensor<1x1x1x4xi8>, %wt: tensor<2x1x1x4xi8>,
+  %bias: tensor<2xi32>, %izp: tensor<1xi8>, %wzp: tensor<1xi8>
+) -> tensor<1x1x1x2xi32> {
+  %0 = tosa.conv2d %in, %wt, %bias, %izp, %wzp {
+    acc_type = i32, dilation = array<i64: 1, 1>,
+    pad = array<i64: 0, 0, 0, 0>, stride = array<i64: 1, 1>
+  } : (tensor<1x1x1x4xi8>, tensor<2x1x1x4xi8>, tensor<2xi32>,
+       tensor<1xi8>, tensor<1xi8>) -> tensor<1x1x1x2xi32>
+  func.return %0 : tensor<1x1x1x2xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+              "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+    insns = extract_asm_instructions(run_circt_opt(mlir, passes))
+
+    # 5 args -> result_slot = max(8, 5) = 8 -> 0x18000
+    RESULT_ADDR_28 = TCM_BASE + 8 * TCM_SLOT  # 0x18000, read 2*i32 = 8 bytes
+
+    # wt layout [OC, KH, KW, IC] = [2, 1, 1, 4], flat: [oc0_ic0..ic3, oc1_ic0..ic3]
+    in_vals   = [1, 2, 3, 4]            + [0]*12   # slot 0
+    wt_vals   = [1, 1, 1, 1,  2, 2, 2, 2] + [0]*8    # slot 1: oc0 then oc1
+    bias_vals = [0, 0]                  + [0]*14   # slot 2
+    izp_vals  = [0]*16                             # slot 3 (unused)
+    wzp_vals  = [0]*16                             # slot 4 (unused)
+
+    prologue = [
+        ".section .text", ".globl _start", "_start:",
+        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    or    t0, t0, t1",  "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(in_vals,   TCM_BASE + 0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(wt_vals,   TCM_BASE + 1 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(bias_vals, TCM_BASE + 2 * TCM_SLOT)
+
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR_28, 8)
+        vals = list(struct.unpack("<2i", raw))
+        # oc0: dot([1,2,3,4],[1,1,1,1]) = 10; oc1: dot([1,2,3,4],[2,2,2,2]) = 20
+        check_result("conv2d OC=2: oc0=10, oc1=20", vals, [10, 20])
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
 if __name__ == "__main__":
     print("CoralNPU E2E Validation")
     print(f"  circt-opt : {CIRCT_OPT}")
@@ -1750,6 +1804,7 @@ if __name__ == "__main__":
     test_conv2d_e2e()
     test_conv2d_rescale_e2e()
     test_mobilenet_dw_pw_block_e2e()
+    test_conv2d_oc2_e2e()
 
     print(f"\n{'='*50}")
     print(f"Results: {COUNTS['pass']} passed, {COUNTS['fail']} failed")
