@@ -2276,6 +2276,120 @@ SECTIONS {
         for p in [elf_bare, patched_path]:
             if p.exists(): p.unlink()
 
+
+
+def test_tflite_weight_e2e():
+    """
+    TEST 33: 完整 TFLite→ELF→spike 端到端流水线（真实权重注入）。
+
+    流程：
+      1. 从 MobileNet v1 0.25x dummy TFLite 模型提取 buf[24] 的前 4 个 i8 权重
+      2. 构造 conv2d (IC=4, OC=1) MLIR，输入全 1
+      3. circt-opt 生成 RISC-V 汇编
+      4. 链接成 ELF（.data@0x10000, .text@0x20000）
+      5. write_weights.patch_elf_data 将真实 TFLite 权重注入 .data slot 1
+      6. spike 运行，读取 0x18000，对比 dot([1,1,1,1], wt) 手算期望值
+
+    这是方向 A（完整 MobileNet 端到端）的最终里程碑验证：
+    真实 TFLite 权重 → CoralNPU ISA → spike bit-exact。
+    """
+    print("\n=== TEST 33: TFLite 真实权重注入 E2E (MobileNet buf[24] i8 → spike) ===")
+
+    import os, sys
+    sys.path.insert(0, '/home/radxa/Work/Circt4Coral/tools')
+    from write_weights import parse_tflite, patch_elf_data
+
+    TFLITE_PATH = Path('/home/radxa/Work/coralnpu/tests/cocotb/tutorial/tfmicro/'
+                       'models/mobilenet_v1_0.25_224_int8_dummy.tflite')
+    if not TFLITE_PATH.exists():
+        print(f"  [SKIP] TFLite model not found: {TFLITE_PATH}")
+        return
+
+    try:
+        # ── 1. 提取真实 i8 权重（buf[24] 前 4 字节）──────────────────────────
+        tflite_data = TFLITE_PATH.read_bytes()
+        buffers, _ = parse_tflite(tflite_data)
+        wt_raw = buffers[24]  # 1152 bytes i8, MobileNet first conv weights
+        wt_4 = list(struct.unpack('4b', wt_raw[:4]))
+
+        # ── 2. MLIR: conv2d IC=4 OC=1，输入全 1 ─────────────────────────────
+        mlir = """func.func @pw_conv_tflite(
+  %in: tensor<1x1x1x4xi8>, %wt: tensor<1x1x1x4xi8>,
+  %bias: tensor<1xi32>, %izp: tensor<1xi8>, %wzp: tensor<1xi8>
+) -> tensor<1x1x1x1xi32> {
+  %0 = tosa.conv2d %in, %wt, %bias, %izp, %wzp {
+    acc_type = i32, dilation = array<i64: 1, 1>,
+    pad = array<i64: 0, 0, 0, 0>, stride = array<i64: 1, 1>
+  } : (tensor<1x1x1x4xi8>, tensor<1x1x1x4xi8>, tensor<1xi32>,
+       tensor<1xi8>, tensor<1xi8>) -> tensor<1x1x1x1xi32>
+  func.return %0 : tensor<1x1x1x1xi32>
+}
+"""
+        passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+                  "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+        insns = extract_asm_instructions(run_circt_opt(mlir, passes))
+
+        # ── 3. 构建 ELF（.data@0x10000 , .text@0x20000）──────────────────────
+        prologue_hdr = [
+            ".section .text", ".globl _start", "_start:",
+            "    csrr  t0, mstatus", "    li    t1, 0x600",
+            "    or    t0, t0, t1",  "    csrw  mstatus, t0",
+        ]
+        data_section = "\n.section .data\n.balign 4\n.zero 36864\n"
+        full_asm = ("\n".join(prologue_hdr) + "\n" + "\n".join(insns) +
+                    "\n.Lexit:\n    ebreak\n" + data_section)
+        ld_script = ("SECTIONS {\n  . = 0x10000;\n  .data : { *(.data*) *(.bss*) }\n"
+                     "  . = 0x20000;\n  .text : { *(.text*) }\n}\n")
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.S', delete=False) as af:
+            af.write(full_asm); asm_file = af.name
+        obj_file = asm_file.replace('.S', '.o')
+        ld_file  = asm_file.replace('.S', '.ld')
+        open(ld_file, 'w').write(ld_script)
+
+        with tempfile.NamedTemporaryFile(suffix='.elf', delete=False) as ef:
+            elf_path = Path(ef.name)
+        patched_path = Path(str(elf_path) + '.p')
+
+        subprocess.run([AS, f'-march={SPIKE_ISA}', '-mabi=ilp32',
+                        '-o', obj_file, asm_file], check=True, capture_output=True)
+        subprocess.run([LD, '-m', 'elf32lriscv', '--no-dynamic-linker', '-static',
+                        '-e', '_start', '-T', ld_file,
+                        '-o', str(elf_path), obj_file], check=True, capture_output=True)
+        for p in [asm_file, obj_file, ld_file]:
+            os.unlink(p)
+
+        # ── 4. write_weights 注入真实 TFLite 权重 ────────────────────────────
+        def i8list_to_slot(vals, pad=16):
+            return struct.pack(f'<{len(vals)}i', *vals) + b'\x00' * (4*(pad-len(vals)))
+
+        slot_data = {
+            0: i8list_to_slot([1, 1, 1, 1]),   # in
+            1: i8list_to_slot(wt_4),           # wt: 真实 TFLite i8 权重
+            2: i8list_to_slot([0]),            # bias
+            3: i8list_to_slot([0]),            # izp
+            4: i8list_to_slot([0]),            # wzp
+        }
+        patched_path.write_bytes(patch_elf_data(elf_path.read_bytes(), slot_data))
+
+        # ── 5. spike 运行 ─────────────────────────────────────────────────────
+        RESULT_ADDR_33 = TCM_BASE + 8 * TCM_SLOT   # 0x18000
+        raw = run_spike_and_read_mem(patched_path, RESULT_ADDR_33, 4)
+        actual = struct.unpack('<i', raw)[0]
+
+        expected = sum(wt_4)  # dot([1,1,1,1], wt_4)
+        check_result(
+            f"TFLite wt={wt_4} → dot([1]*4, wt)={expected}",
+            [actual], [expected])
+
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        for p in [elf_path, patched_path]:
+            try:
+                if p.exists(): p.unlink()
+            except: pass
+
 if __name__ == "__main__":
     print("CoralNPU E2E Validation")
     print(f"  circt-opt : {CIRCT_OPT}")
@@ -2320,6 +2434,7 @@ if __name__ == "__main__":
     test_mobilenet_full_oc2_e2e()
     test_two_mobilenet_blocks_e2e()
     test_weight_injection_e2e()
+    test_tflite_weight_e2e()
 
     print(f"\n{'='*50}")
     print(f"Results: {COUNTS['pass']} passed, {COUNTS['fail']} failed")
