@@ -1949,6 +1949,204 @@ def test_mobilenet_full_oc2_e2e():
     finally:
         if elf_path.exists(): elf_path.unlink()
 
+
+
+def test_two_mobilenet_blocks_e2e():
+    print("\n=== TEST 31: Two serial MobileNet blocks (dw->rs->relu->pw_OC2->rs) x2 ===")
+    mlir = """func.func @two_mobilenet_blocks(
+  %in:      tensor<1x1x1x4xi8>,
+  %wt_dw1:  tensor<1x1x4x1xi8>,  %bias_dw1: tensor<4xi32>,
+  %mult1:   tensor<1xi32>,        %shift1:   tensor<1xi8>,
+  %izp1:    tensor<1xi8>,         %wzp1:     tensor<1xi8>,
+  %izp32_1: tensor<1xi32>,        %ozp1:     tensor<1xi8>,
+  %wt_pw1:  tensor<2x1x1x4xi8>,  %bias_pw1: tensor<2xi32>,
+  %izp_pw1: tensor<1xi8>,         %wzp_pw1:  tensor<1xi8>,
+  %mult2:   tensor<1xi32>,        %shift2:   tensor<1xi8>,
+  %izp32_2: tensor<1xi32>,        %ozp2:     tensor<1xi8>,
+  %wt_dw2:  tensor<1x1x2x1xi8>,  %bias_dw2: tensor<2xi32>,
+  %mult3:   tensor<1xi32>,        %shift3:   tensor<1xi8>,
+  %izp3:    tensor<1xi8>,         %wzp3:     tensor<1xi8>,
+  %izp32_3: tensor<1xi32>,        %ozp3:     tensor<1xi8>,
+  %wt_pw2:  tensor<1x1x1x2xi8>,  %bias_pw2: tensor<1xi32>,
+  %izp_pw2: tensor<1xi8>,         %wzp_pw2:  tensor<1xi8>,
+  %mult4:   tensor<1xi32>,        %shift4:   tensor<1xi8>,
+  %izp32_4: tensor<1xi32>,        %ozp4:     tensor<1xi8>
+) -> tensor<1x1x1x1xi8> {
+  %dw1 = tosa.depthwise_conv2d %in, %wt_dw1, %bias_dw1, %izp1, %wzp1 {
+    acc_type = i32, dilation = array<i64: 1, 1>,
+    pad = array<i64: 0, 0, 0, 0>, stride = array<i64: 1, 1>
+  } : (tensor<1x1x1x4xi8>, tensor<1x1x4x1xi8>, tensor<4xi32>,
+       tensor<1xi8>, tensor<1xi8>) -> tensor<1x1x1x4xi32>
+  %rs1 = tosa.rescale %dw1, %mult1, %shift1, %izp32_1, %ozp1 {
+    input_unsigned = false, output_unsigned = false, per_channel = false,
+    rounding_mode = #tosa.rounding_mode<SINGLE_ROUND>, scale32 = true
+  } : (tensor<1x1x1x4xi32>, tensor<1xi32>, tensor<1xi8>, tensor<1xi32>,
+       tensor<1xi8>) -> tensor<1x1x1x4xi8>
+  %rl1 = tosa.clamp %rs1 {min_val = 0 : i8, max_val = 127 : i8}
+      : (tensor<1x1x1x4xi8>) -> tensor<1x1x1x4xi8>
+  %pw1 = tosa.conv2d %rl1, %wt_pw1, %bias_pw1, %izp_pw1, %wzp_pw1 {
+    acc_type = i32, dilation = array<i64: 1, 1>,
+    pad = array<i64: 0, 0, 0, 0>, stride = array<i64: 1, 1>
+  } : (tensor<1x1x1x4xi8>, tensor<2x1x1x4xi8>, tensor<2xi32>,
+       tensor<1xi8>, tensor<1xi8>) -> tensor<1x1x1x2xi32>
+  %rs2 = tosa.rescale %pw1, %mult2, %shift2, %izp32_2, %ozp2 {
+    input_unsigned = false, output_unsigned = false, per_channel = false,
+    rounding_mode = #tosa.rounding_mode<SINGLE_ROUND>, scale32 = true
+  } : (tensor<1x1x1x2xi32>, tensor<1xi32>, tensor<1xi8>, tensor<1xi32>,
+       tensor<1xi8>) -> tensor<1x1x1x2xi8>
+  %dw2 = tosa.depthwise_conv2d %rs2, %wt_dw2, %bias_dw2, %izp3, %wzp3 {
+    acc_type = i32, dilation = array<i64: 1, 1>,
+    pad = array<i64: 0, 0, 0, 0>, stride = array<i64: 1, 1>
+  } : (tensor<1x1x1x2xi8>, tensor<1x1x2x1xi8>, tensor<2xi32>,
+       tensor<1xi8>, tensor<1xi8>) -> tensor<1x1x1x2xi32>
+  %rs3 = tosa.rescale %dw2, %mult3, %shift3, %izp32_3, %ozp3 {
+    input_unsigned = false, output_unsigned = false, per_channel = false,
+    rounding_mode = #tosa.rounding_mode<SINGLE_ROUND>, scale32 = true
+  } : (tensor<1x1x1x2xi32>, tensor<1xi32>, tensor<1xi8>, tensor<1xi32>,
+       tensor<1xi8>) -> tensor<1x1x1x2xi8>
+  %rl2 = tosa.clamp %rs3 {min_val = 0 : i8, max_val = 127 : i8}
+      : (tensor<1x1x1x2xi8>) -> tensor<1x1x1x2xi8>
+  %pw2 = tosa.conv2d %rl2, %wt_pw2, %bias_pw2, %izp_pw2, %wzp_pw2 {
+    acc_type = i32, dilation = array<i64: 1, 1>,
+    pad = array<i64: 0, 0, 0, 0>, stride = array<i64: 1, 1>
+  } : (tensor<1x1x1x2xi8>, tensor<1x1x1x2xi8>, tensor<1xi32>,
+       tensor<1xi8>, tensor<1xi8>) -> tensor<1x1x1x1xi32>
+  %rs4 = tosa.rescale %pw2, %mult4, %shift4, %izp32_4, %ozp4 {
+    input_unsigned = false, output_unsigned = false, per_channel = false,
+    rounding_mode = #tosa.rounding_mode<SINGLE_ROUND>, scale32 = true
+  } : (tensor<1x1x1x1xi32>, tensor<1xi32>, tensor<1xi8>, tensor<1xi32>,
+       tensor<1xi8>) -> tensor<1x1x1x1xi8>
+  func.return %rs4 : tensor<1x1x1x1xi8>
+}
+"""
+    passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+              "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+    insns = extract_asm_instructions(run_circt_opt(mlir, passes))
+
+    # 33 args (0..32) -> result_slot = max(8,33) = 33 -> 0x10000+33*0x1000 = 0x31000
+    RESULT_ADDR_31 = TCM_BASE + 33 * TCM_SLOT   # 0x31000
+
+    # Slot layout (slot N -> 0x10000 + N*0x1000):
+    #   0: in          1: wt_dw1     2: bias_dw1   3: mult1      4: shift1
+    #   5: izp1        6: wzp1       7: izp32_1    8: ozp1
+    #   9: wt_pw1     10: bias_pw1  11: izp_pw1   12: wzp_pw1
+    #  13: mult2      14: shift2    15: izp32_2   16: ozp2
+    #  17: wt_dw2     18: bias_dw2  19: mult3     20: shift3
+    #  21: izp3       22: wzp3      23: izp32_3   24: ozp3
+    #  25: wt_pw2     26: bias_pw2  27: izp_pw2   28: wzp_pw2
+    #  29: mult4      30: shift4    31: izp32_4   32: ozp4
+    #
+    # Numerical trace (result_slot=33=0x31000, spike mem zero-init):
+    #   dw1: vmul([16,0,0,0],[1,0,0,0])=[16,0,0,0], vredsum=16, sw->0x31000
+    #   rs1: per-elem: [16->4, 0->0, 0->0, 0->0] stored @0x31000..0x3100C
+    #   rl1: vmax [4,0,0,0] (from_elements carry, stored to kResultSlot=8=0x18000)
+    #   pw1 OC=2: inTile=[4,0,0,0]; oc0 wt=[1,0,0,0] sum=4; oc1 wt=[2,0,0,0] sum=8
+    #              sw(4,0x31000), sw(8,0x31004)
+    #   rs2: [4->1, 8->2] @0x31000..0x31004
+    #   dw2: vmul([1,2],[4,0])=[4,0], vredsum=4, sw->0x31000
+    #   rs3 nElems=2: lw(0x31000)=4->1, lw(0x31004)=2(rs2 residual)->0
+    #              stored [1,0] @0x31000
+    #   rl2: [1,0]
+    #   pw2 OC=1: inTile=[1,0]; wt=[4,0] -> sum=4, sw->0x31000
+    #   rs4: lw(0x31000)=4->1, sw(1,0x31000)
+    #   => read 0x31000 = 1
+
+    in_vals     = [16, 0, 0, 0]            + [0]*12   # slot 0
+    wt_dw1      = [1, 0, 0, 0]             + [0]*12   # slot 1
+    bias_dw1    = [0]*16                              # slot 2
+    mult1       = [0x40000000]             + [0]*15   # slot 3
+    shift1      = [32]                     + [0]*15   # slot 4
+    # slots 5,6 (izp1,wzp1) zero
+    izp32_1     = [0]*16                              # slot 7
+    ozp1        = [0]*16                              # slot 8
+    # wt_pw1: flat [OC,KH,KW,IC]=[2,1,1,4]; oc0=[1,0,0,0], oc1=[2,0,0,0]
+    wt_pw1      = [1, 0, 0, 0, 2, 0, 0, 0] + [0]*8   # slot 9
+    bias_pw1    = [0]*16                              # slot 10
+    # slots 11,12 (izp_pw1,wzp_pw1) zero
+    mult2       = [0x40000000]             + [0]*15   # slot 13
+    shift2      = [32]                     + [0]*15   # slot 14
+    izp32_2     = [0]*16                              # slot 15
+    ozp2        = [0]*16                              # slot 16
+    # wt_dw2: [KH,KW,IC,1]=[1,1,2,1]; IC=2 channels
+    wt_dw2      = [4, 0]                   + [0]*14   # slot 17
+    bias_dw2    = [0]*16                              # slot 18
+    mult3       = [0x40000000]             + [0]*15   # slot 19
+    shift3      = [32]                     + [0]*15   # slot 20
+    # slots 21,22 (izp3,wzp3) zero
+    izp32_3     = [0]*16                              # slot 23
+    ozp3        = [0]*16                              # slot 24
+    # wt_pw2: [OC,KH,KW,IC]=[1,1,1,2]; oc0=[4,0]
+    wt_pw2      = [4, 0]                   + [0]*14   # slot 25
+    bias_pw2    = [0]*16                              # slot 26
+    # slots 27,28 (izp_pw2,wzp_pw2) zero
+    mult4       = [0x40000000]             + [0]*15   # slot 29
+    shift4      = [32]                     + [0]*15   # slot 30
+    izp32_4     = [0]*16                              # slot 31
+    ozp4        = [0]*16                              # slot 32
+
+    prologue = [
+        ".section .text", ".globl _start", "_start:",
+        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    or    t0, t0, t1",  "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(in_vals,   TCM_BASE +  0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(wt_dw1,    TCM_BASE +  1 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(bias_dw1,  TCM_BASE +  2 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(mult1,     TCM_BASE +  3 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(shift1,    TCM_BASE +  4 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(izp32_1,   TCM_BASE +  7 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(ozp1,      TCM_BASE +  8 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(wt_pw1,    TCM_BASE +  9 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(bias_pw1,  TCM_BASE + 10 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(mult2,     TCM_BASE + 13 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(shift2,    TCM_BASE + 14 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(izp32_2,   TCM_BASE + 15 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(ozp2,      TCM_BASE + 16 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(wt_dw2,    TCM_BASE + 17 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(bias_dw2,  TCM_BASE + 18 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(mult3,     TCM_BASE + 19 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(shift3,    TCM_BASE + 20 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(izp32_3,   TCM_BASE + 23 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(ozp3,      TCM_BASE + 24 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(wt_pw2,    TCM_BASE + 25 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(bias_pw2,  TCM_BASE + 26 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(mult4,     TCM_BASE + 29 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(shift4,    TCM_BASE + 30 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(izp32_4,   TCM_BASE + 31 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(ozp4,      TCM_BASE + 32 * TCM_SLOT)
+
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        # TEST 31 has 33 args (slot 0..32, max data addr 0x31040).
+        # The default CODE_BASE=0x20000 collides with slot 32 (0x30000).
+        # Use a local linker script that places code at 0x80000.
+        import tempfile as _tf, subprocess as _sp
+        _ld_src = 'SECTIONS { . = 0x80000; .text : { *(.text*) } . = ALIGN(16); .data : { *(.bss*) } }'
+        with _tf.NamedTemporaryFile(mode='w', suffix='.S', delete=False) as _af:
+            _af.write(full_asm); _asm = _af.name
+        _obj = _asm.replace('.S', '.o')
+        _ld  = _asm.replace('.S', '.ld')
+        open(_ld, 'w').write(_ld_src)
+        _sp.run([AS, f'-march={SPIKE_ISA}', '-mabi=ilp32', '-o', _obj, _asm],
+                check=True, capture_output=True)
+        _sp.run([LD, '-m', 'elf32lriscv', '--no-dynamic-linker', '-static',
+                 '-e', '_start', '-T', _ld, '-o', str(elf_path), _obj],
+                check=True, capture_output=True)
+        for _p in [_asm, _obj, _ld]: __import__('os').unlink(_p)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR_31, 4)
+        actual = struct.unpack("<i", raw)[0]
+        # dw1=16->rs1=4->relu=[4,0,0,0] -> pw1=[4,8]->rs2=[1,2]
+        # dw2([1,2],[4,0])=4->rs3=[1,0]->relu=[1,0]->pw2=4->rs4=1
+        check_result("two-block: dw1=16->4->pw1=[4,8]->rs2=[1,2]->dw2=4->rs3=1->pw2=4->rs4=1",
+                     [actual], [1])
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
 if __name__ == "__main__":
     print("CoralNPU E2E Validation")
     print(f"  circt-opt : {CIRCT_OPT}")
@@ -1991,6 +2189,7 @@ if __name__ == "__main__":
     test_conv2d_oc2_e2e()
     test_conv2d_oc2_rescale_relu_e2e()
     test_mobilenet_full_oc2_e2e()
+    test_two_mobilenet_blocks_e2e()
 
     print(f"\n{'='*50}")
     print(f"Results: {COUNTS['pass']} passed, {COUNTS['fail']} failed")
