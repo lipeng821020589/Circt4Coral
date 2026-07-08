@@ -514,15 +514,15 @@ def test_depthwise_conv2d():
     # Use tensor<1x1x1x4xi8> (N=4, exactly 1 e32 tile) so getTiles produces
     # a single tile pair and vmul covers all valid input elements.
     mlir = """\
-func.func @dw(%in: tensor<1x1x1x4xi8>, %wt: tensor<1x1x4x1xi8>,
-              %bias: tensor<4xi32>, %izp: tensor<1xi8>, %wzp: tensor<1xi8>)
-    -> tensor<1x1x1x4xi32> {
+func.func @dw(%in: tensor<1x1x1x1xi8>, %wt: tensor<1x1x1x1xi8>,
+              %bias: tensor<1xi32>, %izp: tensor<1xi8>, %wzp: tensor<1xi8>)
+    -> tensor<1x1x1x1xi32> {
   %0 = tosa.depthwise_conv2d %in, %wt, %bias, %izp, %wzp {
     acc_type = i32, dilation = array<i64: 1, 1>,
     pad = array<i64: 0, 0, 0, 0>, stride = array<i64: 1, 1>
-  } : (tensor<1x1x1x4xi8>, tensor<1x1x4x1xi8>, tensor<4xi32>,
-       tensor<1xi8>, tensor<1xi8>) -> tensor<1x1x1x4xi32>
-  func.return %0 : tensor<1x1x1x4xi32>
+  } : (tensor<1x1x1x1xi8>, tensor<1x1x1x1xi8>, tensor<1xi32>,
+       tensor<1xi8>, tensor<1xi8>) -> tensor<1x1x1x1xi32>
+  func.return %0 : tensor<1x1x1x1xi32>
 }
 """
     passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
@@ -532,10 +532,11 @@ func.func @dw(%in: tensor<1x1x1x4xi8>, %wt: tensor<1x1x4x1xi8>,
     insns = extract_asm_instructions(circt_out)
 
     # N=4, k=1 tile; vmul([2,4,6,8],[1,1,1,1])=[2,4,6,8]; vredsum=20; +bias(0)=20
-    inputs  = [2, 4, 6, 8] + [0]*12
-    weights = [1, 1, 1, 1] + [0]*12
+    # C=1: single channel, in=20, wt=1 -> out=20
+    inputs  = [20] + [0]*15
+    weights = [1]  + [0]*15
     bias    = [0] * 16
-    expected_sum = sum(a * b for a, b in zip(inputs[:4], weights[:4]))  # 20
+    expected_sum = 20
 
     prologue = [
         ".section .text",
@@ -558,7 +559,7 @@ func.func @dw(%in: tensor<1x1x1x4xi8>, %wt: tensor<1x1x4x1xi8>,
         build_elf(full_asm, elf_path)
         raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 4)
         actual_val = struct.unpack("<i", raw)[0]
-        check_result(f"depthwise vmul+sum in=[2,4,6,8] wt=[1]*4 bias=0 expect={expected_sum}",
+        check_result(f"depthwise C=1: in=[20] wt=[1] bias=0 expect={expected_sum}",
                      [actual_val], [expected_sum])
     except Exception as e:
         print(f"  [ERROR] {e}")
@@ -800,9 +801,9 @@ func.func @dw_rescale(%in: tensor<1x1x1x4xi8>, %wt: tensor<1x1x4x1xi8>,
     shift   = [32] + [0]*15
     izp32   = [0] * 16
     ozp     = [0] * 16
-    expected = 5  # mulh(20, 0x40000000) = 5
+    expected = [0, 1, 1, 2]  # per-channel rescale of [2,4,6,8]
 
-    RESULT_ADDR_CHAIN = TCM_BASE + 9 * TCM_SLOT  # slot 9 = 0x19000
+    RESULT_ADDR_CHAIN = TCM_BASE + 9 * TCM_SLOT  # slot 9 = 0x19000; read 4 channels
 
     prologue = [
         ".section .text",
@@ -828,10 +829,11 @@ func.func @dw_rescale(%in: tensor<1x1x1x4xi8>, %wt: tensor<1x1x4x1xi8>,
         elf_path = Path(ef.name)
     try:
         build_elf(full_asm, elf_path)
-        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR_CHAIN, 4)
-        actual_val = struct.unpack("<i", raw)[0]
-        check_result(f"dw([2,4,6,8]·[1]*4+bias=0=20) → rescale(20)=5",
-                     [actual_val], [expected])
+        # C=4: per-channel result; rescale(2,Q30/32)=0, rescale(4)=1, rescale(6)=1, rescale(8)=2
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR_CHAIN, 16)
+        vals = list(struct.unpack("<4i", raw))
+        check_result(f"dw([2,4,6,8]·[1]*4+bias=0) → per-ch rescale=[0,1,1,2]",
+                     vals, [0, 1, 1, 2])
     except Exception as e:
         print(f"  [ERROR] {e}")
         COUNTS['fail'] += 1
@@ -1064,10 +1066,12 @@ func.func @mobilenet_dw_block(
         elf_path = Path(ef.name)
     try:
         build_elf(full_asm, elf_path)
-        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 4)
-        actual = struct.unpack("<i", raw)[0]
-        # dw(in=[2,4,6,8], wt=[1]*4) = 20; rescale(20)=5; relu(5)=5
-        check_result("dw->rescale->relu: acc=20->rescale=5->relu=5", [actual], [5])
+        # C=4: per-channel result
+        # dw=[2,4,6,8]; rescale=[0,1,1,2]; relu=[0,1,1,2]
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 16)
+        vals = list(struct.unpack("<4i", raw))
+        check_result("dw->rescale->relu C=4: [2,4,6,8]->rs=[0,1,1,2]->relu=[0,1,1,2]",
+                     vals, [0, 1, 1, 2])
     except Exception as e:
         print(f"  [ERROR] {e}")
         COUNTS["fail"] += 1
@@ -2539,6 +2543,66 @@ def test_conv2d_ic16_oc2_e2e():
     finally:
         if elf_path.exists(): elf_path.unlink()
 
+
+
+def test_dw33_e2e():
+    """TEST 37: 3x3 depthwise_conv2d (direction-E: real KH/KW support)."""
+    print("\n=== TEST 37: tosa.depthwise_conv2d 3x3 kernel (KH=KW=3, C=2) ===")
+    mlir = """func.func @dw33(
+  %in: tensor<1x3x3x2xi8>, %wt: tensor<3x3x2x1xi8>,
+  %bias: tensor<2xi32>, %izp: tensor<1xi8>, %wzp: tensor<1xi8>
+) -> tensor<1x1x1x2xi32> {
+  %0 = tosa.depthwise_conv2d %in, %wt, %bias, %izp, %wzp {
+    acc_type = i32, dilation = array<i64: 1, 1>,
+    pad = array<i64: 0, 0, 0, 0>, stride = array<i64: 1, 1>
+  } : (tensor<1x3x3x2xi8>, tensor<3x3x2x1xi8>, tensor<2xi32>,
+       tensor<1xi8>, tensor<1xi8>) -> tensor<1x1x1x2xi32>
+  func.return %0 : tensor<1x1x1x2xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+              "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+    insns = extract_asm_instructions(run_circt_opt(mlir, passes))
+
+    # Input [1,3,3,2] NHWC flat: in[h,w,c] = h*6 + w*2 + c + 1 = [1..18]
+    # Weight [3,3,2,1] flat, all ones: wt[kh,kw,c,0] = 1
+    # bias = [0, 0]
+    # out[0,0,0,c] = sum_{kh,kw} in[kh,kw,c] * 1
+    # c=0: sum of in[h,w,0] for h,w in {0,1,2} = 1+3+5+7+9+11+13+15+17 = 81
+    # c=1: sum of in[h,w,1] for h,w in {0,1,2} = 2+4+6+8+10+12+14+16+18 = 90
+
+    # 5 args -> result_slot = max(8,5) = 8 -> 0x18000; read 2*i32=8 bytes
+    RESULT_ADDR_37 = TCM_BASE + 8 * TCM_SLOT
+
+    # Input data: flat [1..18] stored as i32 in slot 0
+    in_vals  = list(range(1, 19))       # [1..18] = 18 i32 elements
+    wt_vals  = [1] * 18                 # all-one weights, 18 elements
+    bias_vals = [0] * 16
+
+    prologue = [
+        ".section .text", ".globl _start", "_start:",
+        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    or    t0, t0, t1",  "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(in_vals,   TCM_BASE + 0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(wt_vals,   TCM_BASE + 1 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(bias_vals, TCM_BASE + 2 * TCM_SLOT)
+
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR_37, 8)
+        vals = list(struct.unpack("<2i", raw))
+        # c0=sum(1,3,5,7,9,11,13,15,17)=81; c1=sum(2,4,6,8,10,12,14,16,18)=90
+        check_result("dw33 C=2: ch0=81 ch1=90", vals, [81, 90])
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
 if __name__ == "__main__":
     print("CoralNPU E2E Validation")
     print(f"  circt-opt : {CIRCT_OPT}")
@@ -2587,6 +2651,7 @@ if __name__ == "__main__":
     test_conv2d_ic8_oc1_e2e()
     test_conv2d_ic8_oc4_e2e()
     test_conv2d_ic16_oc2_e2e()
+    test_dw33_e2e()
 
     print(f"\n{'='*50}")
     print(f"Results: {COUNTS['pass']} passed, {COUNTS['fail']} failed")

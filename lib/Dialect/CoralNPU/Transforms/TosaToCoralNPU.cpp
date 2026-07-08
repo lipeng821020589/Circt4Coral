@@ -1080,52 +1080,90 @@ struct TosaDepthwiseConv2DLowering
                                       mlir::PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     // depthwise_conv2d: for each output channel c,
-    //   out[c] = sum_{kh,kw}(in[c, kh, kw] * wt[kh, kw, c, 0]) + bias[c]
-    // which is a length KH*KW dot product per channel.
+    //   out[0,0,0,c] = sum_{kh,kw}(in[kh,kw,c] * wt[kh,kw,c,0]) + bias[c]
     //
-    // Strategy: load input tile (arg 0) and weight tile (arg 1) in e32 mode,
-    // compute element-wise multiply per tile via VMulOp, then reduce with
-    // VRedSumOp to get a partial scalar sum, fold across tiles with ScalarAddOp,
-    // then add bias (arg 2 as scalar) and store via ScalarSwOp.
-    //
-    // This gives a correct data-flow path through the CoralNPU pipeline
-    // (real vle32/vmul/vredsum/add/sw sequence on spike).
+    // Direction-E: full KH×KW support with per-channel scalar loop.
+    // Input layout [N,H,W,C] flat: in[kh,kw,c] @ inBase + (kh*W*C + kw*C + c)*4
+    // Weight layout [KH,KW,C,CM] flat: wt[kh,kw,c,0] @ wtBase + (kh*KW*C + kw*C + c)*4
+    // For 1×1 (KH=KW=1) this reduces to the previous single-pass dot-product,
+    // but now computed element-by-element for correctness with any KH/KW.
+
     rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
 
-    int64_t n = numElements(op.getOperand(0));  // total input elements
-    auto inTiles  = getTiles(op.getOperand(0), SEW::E32, rewriter, loc);
-    auto wtTiles  = getTiles(op.getOperand(1), SEW::E32, rewriter, loc);
-
-    // Element-wise multiply each tile pair, then reduce-sum each product tile.
-    // Note: VWMACCOp (vwmacc.vv) is defined in the dialect for future use, but
-    // requires a vector accumulator operand; using VMulOp + VRedSumOp here for
-    // correctness until a proper vector-acc init sequence is designed.
-    llvm::SmallVector<mlir::Value> partials;
-    size_t numTiles = std::min(inTiles.size(), wtTiles.size());
-    for (size_t i = 0; i < numTiles; ++i) {
-      auto prod = rewriter.create<VMulOp>(loc, vregE32(loc.getContext()), inTiles[i], wtTiles[i], 1);
-      partials.push_back(rewriter.create<VRedSumOp>(loc, prod.getResult()).getResult());
+    // Extract spatial/channel dimensions from operand types.
+    // in:  [N, H, W, C]  — NHWC
+    // wt:  [KH, KW, C, CM]
+    // out: [N, OH, OW, C]
+    int64_t nH = 1, nW = 1, nC = 1, KH = 1, KW = 1;
+    if (auto inTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getOperand(0).getType())) {
+      if (inTy.getRank() == 4) {
+        nH = inTy.getDimSize(1);
+        nW = inTy.getDimSize(2);
+        nC = inTy.getDimSize(3);
+      }
+    }
+    if (auto wtTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getOperand(1).getType())) {
+      if (wtTy.getRank() == 4) {
+        KH = wtTy.getDimSize(0);
+        KW = wtTy.getDimSize(1);
+      }
     }
 
-    // Fold tile partial sums into one scalar.
-    mlir::Value sum = partials.empty()
-        ? createI32Const(loc, 0, rewriter)
-        : partials[0];
-    for (size_t i = 1; i < partials.size(); ++i)
-      sum = rewriter.create<ScalarAddOp>(loc, sum, partials[i]).getResult();
-
-    // Add bias: derive slot from bias operand arg index for correctness in chains.
-    int64_t biasSlot = 2; // default for standalone depthwise
+    // TCM base addresses for in/wt/bias/result.
+    // Use resolveInputBaseAddr for 'in' so chained ops (rescale→dw) work:
+    // when in is a tileCarrier (from_elements or splat), trace back to the
+    // TCM slot that holds the actual data.
+    int64_t inBase   = resolveInputBaseAddr(op.getOperand(0));
+    // wt/bias are always BlockArguments (weight tensors don't flow through carriers).
+    int64_t wtSlot   = 1;
+    int64_t biasSlot = 2;
+    if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(op.getOperand(1)))
+      wtSlot = barg.getArgNumber();
     if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(op.getBias()))
       biasSlot = barg.getArgNumber();
-    auto biasAddr = createI32Const(loc, (int32_t)(kTcmBase + biasSlot * kTcmSlot), rewriter);
-    auto biasVal  = rewriter.create<ScalarLwOp>(loc, biasAddr);
-    auto result   = rewriter.create<ScalarAddOp>(loc, sum, biasVal.getResult());
 
-    // Store scalar result via sw.
-    auto resultAddr = createI32Const(loc, (int32_t)(kTcmBase + getResultSlot(op) * kTcmSlot), rewriter);
-    rewriter.create<ScalarSwOp>(loc, result.getResult(), resultAddr);
-    rewriter.replaceOp(op, carrier(op, rewriter, result.getResult()));
+    int64_t wtBase   = kTcmBase + wtSlot   * kTcmSlot;
+    int64_t biasBase = kTcmBase + biasSlot * kTcmSlot;
+    int64_t resultBase = kTcmBase + getResultSlot(op) * kTcmSlot;
+
+    // Per-channel scalar loop: for each c, accumulate KH*KW scalar MACs.
+    mlir::Value lastResult = createI32Const(loc, 0, rewriter);
+    for (int64_t c = 0; c < nC; ++c) {
+      mlir::Value acc = createI32Const(loc, 0, rewriter);
+      for (int64_t kh = 0; kh < KH; ++kh) {
+        for (int64_t kw = 0; kw < KW; ++kw) {
+          // in[kh, kw, c] address (output position 0,0 means input patch starts at 0,0)
+          int64_t inElemOff = (kh * nW * nC + kw * nC + c) * 4;
+          auto inAddr = createI32Const(loc, (int32_t)(inBase + inElemOff), rewriter);
+          auto inVal  = rewriter.create<ScalarLwOp>(loc, inAddr).getResult();
+          // wt[kh, kw, c, 0] address
+          int64_t wtElemOff = (kh * KW * nC + kw * nC + c) * 4;
+          auto wtAddr = createI32Const(loc, (int32_t)(wtBase + wtElemOff), rewriter);
+          auto wtVal  = rewriter.create<ScalarLwOp>(loc, wtAddr).getResult();
+          // MAC: acc += in * wt  (using ScalarMulOp for int32 multiply)
+          auto prod = rewriter.create<ScalarMulOp>(loc, inVal, wtVal).getResult();
+          acc = rewriter.create<ScalarAddOp>(loc, acc, prod).getResult();
+        }
+      }
+      // Add bias[c].
+      auto biasAddr = createI32Const(loc, (int32_t)(biasBase + c * 4), rewriter);
+      auto biasVal  = rewriter.create<ScalarLwOp>(loc, biasAddr).getResult();
+      auto chResult = rewriter.create<ScalarAddOp>(loc, acc, biasVal).getResult();
+      // Store channel result.
+      auto addrV = createI32Const(loc, (int32_t)(resultBase + c * 4), rewriter);
+      rewriter.create<ScalarSwOp>(loc, chResult, addrV);
+      lastResult = chResult;
+    }
+
+    // Reload nC results as vector tile(s) and return tileCarrier.
+    int64_t k_c = tileCount(SEW::E32, nC);
+    llvm::SmallVector<mlir::Value> ocTiles;
+    for (int64_t t = 0; t < k_c; ++t) {
+      auto addrV = createI32Const(loc, (int32_t)(resultBase + t * kTileBytes), rewriter);
+      auto nV    = createI32Const(loc, (int32_t)tileElems(t, k_c, nC, SEW::E32), rewriter);
+      ocTiles.push_back(rewriter.create<VLE32Op>(loc, vregE32(loc.getContext()), addrV, nV).getResult());
+    }
+    rewriter.replaceOp(op, tileCarrier(op, ocTiles, rewriter));
     return mlir::success();
   }
 };
