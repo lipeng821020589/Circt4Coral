@@ -2390,6 +2390,155 @@ def test_tflite_weight_e2e():
                 if p.exists(): p.unlink()
             except: pass
 
+
+
+def test_conv2d_ic8_oc1_e2e():
+    """TEST 34: conv2d IC=8 OC=1 — 2 input tiles, single output channel."""
+    print("\n=== TEST 34: tosa.conv2d IC=8 OC=1 (2 in-tiles) ===")
+    mlir = """func.func @conv_ic8_oc1(
+  %in: tensor<1x1x1x8xi8>, %wt: tensor<1x1x1x8xi8>,
+  %bias: tensor<1xi32>, %izp: tensor<1xi8>, %wzp: tensor<1xi8>
+) -> tensor<1x1x1x1xi32> {
+  %0 = tosa.conv2d %in, %wt, %bias, %izp, %wzp {
+    acc_type = i32, dilation = array<i64: 1, 1>,
+    pad = array<i64: 0, 0, 0, 0>, stride = array<i64: 1, 1>
+  } : (tensor<1x1x1x8xi8>, tensor<1x1x1x8xi8>, tensor<1xi32>,
+       tensor<1xi8>, tensor<1xi8>) -> tensor<1x1x1x1xi32>
+  func.return %0 : tensor<1x1x1x1xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+              "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+    insns = extract_asm_instructions(run_circt_opt(mlir, passes))
+    # 5 args -> result_slot = 8 -> 0x18000
+    RESULT_ADDR_34 = TCM_BASE + 8 * TCM_SLOT
+    # in=[1..8] wt=[1]*8 -> sum=36
+    in_vals   = [1,2,3,4,5,6,7,8] + [0]*8
+    wt_vals   = [1]*8              + [0]*8
+    bias_vals = [0]*16
+    prologue = [
+        ".section .text", ".globl _start", "_start:",
+        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    or    t0, t0, t1",  "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(in_vals,   TCM_BASE + 0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(wt_vals,   TCM_BASE + 1 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(bias_vals, TCM_BASE + 2 * TCM_SLOT)
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR_34, 4)
+        actual = struct.unpack("<i", raw)[0]
+        check_result("conv2d IC=8 OC=1: in=[1..8] wt=[1]*8 -> 36", [actual], [36])
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
+
+def test_conv2d_ic8_oc4_e2e():
+    """TEST 35: conv2d IC=8 OC=4 — 2 in-tiles × 4 OC."""
+    print("\n=== TEST 35: tosa.conv2d IC=8 OC=4 (2 in-tiles, 4 OC) ===")
+    mlir = """func.func @conv_ic8_oc4(
+  %in: tensor<1x1x1x8xi8>, %wt: tensor<4x1x1x8xi8>,
+  %bias: tensor<4xi32>, %izp: tensor<1xi8>, %wzp: tensor<1xi8>
+) -> tensor<1x1x1x4xi32> {
+  %0 = tosa.conv2d %in, %wt, %bias, %izp, %wzp {
+    acc_type = i32, dilation = array<i64: 1, 1>,
+    pad = array<i64: 0, 0, 0, 0>, stride = array<i64: 1, 1>
+  } : (tensor<1x1x1x8xi8>, tensor<4x1x1x8xi8>, tensor<4xi32>,
+       tensor<1xi8>, tensor<1xi8>) -> tensor<1x1x1x4xi32>
+  func.return %0 : tensor<1x1x1x4xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+              "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+    insns = extract_asm_instructions(run_circt_opt(mlir, passes))
+    # 5 args -> result_slot=8 -> 0x18000, read 4*i32=16 bytes
+    RESULT_ADDR_35 = TCM_BASE + 8 * TCM_SLOT
+    # in=[1..8], wt layout [4,1,1,8] flat: oc0=[1]*8, oc1=[2]*8, oc2=[1,0..0], oc3=[0..0,1]
+    # oc0: sum([1..8])=36, oc1: 2*36=72, oc2: 1, oc3: 8
+    in_vals  = [1,2,3,4,5,6,7,8]      + [0]*8
+    wt_oc0   = [1,1,1,1,1,1,1,1]
+    wt_oc1   = [2,2,2,2,2,2,2,2]
+    wt_oc2   = [1,0,0,0,0,0,0,0]
+    wt_oc3   = [0,0,0,0,0,0,0,1]
+    wt_vals  = wt_oc0 + wt_oc1 + wt_oc2 + wt_oc3   # 32 elems, fits in 1 slot (32*4=128B < 4KB)
+    bias_vals = [0]*16
+    prologue = [
+        ".section .text", ".globl _start", "_start:",
+        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    or    t0, t0, t1",  "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(in_vals,   TCM_BASE + 0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(wt_vals,   TCM_BASE + 1 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(bias_vals, TCM_BASE + 2 * TCM_SLOT)
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR_35, 16)
+        vals = list(struct.unpack("<4i", raw))
+        # oc0=sum([1..8])=36, oc1=2*36=72, oc2=in[0]=1, oc3=in[7]=8
+        check_result("conv2d IC=8 OC=4: [36, 72, 1, 8]", vals, [36, 72, 1, 8])
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
+
+def test_conv2d_ic16_oc2_e2e():
+    """TEST 36: conv2d IC=16 OC=2 — 4 in-tiles × 2 OC."""
+    print("\n=== TEST 36: tosa.conv2d IC=16 OC=2 (4 in-tiles, 2 OC) ===")
+    mlir = """func.func @conv_ic16_oc2(
+  %in: tensor<1x1x1x16xi8>, %wt: tensor<2x1x1x16xi8>,
+  %bias: tensor<2xi32>, %izp: tensor<1xi8>, %wzp: tensor<1xi8>
+) -> tensor<1x1x1x2xi32> {
+  %0 = tosa.conv2d %in, %wt, %bias, %izp, %wzp {
+    acc_type = i32, dilation = array<i64: 1, 1>,
+    pad = array<i64: 0, 0, 0, 0>, stride = array<i64: 1, 1>
+  } : (tensor<1x1x1x16xi8>, tensor<2x1x1x16xi8>, tensor<2xi32>,
+       tensor<1xi8>, tensor<1xi8>) -> tensor<1x1x1x2xi32>
+  func.return %0 : tensor<1x1x1x2xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+              "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+    insns = extract_asm_instructions(run_circt_opt(mlir, passes))
+    # 5 args -> result_slot=8 -> 0x18000, read 2*i32=8 bytes
+    RESULT_ADDR_36 = TCM_BASE + 8 * TCM_SLOT
+    # in=[1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4]
+    # wt_oc0=[1]*16 -> sum=1*4+2*4+3*4+4*4=40
+    # wt_oc1=[1,0,0,0]*4 -> picks in[0,4,8,12]=1+2+3+4=10
+    in_vals  = [1,1,1,1, 2,2,2,2, 3,3,3,3, 4,4,4,4]
+    wt_oc0   = [1]*16
+    wt_oc1   = [1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0]
+    wt_vals  = wt_oc0 + wt_oc1   # 32 elems, fits in 1 slot
+    bias_vals = [0]*16
+    prologue = [
+        ".section .text", ".globl _start", "_start:",
+        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    or    t0, t0, t1",  "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(in_vals,   TCM_BASE + 0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(wt_vals,   TCM_BASE + 1 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(bias_vals, TCM_BASE + 2 * TCM_SLOT)
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR_36, 8)
+        vals = list(struct.unpack("<2i", raw))
+        check_result("conv2d IC=16 OC=2: [40, 10]", vals, [40, 10])
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
 if __name__ == "__main__":
     print("CoralNPU E2E Validation")
     print(f"  circt-opt : {CIRCT_OPT}")
@@ -2435,6 +2584,9 @@ if __name__ == "__main__":
     test_two_mobilenet_blocks_e2e()
     test_weight_injection_e2e()
     test_tflite_weight_e2e()
+    test_conv2d_ic8_oc1_e2e()
+    test_conv2d_ic8_oc4_e2e()
+    test_conv2d_ic16_oc2_e2e()
 
     print(f"\n{'='*50}")
     print(f"Results: {COUNTS['pass']} passed, {COUNTS['fail']} failed")
