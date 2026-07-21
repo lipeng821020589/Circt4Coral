@@ -378,12 +378,12 @@ def OuterProductOp : CoralNPU_Op<"outer_product", [Pure]> {
     The `stripmine` attribute controls hardware replication (each lane
     processes different weight columns in parallel).
   }];
-  let arguments = (ins I32:$input,        // 8-bit elements packed in i32
-                       I32:$weight,       // 8-bit elements packed in i32
-                       I32:$acc_old,      // previous accumulator value
+  let arguments = (ins CoralNPU_VRegOrI32:$input,   // direction-B: vreg or i32
+                       CoralNPU_VRegOrI32:$weight,  // direction-B: vreg or i32
+                       I32:$acc_old,                // previous accumulator value
                        DefaultValuedAttr<ConfinedAttr<I32Attr, [IntMinValue<1>, IntMaxValue<4>]>, "1">:$stripmine);
   let results = (outs I32:$acc_new);      // updated accumulator value
-  let assemblyFormat = "$input `,` $weight `,` $acc_old (`stripmine` `=` $stripmine^)? attr-dict `:` type($acc_new)";
+  let assemblyFormat = "$input `,` $weight `,` $acc_old (`stripmine` `=` $stripmine^)? attr-dict `:` functional-type(operands, results)";
 }
 
 //===----------------------------------------------------------------------===//

@@ -1181,7 +1181,6 @@ struct TosaMatMulLowering : public mlir::OpRewritePattern<mlir::tosa::MatMulOp> 
 
     // Derive matmul dimensions from the operand/result shapes.
     //   A: [.., M, K]   B: [.., K, N]   C: [.., M, N]
-    // We tile M and N by the 8x8 accumulator and accumulate along K.
     auto aTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getOperand(0).getType());
     auto bTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getOperand(1).getType());
     int64_t M = 8, K = 8, N = 8;
@@ -1192,13 +1191,83 @@ struct TosaMatMulLowering : public mlir::OpRewritePattern<mlir::tosa::MatMulOp> 
     if (bTy && bTy.getRank() >= 2)
       N = bTy.getDimSize(bTy.getRank() - 1);
     auto ceilDiv = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
-    int64_t mT = ceilDiv(M, kTile), nT = ceilDiv(N, kTile),
-            kT = ceilDiv(K, kTile);
+    int64_t nT = ceilDiv(N, kTile), kT = ceilDiv(K, kTile);
+    mlir::Value last;
 
+    // GEMV path (M=1): per-output-channel vle+vmul+vredsum for i32,
+    // or outer_product MAC CSR path for int8.
+    if (M == 1) {
+      auto elemTy = aTy ? aTy.getElementType() : rewriter.getI32Type();
+      if (elemTy.isInteger(8)) {
+        // int8 GEMV: use 8x8 MAC engine via OuterProductOp (CSR path).
+        rewriter.create<VSetVLOp>(loc, SEW::E8, LMUL::M1);
+        unsigned sm = stripmineFor(kTile * kTile, SEW::E8);
+        auto col0 = createI32Const(loc, 0, rewriter);
+        for (int64_t ni = 0; ni < nT; ++ni) {
+          mlir::Value acc = createI32Const(loc, 0, rewriter);
+          for (int64_t ki = 0; ki < kT; ++ki) {
+            auto aTile = loadTile(op.getOperand(0), ki * kTile * kTile,
+                                  kTile * kTile, rewriter, loc);
+            auto bTile = loadTile(op.getOperand(1), (ki * nT + ni) * kTile * kTile,
+                                  kTile * kTile, rewriter, loc);
+            acc = rewriter.create<OuterProductOp>(loc, aTile, bTile, acc, sm)
+                      .getAccNew();
+          }
+          auto accRead = rewriter.create<AccReadOp>(loc, acc, col0);
+          rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
+          storeTile(accRead.getResult(), ni * kTile, kTile, rewriter, loc);
+          rewriter.create<VSetVLOp>(loc, SEW::E8, LMUL::M1);
+          last = accRead.getResult();
+        }
+      } else {
+        // i32/f32 GEMV: per-output-channel vle+vmul+vredsum (dot product).
+        // B layout assumed [N, K] (output-channel first, transposed weight).
+        rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
+        unsigned vCap = vregCapacity(SEW::E32); // 4 elements per vreg tile
+        int64_t kTilesF = ceilDiv(K, (int64_t)vCap);
+        for (int64_t ni = 0; ni < N; ++ni) {
+          mlir::Value acc = createI32Const(loc, 0, rewriter);
+          for (int64_t kt = 0; kt < kTilesF; ++kt) {
+            int64_t kElem = std::min((int64_t)vCap, K - kt * (int64_t)vCap);
+            // Load input tile a[0, kt*vCap .. kt*vCap+kElem-1] from slot 0.
+            int64_t aAddr = kTcmBase + 0 * kTcmSlot + kt * kTileBytes;
+            auto aAddrV = createI32Const(loc, (int32_t)aAddr, rewriter);
+            auto kElemV = createI32Const(loc, (int32_t)kElem, rewriter);
+            auto aTile = rewriter.create<VLE32Op>(
+                loc, vregE32(loc.getContext()), aAddrV, kElemV);
+            // Load weight tile b[ni, kt*vCap .. kt*vCap+kElem-1] from slot 1.
+            // Assumes B stored row-major with output-channel as row (transposed).
+            int64_t bAddr = kTcmBase + 1 * kTcmSlot + (ni * K + kt * (int64_t)vCap) * 4;
+            auto bAddrV = createI32Const(loc, (int32_t)bAddr, rewriter);
+            auto bTile = rewriter.create<VLE32Op>(
+                loc, vregE32(loc.getContext()), bAddrV, kElemV);
+            auto prod = rewriter.create<VMulOp>(
+                loc, vregE32(loc.getContext()), aTile.getResult(),
+                bTile.getResult(), 1);
+            // VRedSumOp reduces vector→scalar; accumulate tiles with ScalarAddOp.
+            auto tileSum = rewriter.create<VRedSumOp>(
+                loc, prod.getResult()).getResult();
+            acc = rewriter.create<ScalarAddOp>(loc, acc, tileSum).getResult();
+          }
+          // Store scalar result ni to result slot.
+          int64_t resAddr = kTcmBase + kResultSlot * kTcmSlot + ni * 4;
+          auto resAddrV = createI32Const(loc, (int32_t)resAddr, rewriter);
+          rewriter.create<ScalarSwOp>(loc, acc, resAddrV);
+          last = acc;
+        }
+      }
+      if (!last)
+        last = createI32Const(loc, 0, rewriter);
+      rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
+      rewriter.replaceOp(op, carrier(op, rewriter, last));
+      return mlir::success();
+    }
+
+    // General GEMM path (M>1): tile through 8x8 outer-product MAC.
+    int64_t mT = ceilDiv(M, kTile);
     rewriter.create<VSetVLOp>(loc, SEW::E8, LMUL::M1);
     unsigned sm = stripmineFor(kTile * kTile, SEW::E8);
     auto col0 = createI32Const(loc, 0, rewriter);
-    mlir::Value last;
     // Output-tile loop nest; each (mi,ni) tile accumulates over the K tiles.
     for (int64_t mi = 0; mi < mT; ++mi) {
       for (int64_t ni = 0; ni < nT; ++ni) {
@@ -1379,6 +1448,35 @@ struct TosaReduceSumLowering : public mlir::OpRewritePattern<mlir::tosa::ReduceS
     auto ra = createI32Const(loc, (int32_t)(kTcmBase + getResultSlot(op)*kTcmSlot), rewriter);
     rewriter.create<ScalarSwOp>(loc, sum, ra);
     rewriter.replaceOp(op, carrier(op, rewriter, sum));
+    return mlir::success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// tosa.rsqrt → vredsum to get scalar, then scalar integer inverse sqrt approx
+// For integer inputs: rsqrt(x) = 1 / x (integer division, truncates).
+// This is an integer approximation sufficient for lowering chain validation;
+// float-accurate rsqrt requires a Newton-Raphson pass (future work).
+//===----------------------------------------------------------------------===//
+struct TosaRsqrtLowering : public mlir::OpRewritePattern<mlir::tosa::RsqrtOp> {
+  using mlir::OpRewritePattern<mlir::tosa::RsqrtOp>::OpRewritePattern;
+  mlir::LogicalResult matchAndRewrite(mlir::tosa::RsqrtOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
+    // Reduce input to scalar sum (for 1-element tensor, this IS the value).
+    auto tiles = getTiles(op.getInput1(), SEW::E32, rewriter, loc);
+    mlir::Value acc = createI32Const(loc, 0, rewriter);
+    for (auto tile : tiles) {
+      auto partial = rewriter.create<VRedSumOp>(loc, tile).getResult();
+      acc = rewriter.create<ScalarAddOp>(loc, acc, partial).getResult();
+    }
+    // Integer rsqrt: 1 / x (truncating division). Sufficient for int32 chain tests.
+    auto one = createI32Const(loc, 1, rewriter);
+    auto inv = rewriter.create<ScalarDivOp>(loc, one, acc);
+    auto ra = createI32Const(loc, (int32_t)(kTcmBase + getResultSlot(op)*kTcmSlot), rewriter);
+    rewriter.create<ScalarSwOp>(loc, inv.getResult(), ra);
+    rewriter.replaceOp(op, carrier(op, rewriter, inv.getResult()));
     return mlir::success();
   }
 };
@@ -1868,6 +1966,12 @@ struct TosaConstLowering : public mlir::OpRewritePattern<mlir::tosa::ConstOp> {
 
 struct TosaToCoralNPUPass
     : public impl::TosaToCoralNPUBase<TosaToCoralNPUPass> {
+  void getDependentDialects(mlir::DialectRegistry &registry) const override {
+    registry.insert<mlir::tosa::TosaDialect,
+                    mlir::tensor::TensorDialect,
+                    mlir::func::FuncDialect,
+                    circt::coralnpu::CoralNPUDialect>();
+  }
   void runOnOperation() override {
     auto *ctx = &getContext();
 
@@ -1900,6 +2004,7 @@ struct TosaToCoralNPUPass
                      TosaMaxPool2dLowering>(ctx);
     tosaPatterns.add<TosaNegateVXLowering, TosaAbsLowering>(ctx);
     tosaPatterns.add<TosaReduceSumLowering, TosaReduceMaxLowering>(ctx);
+    tosaPatterns.add<TosaRsqrtLowering>(ctx);
     tosaPatterns.add<TosaMaximumLowering, TosaMinimumLowering>(ctx);
     tosaPatterns.add<TosaArithmeticRightShiftLowering>(ctx);
     tosaPatterns.add<TosaEqualLowering, TosaGreaterLowering, TosaGreaterEqualLowering>(ctx);

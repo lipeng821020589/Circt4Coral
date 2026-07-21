@@ -34,8 +34,8 @@ func.func @test_stripmine_vdot(%a: i32, %b: i32) -> i32 {
 // CHECK-LABEL: func.func @test_stripmine_outer_product
 func.func @test_stripmine_outer_product(%inp: i32, %wgt: i32, %acc: i32) -> i32 {
   coralnpu.vsetvl e8, m4
-  // CHECK: coralnpu.outer_product {{.*}} stripmine = 4 : i32
-  %r = coralnpu.outer_product %inp, %wgt, %acc : i32
+  // CHECK: coralnpu.outer_product {{.*}} stripmine = 4 : (i32, i32, i32) -> i32
+  %r = coralnpu.outer_product %inp, %wgt, %acc : (i32, i32, i32) -> i32
   coralnpu.return %r : i32
 }
 

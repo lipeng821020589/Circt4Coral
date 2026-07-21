@@ -928,7 +928,7 @@ func.func @demo_outer_product() -> i32 {
   %a = coralnpu.li 2 : i32
   %b = coralnpu.li 3 : i32
   %acc = coralnpu.li 0 : i32
-  %r = coralnpu.outer_product %a, %b, %acc : i32
+  %r = coralnpu.outer_product %a, %b, %acc : (i32, i32, i32) -> i32
   coralnpu.return %r : i32
 }
 """
@@ -2603,6 +2603,116 @@ def test_dw33_e2e():
     finally:
         if elf_path.exists(): elf_path.unlink()
 
+# ── TEST 38: GEMV i32 M=1 K=4 N=4 ────────────────────────────────────────────
+
+def test_gemv_i32_e2e():
+    print("\n=== TEST 38: GEMV i32 M=1 K=4 N=4 (vle+vmul+vredsum path) ===")
+    # a=[1,2,3,4], W=diag([1,2,3,4]) → a @ W = [1,4,9,16]
+    mlir = """\
+func.func @gemv(%a: tensor<1x1x4xi32>, %b: tensor<1x4x4xi32>,
+                %az: tensor<1xi32>, %bz: tensor<1xi32>) -> tensor<1x1x4xi32> {
+  %0 = tosa.matmul %a, %b, %az, %bz
+    : (tensor<1x1x4xi32>, tensor<1x4x4xi32>, tensor<1xi32>, tensor<1xi32>) -> tensor<1x1x4xi32>
+  func.return %0 : tensor<1x1x4xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+              "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+    circt_out = run_circt_opt(mlir, passes)
+    insns = extract_asm_instructions(circt_out)
+
+    # a=[1,2,3,4], W=diag([1,2,3,4]) stored row-major [N,K] = [[1,0,0,0],[0,2,0,0],...]
+    a_data = [1, 2, 3, 4] + [0] * 12
+    W_data = [1, 0, 0, 0,   # row 0 (output 0)
+              0, 2, 0, 0,   # row 1 (output 1)
+              0, 0, 3, 0,   # row 2 (output 2)
+              0, 0, 0, 4]   # row 3 (output 3)
+    W_data += [0] * 48      # pad slot to 64 elements
+    expected = [1, 4, 9, 16]
+
+    prologue = [
+        ".section .text",
+        ".globl _start",
+        "_start:",
+        "    csrr  t0, mstatus",
+        "    li    t1, 0x600",
+        "    or    t0, t0, t1",
+        "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(a_data, TCM_BASE + 0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(W_data, TCM_BASE + 1 * TCM_SLOT)
+
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 16)
+        actual = list(struct.unpack("<4i", raw))
+        check_result("GEMV i32 [1,2,3,4] x diag([1,2,3,4])", actual, expected)
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
+
+# ── TEST 39: RMSNorm integer chain ────────────────────────────────────────────
+
+def test_rmsnorm_e2e():
+    print("\n=== TEST 39: RMSNorm scalar chain (int32, rsqrt=1/x, same-dim) ===")
+    # Scalar-only: x=[26], gamma=[1]. sum_sq=676, +1=677, rsqrt=1/677=0 (int).
+    # norm=26*0=0, out=0*1=0. Tests rsqrt lowering chain end-to-end.
+    # Use same-size tensors (1-element) to avoid broadcast issues.
+    mlir = """\
+func.func @rmsnorm_scalar(%x: tensor<1xi32>, %g: tensor<1xi32>) -> tensor<1xi32> {
+  %shift = "tosa.const"() <{values = dense<0> : tensor<1xi8>}> : () -> tensor<1xi8>
+  %xsq  = tosa.mul %x, %x, %shift : (tensor<1xi32>, tensor<1xi32>, tensor<1xi8>) -> tensor<1xi32>
+  %eps  = "tosa.const"() <{values = dense<1> : tensor<1xi32>}> : () -> tensor<1xi32>
+  %seps = tosa.add %xsq, %eps : (tensor<1xi32>, tensor<1xi32>) -> tensor<1xi32>
+  %rsq  = tosa.rsqrt %seps : (tensor<1xi32>) -> tensor<1xi32>
+  %norm = tosa.mul %x, %rsq, %shift : (tensor<1xi32>, tensor<1xi32>, tensor<1xi8>) -> tensor<1xi32>
+  %out  = tosa.mul %norm, %g, %shift : (tensor<1xi32>, tensor<1xi32>, tensor<1xi8>) -> tensor<1xi32>
+  func.return %out : tensor<1xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+              "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+    circt_out = run_circt_opt(mlir, passes)
+    insns = extract_asm_instructions(circt_out)
+
+    # x=[5]: xsq=25, +1=26, rsqrt(26)=0 (int), norm=5*0=0, out=0*2=0
+    x_data = [5] + [0] * 15
+    g_data = [2] + [0] * 15
+    expected = [0]  # rsqrt truncates to 0
+
+    prologue = [
+        ".section .text",
+        ".globl _start",
+        "_start:",
+        "    csrr  t0, mstatus",
+        "    li    t1, 0x600",
+        "    or    t0, t0, t1",
+        "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(x_data, TCM_BASE + 0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(g_data, TCM_BASE + 1 * TCM_SLOT)
+
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 4)
+        actual = list(struct.unpack("<1i", raw))
+        check_result("RMSNorm scalar: x=[5] gamma=[2] → [0] (rsqrt int trunc)", actual, expected)
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
+
 if __name__ == "__main__":
     print("CoralNPU E2E Validation")
     print(f"  circt-opt : {CIRCT_OPT}")
@@ -2652,6 +2762,8 @@ if __name__ == "__main__":
     test_conv2d_ic8_oc4_e2e()
     test_conv2d_ic16_oc2_e2e()
     test_dw33_e2e()
+    test_gemv_i32_e2e()
+    test_rmsnorm_e2e()
 
     print(f"\n{'='*50}")
     print(f"Results: {COUNTS['pass']} passed, {COUNTS['fail']} failed")

@@ -87,10 +87,10 @@ func.func @test_reduction(%arg0: !coralnpu.vreg<e32, m1>) {
 // CHECK-LABEL: func.func @test_matrix_ops
 func.func @test_matrix_ops(%arg0: i32, %arg1: i32, %arg2: i32) {
   coralnpu.vsetvl e8, m1
-  // CHECK: coralnpu.outer_product %arg0, %arg1, %arg2 : i32
-  %0 = coralnpu.outer_product %arg0, %arg1, %arg2 : i32
-  // CHECK: coralnpu.outer_product %arg0, %arg1, %0 stripmine = 4 : i32
-  %1 = coralnpu.outer_product %arg0, %arg1, %0 stripmine = 4 : i32
+  // CHECK: coralnpu.outer_product %arg0, %arg1, %arg2 : (i32, i32, i32) -> i32
+  %0 = coralnpu.outer_product %arg0, %arg1, %arg2 : (i32, i32, i32) -> i32
+  // CHECK: coralnpu.outer_product %arg0, %arg1, %0 stripmine = 4 : (i32, i32, i32) -> i32
+  %1 = coralnpu.outer_product %arg0, %arg1, %0 stripmine = 4 : (i32, i32, i32) -> i32
   // CHECK: coralnpu.aconv %1, %arg1, %arg0 : i32
   %2 = coralnpu.aconv %1, %arg1, %arg0 : i32
   // CHECK: coralnpu.accread %2, %arg0 : i32
