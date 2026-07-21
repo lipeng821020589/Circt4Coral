@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <ranges>
 #include <type_traits>
 #include <vector>
@@ -68,7 +69,7 @@ void expectBytes(const T &value, const std::array<uint8_t, N> &expected,
 }
 
 // ---------------------------------------------------------------------------
-// Path A — 8/16/32/64-bit byte-aligned integers
+// Standard 8/16/32/64-bit byte-aligned integers
 // ---------------------------------------------------------------------------
 
 void testStandardWidthUnsigned() {
@@ -135,7 +136,7 @@ void testStandardWidthSigned() {
 }
 
 // ---------------------------------------------------------------------------
-// Path B — byte-aligned non-standard width (e.g. i24, i48)
+// Byte-aligned non-standard width (e.g. i24, i48)
 // ---------------------------------------------------------------------------
 
 void testByteAlignedOddWidthUnsigned() {
@@ -166,7 +167,7 @@ void testByteAlignedOddWidthSigned() {
 }
 
 // ---------------------------------------------------------------------------
-// Path C — sub-byte alignment (uses the BitAccess helpers)
+// Sub-byte alignment (uses the BitAccess helpers)
 // ---------------------------------------------------------------------------
 
 void testSubByteUnsigned() {
@@ -431,6 +432,65 @@ void testSubByteStructArray() {
 }
 
 // ---------------------------------------------------------------------------
+// Nested arrays (array-of-array) -- previously mis-handled by the flat-copy
+// path; now driven by the recursive per-element (un)packer.
+// ---------------------------------------------------------------------------
+
+void testNestedIntArray() {
+  // `2 x 4 x ui3`: the element type is itself the non-byte-packable array
+  // `4 x ui3` (12 wire bits, 4 bytes in memory). The old codegen emitted a
+  // corrupt whole-array copy and no indexed accessor; the recursive packer
+  // places each `ui3` leaf at wire bit `i * 12 + j * 3`.
+  Nested3 a;
+  std::array<std::array<uint8_t, 4>, 2> rows = {{{1, 2, 3, 4}, {5, 6, 7, 0}}};
+  a.rows(rows);
+
+  auto whole = a.rows();
+  for (std::size_t i = 0; i < 2; ++i)
+    for (std::size_t j = 0; j < 4; ++j) {
+      assert(whole[i][j] == rows[i][j]);
+      assert(a.rows(i)[j] == rows[i][j]);
+    }
+  // Flattened [1,2,3,4,5,6,7,0] at 3-bit strides -- identical wire bytes to
+  // the flat `8 x ui3` case.
+  expectBytes(a, std::array<uint8_t, 3>{0xD1, 0x58, 0x1F}, "Nested3");
+
+  // Indexed setter for one inner row; the other row must stay zero.
+  Nested3 b;
+  b.rows(1, {5, 6, 7, 0});
+  for (std::size_t j = 0; j < 4; ++j) {
+    assert(b.rows(1)[j] == rows[1][j]);
+    assert(b.rows(0)[j] == 0);
+  }
+  // Row 1 occupies bits 12..23: [5,6,7,0].
+  expectBytes(b, std::array<uint8_t, 3>{0x00, 0x50, 0x1F}, "Nested3 row1");
+}
+
+void testNestedStructArray() {
+  // `2 x 3 x SbCell` (each cell 5 wire bits). Array-of-array-of-sub-byte-
+  // aggregate: the recursive packer copies each cell's bits at its true
+  // wire offset `i * 15 + j * 5`.
+  NestedCell a;
+  std::array<std::array<SbCell, 3>, 2> grid = {{
+      {SbCell(1, 0), SbCell(2, 1), SbCell(3, 2)},
+      {SbCell(4, 3), SbCell(5, 0), SbCell(6, 1)},
+  }};
+  a.grid(grid);
+
+  auto whole = a.grid();
+  for (std::size_t i = 0; i < 2; ++i)
+    for (std::size_t j = 0; j < 3; ++j) {
+      assert(whole[i][j].hi() == grid[i][j].hi());
+      assert(whole[i][j].lo() == grid[i][j].lo());
+      assert(a.grid(i)[j].hi() == grid[i][j].hi());
+      assert(a.grid(i)[j].lo() == grid[i][j].lo());
+    }
+  // grid[0] reuses the first three SbCellArr cells, so bytes 0..1 match that
+  // test's leading bytes.
+  expectBytes(a, std::array<uint8_t, 4>{0x24, 0xB9, 0x49, 0x33}, "NestedCell");
+}
+
+// ---------------------------------------------------------------------------
 // Unions
 // ---------------------------------------------------------------------------
 
@@ -480,9 +540,10 @@ void testWindowList() {
   auto data_seg = win.segment(1);
   auto footer_seg = win.segment(2);
   assert(data_seg.size == elements.size() * sizeof(uint32_t));
-  // Header carries `tag` at the MSB end and the count at the LSB end.
-  // Layout: count (ui16, 2 bytes) then tag (ui16, 2 bytes) in reversed
-  // declaration order; header bytes = [count_lo, count_hi, tag_lo, tag_hi].
+  // Content is MSB-aligned within the 32-bit frame: `tag` (ui16) occupies
+  // the top 16 bits (bytes 2..3) and the count (ui16) the low 16 bits
+  // (bytes 0..1). Here the content fills the frame exactly, so header bytes =
+  // [count_lo, count_hi, tag_lo, tag_hi].
   assert(header_seg.size == 4);
   assert(header_seg.data[0] == (static_cast<uint8_t>(elements.size()) & 0xFF));
   assert(header_seg.data[1] == 0); // count high byte (size < 256)
@@ -495,7 +556,89 @@ void testWindowList() {
 }
 
 // ---------------------------------------------------------------------------
-// Path D — value-class fields (esi::MutableBitVector, esi::Int, esi::UInt)
+// ---------------------------------------------------------------------------
+// Multi-burst chunking: a window whose count field is too narrow to encode
+// the whole list in one burst must split the list across several
+// header/data bursts (terminated by a zero-count footer) and the read-side
+// deserializer must reassemble it back into the original list.
+// ---------------------------------------------------------------------------
+
+void testWindowListMultiBurst() {
+  // SmallListWindow has a 2-bit count field, so at most 3 items fit in one
+  // burst. A 7-item list therefore splits into 3 bursts of 3 + 3 + 1 items.
+  std::vector<uint32_t> elements = {0x11111111u, 0x22222222u, 0x33333333u,
+                                    0x44444444u, 0x55555555u, 0x66666666u,
+                                    0x77777777u};
+  SmallListWindow win(0xBEEF, elements);
+
+  assert(win.tag() == 0xBEEF);
+  assert(win.items_count() == elements.size());
+
+  // ceil(7 / 3) = 3 bursts -> 3 headers + 3 data + 1 footer = 7 segments.
+  assert(win.numSegments() == 2 * 3 + 1);
+
+  // Each header / footer frame is 4 bytes. Data segments carry 3, 3, then 1
+  // item(s), one ui32 (4 bytes) per item.
+  assert(win.segment(0).size == 4);                    // burst 0 header
+  assert(win.segment(1).size == 3 * sizeof(uint32_t)); // burst 0 data
+  assert(win.segment(2).size == 4);                    // burst 1 header
+  assert(win.segment(3).size == 3 * sizeof(uint32_t)); // burst 1 data
+  assert(win.segment(4).size == 4);                    // burst 2 header
+  assert(win.segment(5).size == 1 * sizeof(uint32_t)); // burst 2 data
+  assert(win.segment(6).size == 4);                    // footer
+
+  // The header content is MSB-aligned within the 32-bit frame, exactly as
+  // CIRCT lowers the frame union: `tag` (ui16) sits at bits [31:16]
+  // (bytes 2..3) and the 2-bit count immediately below it at bits [15:14] --
+  // the top two bits of byte 1 -- with the remaining low bits zero. Only the
+  // first burst's header carries the static tag; later bursts and the footer
+  // leave it zero. (The old byte-granular codegen put the count in the low
+  // bits of byte 1, which the hardware would have read as zero.)
+  auto headerCount = [](const auto &s) -> unsigned {
+    return (s.data[1] >> 6) & 0x3;
+  };
+  assert(headerCount(win.segment(0)) == 3);
+  assert(headerCount(win.segment(2)) == 3);
+  assert(headerCount(win.segment(4)) == 1);
+  assert(headerCount(win.segment(6)) == 0);
+  // Exact header-frame bytes. Burst 0 (count 3, tag 0xBEEF):
+  //   byte0 = 0x00 (pad), byte1 = 0xC0 (count 3 at bits [15:14]),
+  //   byte2 = 0xEF, byte3 = 0xBE (tag, little-endian, at bits [31:16]).
+  assert(win.segment(0).data[0] == 0x00);
+  assert(win.segment(0).data[1] == 0xC0);
+  assert(win.segment(0).data[2] == 0xEF);
+  assert(win.segment(0).data[3] == 0xBE);
+  // Later bursts repeat the count but not the tag (bytes 2..3 stay zero).
+  assert(win.segment(2).data[1] == 0xC0); // count 3
+  assert(win.segment(2).data[2] == 0x00);
+  assert(win.segment(2).data[3] == 0x00);
+  assert(win.segment(4).data[1] == 0x40); // count 1
+  // Footer: zero count, zero tag.
+  assert(win.segment(6).data[1] == 0x00);
+
+  // Round-trip: flatten the multi-burst stream and feed it back through the
+  // generated serial-list deserializer. It must rebuild one window holding
+  // all 7 items with the original tag.
+  std::unique_ptr<SmallListWindow> decoded;
+  SmallListWindow::TypeDeserializer deser(
+      [&](std::unique_ptr<SmallListWindow> &out) {
+        decoded = std::move(out);
+        return true;
+      });
+  std::unique_ptr<esi::SegmentedMessageData> msg =
+      std::make_unique<esi::MessageData>(win.toMessageData());
+  bool pushed = deser.push(msg);
+  assert(pushed);
+  assert(decoded);
+  assert(decoded->tag() == 0xBEEF);
+  auto reassembled = decoded->items_vector();
+  assert(reassembled.size() == elements.size());
+  for (std::size_t j = 0; j < elements.size(); ++j)
+    assert(reassembled[j] == elements[j]);
+}
+
+// ---------------------------------------------------------------------------
+// View-class fields (esi::MutableBitVector, esi::Int, esi::UInt)
 // ---------------------------------------------------------------------------
 
 // Build a wide MutableBitVector from an arbitrary-length byte buffer
@@ -588,9 +731,9 @@ void testWideSigned() {
 }
 
 void testBitsField() {
-  // BitsType > 64 routes through Path D (non-owning `esi::BitVector`
-  // view); narrower Bits stay on the native int paths and are covered
-  // by the other tests above.
+  // BitsType > 64 routes through the view-class accessor (non-owning
+  // `esi::BitVector` view); narrower Bits stay on the native int
+  // accessors and are covered by the other tests above.
   BitsField f;
   auto wide = bvFromBytes(
       {
@@ -609,7 +752,7 @@ void testBitsField() {
 void testWideMisaligned() {
   // WideMisaligned: tag (ui3) at bits 0..2, payload (ui128) at bits
   // 3..130 — i.e. a wide value at a non-byte-aligned offset. Hits the
-  // `copyBitsIn` / `copyBitsOut` arm of Path D.
+  // bit-shifted view accessor.
   WideMisaligned m;
   auto payload = bvFromBytes(
       {
@@ -634,7 +777,7 @@ void testWideMisaligned() {
 
   // A narrower input value must be zero-extended; a wider input is
   // truncated. Verify the former here (the latter is exercised
-  // implicitly because the Path D setter clamps to bit_width).
+  // implicitly because the view-class setter clamps to bit_width).
   auto narrow = bvFromBytes({0xAA}, 8); // only 8 bits of input
   m.payload(narrow);
   auto got3 = m.payload();
@@ -806,8 +949,11 @@ int main() {
   testSubByteSignedArray();
   testOddWidthArray();
   testSubByteStructArray();
+  testNestedIntArray();
+  testNestedStructArray();
   testUnion();
   testWindowList();
+  testWindowListMultiBurst();
   testWideUnsigned();
   testWideSigned();
   testBitsField();

@@ -10,6 +10,7 @@
 #define CIRCT_DIALECT_ARC_ARCOPS_TD
 
 include "circt/Dialect/Arc/ArcDialect.td"
+include "circt/Dialect/Arc/ArcAttributes.td"
 include "circt/Dialect/Arc/ArcInterfaces.td"
 include "circt/Dialect/Arc/ArcTypes.td"
 include "circt/Dialect/HW/HWTypes.td"
@@ -482,10 +483,12 @@ def AllocMemoryOp : ArcOp<"alloc_memory", [MemoryEffects<[MemAlloc]>]> {
 
 def AllocStorageOp : ArcOp<"alloc_storage", [MemoryEffects<[MemAlloc]>]> {
   let summary = "Allocate contiguous storage space from a larger storage space";
-  let arguments = (ins StorageType:$input, OptionalAttr<I32Attr>:$offset);
+  let arguments = (ins StorageType:$input,
+                       UI32Attr:$size,
+                       OptionalAttr<I32Attr>:$offset);
   let results = (outs StorageType:$output);
   let assemblyFormat = [{
-    $input (`[` $offset^ `]`)? attr-dict `:` functional-type($input, $output)
+    $input (`[` $offset^ `]`)? `,` $size attr-dict
   }];
 }
 
@@ -816,23 +819,36 @@ def CoroutineInstanceOp : ArcOp<"coroutine.instance", [
   CallOpInterface,
   DeclareOpInterfaceMethods<SymbolUserOpInterface>,
   HasParent<"hw::HWModuleOp">,
+  PredOpTrait<"`sensitivityMask` has one bit per argument",
+    CPred<"$sensitivityMask.size() == $args.size()">>,
 ]> {
   let summary = "Continuously run a coroutine in an hw.module";
   let description = [{
     Execute a coroutine concurrently in an `hw.module`. The program counter and
     state of the coroutine are held implicitly by the instance and passed into
     the coroutine when executed next. The values yielded by the coroutine are
-    produced as results of the instance. The callee must produce a wakeup time
-    as its last result value. This wakeup time is not exposed as a result of
-    the instance op and is instead used to schedule the next execution.
+    produced as results of the instance.
+
+    The callee must produce two additional trailing results that steer
+    scheduling and are *not* exposed as results of the instance op:
+
+    - An observe bitmask as its second-to-last result, an integer with one bit
+      per coroutine argument. A set bit requests that the instance re-enter the
+      coroutine whenever the corresponding argument changes value, on top of the
+      time-based wakeup. The dynamic returned mask is AND-combined with the
+      `sensitivityMask` attribute. Only arguments with the corresponding static
+      sensitivity bit set are checked for changes.
+    - A wakeup time as its last result value, used to schedule the next
+      time-based execution.
   }];
   let arguments = (ins
     FlatSymbolRefAttr:$callee,
-    Variadic<AnyType>:$args
+    Variadic<AnyType>:$args,
+    DenseBoolArrayAttr:$sensitivityMask
   );
   let results = (outs Variadic<AnyType>:$results);
   let assemblyFormat = [{
-    $callee `(` $args `)` attr-dict `:` functional-type(operands, results)
+    $callee `(` $args `)` `sensitive` $sensitivityMask attr-dict `:` functional-type(operands, results)
   }];
 
   let extraClassDeclaration = [{
@@ -1178,6 +1194,7 @@ def ModelOp : ArcOp<"model", [
   }];
   let arguments = (ins SymbolNameAttr:$sym_name,
                        TypeAttrOf<ModuleType>:$io,
+                       OptionalAttr<UI32Attr>:$storageBytes,
                        OptionalAttr<FlatSymbolRefAttr>:$initialFn,
                        OptionalAttr<FlatSymbolRefAttr>:$finalFn,
                        OptionalAttr<TraceTapArrayAttr>:$traceTaps);
@@ -1185,6 +1202,7 @@ def ModelOp : ArcOp<"model", [
 
   let assemblyFormat = [{
     $sym_name `io` $io
+    (`storageBytes` $storageBytes^)?
     (`initializer` $initialFn^)?
     (`finalizer` $finalFn^)?
     (`traceTaps` $traceTaps^)?

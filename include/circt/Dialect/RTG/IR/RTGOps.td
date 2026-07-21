@@ -10,6 +10,9 @@
 //
 //===----------------------------------------------------------------------===//
 
+#ifndef CIRCT_DIALECT_RTG_IR_RTGOPS_TD
+#define CIRCT_DIALECT_RTG_IR_RTGOPS_TD
+
 include "mlir/IR/BuiltinTypes.td"
 include "mlir/IR/EnumAttr.td"
 include "mlir/IR/CommonTypeConstraints.td"
@@ -24,6 +27,9 @@ include "circt/Dialect/RTG/IR/RTGAttributes.td"
 include "circt/Dialect/RTG/IR/RTGInterfaces.td"
 include "circt/Dialect/RTG/IR/RTGISAAssemblyInterfaces.td"
 include "circt/Dialect/Emit/EmitOpInterfaces.td"
+include "circt/Dialect/RTG/IR/RTGDialect.td"
+include "circt/Dialect/RTG/IR/RTGTypes.td"
+include "circt/Dialect/RTG/IR/RTGAttributes.td"
 
 // Resource representing the RNG state. Operations that read from or write to
 // the RNG state should declare effects on this resource to prevent CSE and DCE.
@@ -223,7 +229,7 @@ def ImmediateFormatOp : RTGOp<"immediate_format", [Pure]> {
     The immediate is formatted as a decimal number.
   }];
 
-  let arguments = (ins ImmediateType:$value);
+  let arguments = (ins AnySignlessInteger:$value);
   let results = (outs StringType:$result);
 
   let assemblyFormat = "$value `:` qualified(type($value)) attr-dict";
@@ -280,6 +286,21 @@ def StringToLabelOp : RTGOp<"string_to_label", [Pure]> {
   let assemblyFormat = "$string attr-dict";
 
   let hasFolder = 1;
+}
+
+def StringToASCIIArrayOp : RTGOp<"string_to_ascii_array", [Pure]> {
+  let summary = "converts a string to an array of 8-bit ASCII immediates";
+  let description = [{
+    This operation decomposes a string into an array of 8-bit immediates, one
+    per byte, in the same order as the string. No NULL terminator is appended.
+  }];
+
+  let arguments = (ins StringType:$string);
+  let results = (outs ArrayTypeOf<I8>:$result);
+
+  let assemblyFormat = "$string `:` qualified(type($result)) attr-dict";
+
+  let hasCanonicalizeMethod = 1;
 }
 
 def LabelVisibilityAttr : I32EnumAttr<"LabelVisibility",
@@ -983,7 +1004,7 @@ def IntToImmediateOp : RTGISAOp<"int_to_immediate", [Pure]> {
   }];
 
   let arguments = (ins Index:$input);
-  let results = (outs ImmediateType:$result);
+  let results = (outs AnySignlessInteger:$result);
 
   let assemblyFormat = "$input `:` qualified(type($result)) attr-dict";
 }
@@ -999,8 +1020,8 @@ def ConcatImmediateOp : RTGISAOp<"concat_immediate", [
     becoming the most significant bits of the result.
   }];
 
-  let arguments = (ins Variadic<ImmediateType>:$operands);
-  let results = (outs ImmediateType:$result);
+  let arguments = (ins Variadic<AnySignlessInteger>:$operands);
+  let results = (outs AnySignlessInteger:$result);
 
   let assemblyFormat = "$operands `:` qualified(type($operands)) attr-dict";
 
@@ -1016,8 +1037,8 @@ def SliceImmediateOp : RTGISAOp<"slice_immediate", [Pure]> {
     immediate's width.
   }];
 
-  let arguments = (ins ImmediateType:$input, I32Attr:$lowBit);
-  let results = (outs ImmediateType:$result);
+  let arguments = (ins AnySignlessInteger:$input, I32Attr:$lowBit);
+  let results = (outs AnySignlessInteger:$result);
 
   let assemblyFormat = [{
     $input `from` $lowBit `:`
@@ -1140,7 +1161,7 @@ def MemoryBaseAddressOp : RTGISAOp<"memory_base_address", [
   }];
 
   let arguments = (ins MemoryType:$memory);
-  let results = (outs ImmediateType:$result);
+  let results = (outs AnySignlessInteger:$result);
 
   let assemblyFormat = "$memory `:` qualified(type($memory)) attr-dict";
 }
@@ -1192,3 +1213,5 @@ def SegmentOp : RTGISAOp<"segment", [
 
   let assemblyFormat = "$kind attr-dict-with-keyword $bodyRegion";
 }
+
+#endif // CIRCT_DIALECT_RTG_IR_RTGOPS_TD

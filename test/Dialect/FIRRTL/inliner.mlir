@@ -1585,7 +1585,8 @@ firrtl.circuit "FlattenAtRoot" {
   hw.hierpath private @nla [@Foo::@bar, @Bar::@b]
   // CHECK: firrtl.module @Bar
   firrtl.module @Bar() {
-    // CHECK: %b = firrtl.wire sym @b {annotations = [{class = "nla"}]}
+    // CHECK: %b = firrtl.wire sym @b
+    // CHECK-NOT: annotations
     %b = firrtl.wire sym @b {annotations = [{circt.nonlocal = @nla, class = "nla"}]} : !firrtl.uint<1>
   }
   // CHECK: firrtl.module @Foo
@@ -1666,5 +1667,51 @@ firrtl.circuit "Issue3374Derived" {
     firrtl.instance c @Foo()
     firrtl.instance d @Qux()
     firrtl.instance e @Quux()
+  }
+}
+
+// -----
+// https://github.com/llvm/circt/issues/10674
+//
+// Idempotent renames of inner symbols.
+// CHECK-LABEL: "Issue10674"
+firrtl.circuit "Issue10674" {
+  hw.hierpath private @nla [@Parent::@inst, @Child::@w]
+  firrtl.module private @Child() attributes {annotations = [{class = "firrtl.passes.InlineAnnotation"}]} {
+    // @Child persists, nothing annotated here (@nla is rooted at @Parent).
+    %w = firrtl.wire sym @w {annotations = [
+      {circt.nonlocal = @nla, class = "anno1"},
+      {circt.nonlocal = @nla, class = "anno2"}
+    ]} : !firrtl.uint<1>
+  }
+  // CHECK: firrtl.module @Parent
+  firrtl.module @Parent() {
+    // CHECK: %existing = firrtl.wire sym @w
+    %existing = firrtl.wire sym @w : !firrtl.uint<1>
+    // both annotations localized onto the inlined copy:
+    // CHECK: firrtl.wire sym @w_0 {annotations = [{class = "anno1"}, {class = "anno2"}]}
+    firrtl.instance inst sym @inst @Child()
+  }
+  firrtl.module @Issue10674() {
+    firrtl.instance p @Parent()
+  }
+}
+
+// -----
+// https://github.com/llvm/circt/issues/10682
+//
+// Single-element hierpath.
+// CHECK-LABEL: "Issue10682"
+firrtl.circuit "Issue10682" {
+  hw.hierpath private @nla [@M::@w]
+  // CHECK: firrtl.module @Issue10682
+  firrtl.module @Issue10682() {
+    firrtl.instance m @M()
+  }
+  // After inlining @M, the wire is moved into @Issue10682 and localized:
+  // CHECK-NEXT: firrtl.wire sym @w {annotations = [{class = "test"}]}
+  // CHECK-NOT: circt.nonlocal
+  firrtl.module private @M() attributes {annotations = [{class = "firrtl.passes.InlineAnnotation"}]} {
+    %w = firrtl.wire sym @w {annotations = [{circt.nonlocal = @nla, class = "test"}]} : !firrtl.uint<1>
   }
 }

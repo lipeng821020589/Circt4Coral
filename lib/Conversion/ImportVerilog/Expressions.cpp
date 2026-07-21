@@ -62,11 +62,8 @@ static Value coerceToBuiltinInt(OpBuilder &builder, Location loc, Value value,
   return builder.createOrFold<moore::ToBuiltinIntOp>(loc, value);
 }
 
-/// Map an index into an array, with bounds `range`, to a bit offset of the
-/// underlying bit storage. This is a dynamic version of
-/// `slang::ConstantRange::translateIndex`.
-static Value getSelectIndex(Context &context, Location loc, Value index,
-                            const slang::ConstantRange &range) {
+Value ImportVerilog::getSelectIndex(Context &context, Location loc, Value index,
+                                    const slang::ConstantRange &range) {
   auto &builder = context.builder;
   auto indexType = cast<moore::UnpackedType>(index.getType());
 
@@ -1003,12 +1000,22 @@ struct RvalueExprVisitor : public ExprVisitor {
       }
     }
 
-    // For cross-instance hierarchical references, use the instance-aware
-    // hierValueSymbols lookup first. This is required for multi-instance
-    // deduplication where Slang shares the same ValueSymbol* across instances
-    // (e.g., p1.child.child_val and p2.child.child_val may point to the same
-    // ValueSymbol). The scoped valueSymbols lookup would return the wrong
-    // (first-inserted) value in that case.
+    // Inside a function body, a captured symbol must resolve to the capture
+    // argument to respect region isolation.
+    if (auto value = context.resolveCapturedValue(expr.symbol)) {
+      if (isa<moore::RefType>(value.getType())) {
+        auto readOp = moore::ReadOp::create(builder, hierLoc, value);
+        if (context.rvalueReadCallback)
+          context.rvalueReadCallback(readOp);
+        value = readOp.getResult();
+      }
+      return value;
+    }
+
+    // For cross-instance hierarchical references, prefer the isntance-aware
+    // hierValueSymbols lookup. Sibling instances elaborate distinct symbol
+    // objects for the same logical variable, and this map keeps p1 vs p2
+    // resolutions separate where the scoped table could conflate them.
     if (auto key = context.buildHierValueKey(expr)) {
       if (auto it = context.hierValueSymbols.find(*key);
           it != context.hierValueSymbols.end()) {
@@ -1044,8 +1051,27 @@ struct RvalueExprVisitor : public ExprVisitor {
       return value;
     }
 
-    // Try to materialize constant values directly.
-    auto constant = context.evaluateConstant(expr);
+    /// Materialize compile-time constants directly from the symbol: the
+    /// generic evaluateConstant refuses hierarchical references unless slang's
+    /// AllowHierarchicalConst flag is set, which CIRCT does not use.
+    slang::ConstantValue constant;
+    switch (expr.symbol.kind) {
+    case slang::ast::SymbolKind::Parameter:
+      constant = expr.symbol.as<slang::ast::ParameterSymbol>().getValue(
+          expr.sourceRange);
+      break;
+    case slang::ast::SymbolKind::Specparam:
+      constant = expr.symbol.as<slang::ast::SpecparamSymbol>().getValue(
+          expr.sourceRange);
+      break;
+    case slang::ast::SymbolKind::EnumValue:
+      constant = expr.symbol.as<slang::ast::EnumValueSymbol>().getValue(
+          expr.sourceRange);
+      break;
+    default:
+      constant = context.evaluateConstant(expr);
+      break;
+    }
     if (auto value = context.materializeConstant(constant, *expr.type, loc))
       return value;
 
@@ -1469,8 +1495,12 @@ struct RvalueExprVisitor : public ExprVisitor {
     case BinaryOperator::LogicalAnd:
     case BinaryOperator::LogicalOr:
     case BinaryOperator::LogicalImplication:
-    case BinaryOperator::LogicalEquivalence:
-      return buildLogicalBOp(expr.op, lhs, rhs);
+    case BinaryOperator::LogicalEquivalence: {
+      Domain domain = Domain::TwoValued;
+      if (expr.left().type->isFourState() || expr.right().type->isFourState())
+        domain = Domain::FourValued;
+      return buildLogicalBOp(expr.op, lhs, rhs, domain);
+    }
 
     default:
       mlir::emitError(loc) << "Binary operator "
@@ -2086,8 +2116,7 @@ struct RvalueExprVisitor : public ExprVisitor {
     auto nameId = subroutine.knownNameId;
 
     // $rose, $fell, $stable, $changed, $past, and $sampled are only valid in
-    // the context of properties and assertions. Those are treated in the
-    // LTLDialect; treat them there instead.
+    // the contexts with clocks. Those are treated in AssertionExpr.
     switch (nameId) {
     case ksn::Rose:
     case ksn::Fell:
@@ -2095,7 +2124,7 @@ struct RvalueExprVisitor : public ExprVisitor {
     case ksn::Changed:
     case ksn::Past:
     case ksn::Sampled:
-      return context.convertAssertionCallExpression(expr, info, loc);
+      return context.convertSampledValueCallExpression(expr, info, loc);
     default:
       break;
     }
@@ -2574,8 +2603,12 @@ struct LvalueExprVisitor : public ExprVisitor {
       }
     }
 
+    // Same capture priority as the rvalue visitor.
+    if (auto value = context.resolveCapturedValue(expr.symbol))
+      return value;
+
     // For cross-instance hierarchical references, use the instance-aware
-    // hierValueSymbols lookup first (same priority and rationale as rvalue
+    // hierValueSymbols lookup (same priority and rationale as rvalue
     // visitor).
     if (auto key = context.buildHierValueKey(expr)) {
       if (auto it = context.hierValueSymbols.find(*key);
@@ -2690,6 +2723,14 @@ struct LvalueExprVisitor : public ExprVisitor {
 // Hierarchical Name Helpers
 //===----------------------------------------------------------------------===//
 
+Value Context::resolveCapturedValue(const slang::ast::ValueSymbol &sym) {
+  if (!currentFunctionLowering)
+    return {};
+  if (!llvm::is_contained(currentFunctionLowering->capturedSymbols, &sym))
+    return {};
+  return valueSymbols.lookup(&sym);
+}
+
 std::optional<std::pair<const slang::ast::InstanceSymbol *, mlir::StringAttr>>
 Context::buildHierValueKey(
     const slang::ast::HierarchicalValueExpression &expr) {
@@ -2775,20 +2816,14 @@ Value Context::materializeSVReal(const slang::ConstantValue &svreal,
 Value Context::materializeString(const slang::ConstantValue &stringLiteral,
                                  const slang::ast::Type &astType,
                                  Location loc) {
-  slang::ConstantValue intVal = stringLiteral.convertToInt();
-  auto effectiveWidth = intVal.getEffectiveWidth();
-  if (!effectiveWidth)
+  if (!astType.isString())
     return {};
-
-  auto intTy = moore::IntType::getInt(getContext(), effectiveWidth.value());
-
-  if (astType.isString()) {
-    auto immInt = moore::ConstantStringOp::create(builder, loc, intTy,
-                                                  stringLiteral.toString())
-                      .getResult();
-    return moore::IntToStringOp::create(builder, loc, immInt).getResult();
-  }
-  return {};
+  const std::string &str = stringLiteral.str();
+  auto intTy = moore::IntType::getInt(getContext(),
+                                      static_cast<unsigned>(str.size() * 8));
+  auto immInt =
+      moore::ConstantStringOp::create(builder, loc, intTy, str).getResult();
+  return moore::IntToStringOp::create(builder, loc, immInt).getResult();
 }
 
 /// Materialize a Slang integer literal as a constant op.
@@ -2938,15 +2973,11 @@ Value Context::convertToSimpleBitVector(Value value) {
   return {};
 }
 
-/// Create the necessary operations to convert from a `PackedType` to the
-/// corresponding simple bit vector `IntType`. This will apply special handling
-/// to time values, which requires scaling by the local timescale.
-static Value materializePackedToSBVConversion(Context &context, Value value,
-                                              Location loc, bool fallible) {
+Value Context::materializePackedToSBVConversion(Value value, Location loc,
+                                                bool fallible) {
   if (isa<moore::IntType>(value.getType()))
     return value;
 
-  auto &builder = context.builder;
   auto packedType = cast<moore::PackedType>(value.getType());
   auto intType = packedType.getSimpleBitVector();
   assert(intType);
@@ -2957,7 +2988,7 @@ static Value materializePackedToSBVConversion(Context &context, Value value,
       moore::isIntType(intType, 64, moore::Domain::FourValued)) {
     value = builder.createOrFold<moore::TimeToLogicOp>(loc, value);
     auto scale = moore::ConstantOp::create(builder, loc, intType,
-                                           getTimeScaleInFemtoseconds(context));
+                                           getTimeScaleInFemtoseconds(*this));
     return builder.createOrFold<moore::DivUOp>(loc, value, scale);
   }
 
@@ -3063,7 +3094,7 @@ Value Context::materializeConversion(Type type, Value value, bool isSigned,
 
   if (dstInt && srcInt) {
     // Convert the value to a simple bit vector if it isn't one already.
-    value = materializePackedToSBVConversion(*this, value, loc, fallible);
+    value = materializePackedToSBVConversion(value, loc, fallible);
     if (!value)
       return {};
 
@@ -3364,7 +3395,7 @@ Value Context::convertSystemCall(
         mlir::emitError(loc) << "expected integer argument for `$isunknown`";
         return {};
       }
-      value = materializePackedToSBVConversion(*this, value, loc,
+      value = materializePackedToSBVConversion(value, loc,
                                                /*fallible=*/false);
       if (!value)
         return {};
@@ -3384,7 +3415,7 @@ Value Context::convertSystemCall(
             << "expected integer argument for `$onehot`/`$onehot0`";
         return {};
       }
-      value = materializePackedToSBVConversion(*this, value, loc,
+      value = materializePackedToSBVConversion(value, loc,
                                                /*fallible=*/false);
       if (!value)
         return {};
@@ -3445,7 +3476,7 @@ Value Context::convertSystemCall(
         mlir::emitError(loc) << "expected integer argument for `$countones`";
         return {};
       }
-      value = materializePackedToSBVConversion(*this, value, loc,
+      value = materializePackedToSBVConversion(value, loc,
                                                /*fallible=*/false);
       if (!value)
         return {};
@@ -3521,9 +3552,31 @@ Value Context::convertSystemCall(
   if (nameId == ksn::Atanh)
     return convertRealMathBI<moore::AtanhBIOp>(*this, loc, name, args);
 
+  if (nameId == ksn::Pow) {
+    assert(numArgs == 2 && "`$pow` takes 2 arguments");
+    auto realType = moore::RealType::get(getContext(), moore::RealWidth::f64);
+    auto lhs = convertRvalueExpression(*args[0], realType);
+    auto rhs = convertRvalueExpression(*args[1], realType);
+    if (!lhs || !rhs)
+      return {};
+    return moore::PowRealOp::create(builder, loc, lhs, rhs);
+  }
+
   //===--------------------------------------------------------------------===//
   // Type Conversion System Functions
   //===--------------------------------------------------------------------===//
+
+  if (nameId == ksn::Itor) {
+    assert(numArgs == 1 && "`$itor` takes 1 argument");
+    auto realType = moore::RealType::get(getContext(), moore::RealWidth::f64);
+    return convertRvalueExpression(*args[0], realType);
+  }
+
+  if (nameId == ksn::Rtoi) {
+    assert(numArgs == 1 && "`$rtoi` takes 1 argument");
+    auto intType = moore::IntType::get(getContext(), 32, Domain::TwoValued);
+    return convertRvalueExpression(*args[0], intType);
+  }
 
   if (nameId == ksn::Signed || nameId == ksn::Unsigned) {
     // Slang already checks the arity of `$signed`/`$unsigned`.

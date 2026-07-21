@@ -813,29 +813,40 @@ hw.module @TestSimToArcTerminateFailure(in %clock: !seq.clock, in %cond: i1) {
   sim.clocked_terminate %clock, %cond, failure, verbose
 }
 
-// CHECK-LABEL: arc.model @CoroutineInstance
-hw.module @CoroutineInstance(in %in: i42, out o: i42) {
+// CHECK-LABEL: arc.model @CoroutineSensitiveInstance
+hw.module @CoroutineSensitiveInstance(in %in: i42, out o: i42) {
   // CHECK-DAG: [[PC:%.+]] = arc.alloc_state %arg0 : (!arc.storage) -> !arc.state<!arc.coroutine_pc<@DummyCoroutine>>
   // CHECK-DAG: [[STATE:%.+]] = arc.alloc_state %arg0 : (!arc.storage) -> !arc.state<!arc.coroutine_state<@DummyCoroutine>>
   // CHECK-DAG: [[WAKEUP:%.+]] = arc.alloc_state %arg0 : (!arc.storage) -> !arc.state<i64>
   // CHECK-DAG: [[RESULT:%.+]] = arc.alloc_state %arg0 : (!arc.storage) -> !arc.state<i42>
+  // CHECK-DAG: [[MASK:%.+]] = arc.alloc_state %arg0 : (!arc.storage) -> !arc.state<i1>
+  // CHECK-DAG: [[PREV:%.+]] = arc.alloc_state %arg0 : (!arc.storage) -> !arc.state<i42>
 
   // CHECK: [[ARG:%.+]] = arc.state_read %in_in : <i42>
+  // CHECK: [[MASKVAL:%.+]] = arc.state_read [[MASK]] : <i1>
+  // CHECK: [[PREVVAL:%.+]] = arc.state_read [[PREV]] : <i42>
+  // CHECK: arc.state_write [[PREV]] = [[ARG]] : <i42>
+  // CHECK: [[CHANGED:%.+]] = comb.icmp ne [[ARG]], [[PREVVAL]] : i42
+  // CHECK: [[BIT:%.+]] = comb.extract [[MASKVAL]] from 0 : (i1) -> i1
+  // CHECK: [[MASKED:%.+]] = comb.and [[CHANGED]], [[BIT]] : i1
+  // CHECK: [[ANYCHANGE:%.+]] = comb.or {{%.+}}, [[MASKED]] : i1
   // CHECK: [[NOW:%.+]] = arc.current_time %arg0 : !arc.storage
   // CHECK: [[WK:%.+]] = arc.state_read [[WAKEUP]] : <i64>
-  // CHECK: [[READY:%.+]] = comb.icmp uge [[NOW]], [[WK]] : i64
+  // CHECK: [[TIMEREADY:%.+]] = comb.icmp uge [[NOW]], [[WK]] : i64
+  // CHECK: [[READY:%.+]] = comb.or [[TIMEREADY]], [[ANYCHANGE]] : i1
   // CHECK: scf.if [[READY]] {
   // CHECK:   [[OLDSTATE:%.+]] = arc.state_read [[STATE]] : <!arc.coroutine_state<@DummyCoroutine>>
   // CHECK:   [[OLDPC:%.+]] = arc.state_read [[PC]] : <!arc.coroutine_pc<@DummyCoroutine>>
-  // CHECK:   [[RS:%.+]], [[RPC:%.+]], [[RES:%.+]]:2 = arc.coroutine.call @DummyCoroutine([[OLDSTATE]], [[OLDPC]], [[ARG]])
+  // CHECK:   [[RS:%.+]], [[RPC:%.+]], [[RES:%.+]]:3 = arc.coroutine.call @DummyCoroutine([[OLDSTATE]], [[OLDPC]], [[ARG]])
   // CHECK:   [[ISHALT:%.+]] = arc.coroutine.pc_is_halt [[RPC]]
   // CHECK:   [[ISRET:%.+]] = arc.coroutine.pc_is_return [[RPC]]
   // CHECK:   [[DONE:%.+]] = comb.or [[ISHALT]], [[ISRET]] : i1
   // CHECK:   [[NEVER:%.+]] = hw.constant -1 : i64
-  // CHECK:   [[WKEFF:%.+]] = comb.mux [[DONE]], [[NEVER]], [[RES]]#1 : i64
+  // CHECK:   [[WKEFF:%.+]] = comb.mux [[DONE]], [[NEVER]], [[RES]]#2 : i64
   // CHECK:   arc.state_write [[STATE]] = [[RS]] : <!arc.coroutine_state<@DummyCoroutine>>
   // CHECK:   arc.state_write [[PC]] = [[RPC]] : <!arc.coroutine_pc<@DummyCoroutine>>
   // CHECK:   arc.state_write [[WAKEUP]] = [[WKEFF]] : <i64>
+  // CHECK:   arc.state_write [[MASK]] = [[RES]]#1 : <i1>
   // CHECK:   arc.state_write [[RESULT]] = [[RES]]#0 : <i42>
   // CHECK: }
 
@@ -843,7 +854,7 @@ hw.module @CoroutineInstance(in %in: i42, out o: i42) {
   // CHECK: [[NEXT:%.+]] = arc.get_next_wakeup %arg0 : !arc.storage
   // CHECK: [[MIN:%.+]] = arith.minui [[CUR]], [[NEXT]] : i64
   // CHECK: arc.set_next_wakeup %arg0, [[MIN]] : !arc.storage
-  %0 = arc.coroutine.instance @DummyCoroutine(%in) : (i42) -> i42
+  %0 = arc.coroutine.instance @DummyCoroutine(%in) sensitive [true] : (i42) -> i42
 
   // CHECK: [[OUT:%.+]] = arc.state_read [[RESULT]] : <i42>
   // CHECK: func.call @ConsumeI42([[OUT]])
@@ -854,7 +865,26 @@ hw.module @CoroutineInstance(in %in: i42, out o: i42) {
   hw.output %0 : i42
 }
 
-arc.coroutine.define @DummyCoroutine(%arg: i42) -> (i42, i64) {
+// CHECK-LABEL: arc.model @CoroutineInsensitiveInstance
+hw.module @CoroutineInsensitiveInstance(in %in: i42, out o: i42) {
+  // Allocate i42 result but not previous value
+  // CHECK:     arc.alloc_state %arg0 : (!arc.storage) -> !arc.state<i42>
+  // CHECK-NOT: arc.alloc_state %arg0 : (!arc.storage) -> !arc.state<i42>
+
+  // CHECK: [[FALSE:%.+]] = hw.constant false
+  // CHECK: [[READY:%.+]] = comb.or %{{.+}}, [[FALSE]] : i1
+  // CHECK: scf.if [[READY]] {
+  // CHECK:   arc.coroutine.call @DummyCoroutine
+  // CHECK: }
+
+  %0 = arc.coroutine.instance @DummyCoroutine(%in) sensitive [false] : (i42) -> i42
+
+  func.call @ConsumeI42(%0) : (i42) -> ()
+  hw.output %0 : i42
+}
+
+arc.coroutine.define @DummyCoroutine(%arg: i42) -> (i42, i1, i64) {
+  %false = hw.constant 0 : i1
   %never = hw.constant -1 : i64
-  arc.coroutine.halt %arg, %never : i42, i64
+  arc.coroutine.halt %arg, %false, %never : i42, i1, i64
 }

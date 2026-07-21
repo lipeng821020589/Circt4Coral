@@ -91,10 +91,6 @@ class MutableNLA {
   /// migrates to each instantiator of the original NLA.
   SmallVector<InnerRefAttr> newTops;
 
-  /// Cache of roots that this module participates in.  This is only valid when
-  /// newTops is non-empty.
-  DenseSet<StringAttr> rootSet;
-
   /// Stores the size of the NLA path.
   unsigned int size;
 
@@ -174,14 +170,14 @@ public:
       // Root of the namepath. If the next module has been inlined, set lastMod
       // to root and skip adding to the namepath. Otherwise, add the root with
       // its inner ref.
-      if (!inlinedSymbols.test(1)) {
+      if (inlinedSymbols.size() == 1 || !inlinedSymbols.test(1)) {
         lastMod = root;
       } else {
         namepath.push_back(InnerRefAttr::get(root, lookupRename(root)));
       }
 
       // Everything in the middle of the namepath (excluding the root and leaf).
-      for (signed i = 1, e = inlinedSymbols.size() - 1; i != e; ++i) {
+      for (signed i = 1, e = inlinedSymbols.size() - 1; i < e; ++i) {
         if (!inlinedSymbols.test(i + 1)) {
           if (!lastMod)
             lastMod = nla.modPart(i);
@@ -260,7 +256,7 @@ public:
       // Root of the namepath. If the next module has been inlined, set lastMod
       // to root and skip adding to the output. Otherwise, write the root with
       // its inner ref.
-      if (!x.inlinedSymbols.test(1)) {
+      if (x.inlinedSymbols.size() == 1 || !x.inlinedSymbols.test(1)) {
         lastMod = root;
       } else {
         writePathSegment(root, x.lookupRename(root));
@@ -268,7 +264,7 @@ public:
       }
 
       // Everything in the middle of the namepath (excluding the root and leaf).
-      for (signed i = 1, e = x.inlinedSymbols.size() - 1; i != e; ++i) {
+      for (signed i = 1, e = x.inlinedSymbols.size() - 1; i < e; ++i) {
         if (!x.inlinedSymbols.test(i + 1)) {
           if (!lastMod)
             lastMod = x.nla.modPart(i);
@@ -330,15 +326,12 @@ public:
     return inlinedSymbols.find_first_in(1, inlinedSymbols.size()) == -1;
   }
 
-  /// Return true if this NLA has a root that originates from a specific module.
-  bool hasRoot(FModuleLike mod) {
-    return (isDead() && nla.root() == mod.getModuleNameAttr()) ||
-           rootSet.contains(mod.getModuleNameAttr());
-  }
+  /// Return true if either this NLA is rooted at modName, or is retoped to it.
+  bool hasRoot(FModuleLike mod) { return hasRoot(mod.getModuleNameAttr()); }
 
   /// Return true if either this NLA is rooted at modName, or is retoped to it.
   bool hasRoot(StringAttr modName) {
-    return (nla.root() == modName) || rootSet.contains(modName);
+    return symIdx.lookup_or(modName, -1) == 0;
   }
 
   /// Mark a module as inlined.  This will remove it from the NLA.
@@ -376,7 +369,6 @@ public:
       sym = StringAttr::get(nla.getContext(),
                             circuitNamespace->newName(sym.getValue()));
     newTops.push_back(InnerRefAttr::get(module.getNameAttr(), sym));
-    rootSet.insert(module.getNameAttr());
     symIdx.insert({module.getNameAttr(), 0});
     markDead();
     return sym;
@@ -386,8 +378,11 @@ public:
 
   void setInnerSym(Attribute module, StringAttr innerSym) {
     assert(symIdx.count(module) && "Mutable NLA did not contain symbol");
-    assert(!renames.count(module) && "Module already renamed");
-    renames.insert({module, innerSym});
+    // Idempotent: a module may be renamed more than once in the same context
+    // (e.g., one wire carrying two annotations that reference the same NLA).
+    // Allow this as long as its the /same/ symbol.
+    [[maybe_unused]] auto [it, inserted] = renames.insert({module, innerSym});
+    assert((inserted || it->second == innerSym) && "Conflicting rename");
   }
 };
 } // namespace
@@ -1590,12 +1585,16 @@ LogicalResult Inliner::run() {
         if (mnla.isDead())
           return true;
 
-        // If the NLA becomes local after mutation (or sometimes an NLA is
-        // annotated even when the annotation is local in the first place),
-        // remove the nonlocal field.
+        // If the NLA has become local:
+        //  - if it is rooted at this module, replace it with a local version
+        //    of the annotation (drop the nonlocal field);
+        //  - otherwise it is local elsewhere but not here (this module needed
+        //    the NLA to selectively enable it), so just drop the annotation.
         if (mnla.isLocal()) {
-          anno.removeMember("circt.nonlocal");
-          newAnnotations.push_back(anno.getAttr());
+          if (mnla.hasRoot(fmodule)) {
+            anno.removeMember("circt.nonlocal");
+            newAnnotations.push_back(anno.getAttr());
+          }
           return true;
         }
 

@@ -55,13 +55,13 @@ arc.define @LookupTable(%arg0: i32, %arg1: i8) -> () {
 }
 
 // CHECK-LABEL: func.func @StorageAccess
-func.func @StorageAccess(%arg0: !arc.storage<10000>) {
-  // CHECK-NEXT: arc.storage.get %arg0[42] : !arc.storage<10000> -> !arc.state<i9>
-  // CHECK-NEXT: arc.storage.get %arg0[1337] : !arc.storage<10000> -> !arc.memory<4 x i19, i32>
-  // CHECK-NEXT: arc.storage.get %arg0[9001] : !arc.storage<10000> -> !arc.storage<123>
-  %0 = arc.storage.get %arg0[42] : !arc.storage<10000> -> !arc.state<i9>
-  %1 = arc.storage.get %arg0[1337] : !arc.storage<10000> -> !arc.memory<4 x i19, i32>
-  %2 = arc.storage.get %arg0[9001] : !arc.storage<10000> -> !arc.storage<123>
+func.func @StorageAccess(%arg0: !arc.storage) {
+  // CHECK-NEXT: arc.storage.get %arg0[42] : !arc.storage -> !arc.state<i9>
+  // CHECK-NEXT: arc.storage.get %arg0[1337] : !arc.storage -> !arc.memory<4 x i19, i32>
+  // CHECK-NEXT: arc.storage.get %arg0[9001] : !arc.storage -> !arc.storage
+  %0 = arc.storage.get %arg0[42] : !arc.storage -> !arc.state<i9>
+  %1 = arc.storage.get %arg0[1337] : !arc.storage -> !arc.memory<4 x i19, i32>
+  %2 = arc.storage.get %arg0[9001] : !arc.storage -> !arc.storage
   return
 }
 
@@ -348,18 +348,18 @@ func.func @Execute(%arg0: i42) {
 }
 
 // CHECK-LABEL: func.func @CurrentTime
-func.func @CurrentTime(%arg0: !arc.storage<100>) {
-  // CHECK-NEXT: arc.current_time %arg0 : !arc.storage<100>
-  %0 = arc.current_time %arg0 : !arc.storage<100>
+func.func @CurrentTime(%arg0: !arc.storage) {
+  // CHECK-NEXT: arc.current_time %arg0 : !arc.storage
+  %0 = arc.current_time %arg0 : !arc.storage
   return
 }
 
 // CHECK-LABEL: func.func @NextWakeup
-func.func @NextWakeup(%arg0: !arc.storage<100>, %arg1: i64) {
-  // CHECK-NEXT: arc.get_next_wakeup %arg0 : !arc.storage<100>
-  %0 = arc.get_next_wakeup %arg0 : !arc.storage<100>
-  // CHECK-NEXT: arc.set_next_wakeup %arg0, %arg1 : !arc.storage<100>
-  arc.set_next_wakeup %arg0, %arg1 : !arc.storage<100>
+func.func @NextWakeup(%arg0: !arc.storage, %arg1: i64) {
+  // CHECK-NEXT: arc.get_next_wakeup %arg0 : !arc.storage
+  %0 = arc.get_next_wakeup %arg0 : !arc.storage
+  // CHECK-NEXT: arc.set_next_wakeup %arg0, %arg1 : !arc.storage
+  arc.set_next_wakeup %arg0, %arg1 : !arc.storage
   return
 }
 
@@ -443,12 +443,15 @@ arc.coroutine.start_pc : !arc.coroutine_pc<@CoroutineEmpty>
 
 // CHECK-LABEL: hw.module @CoroutineInstanceA
 hw.module @CoroutineInstanceA(in %a: i42, out z: i9001) {
-  // CHECK: arc.coroutine.instance @CoroutineInstanceB(%a) : (i42) -> i9001
-  %0 = arc.coroutine.instance @CoroutineInstanceB(%a) : (i42) -> i9001
+  // CHECK: arc.coroutine.instance @CoroutineInstanceB(%a) sensitive [false] : (i42) -> i9001
+  %0 = arc.coroutine.instance @CoroutineInstanceB(%a) sensitive [false] : (i42) -> i9001
   hw.output %0 : i9001
 }
-arc.coroutine.define @CoroutineInstanceB(%arg0: i42) -> (i9001, i64) {
+// The coroutine produces its result, then an observe bitmask (one bit per
+// argument), then the wakeup time; the instance exposes only the result.
+arc.coroutine.define @CoroutineInstanceB(%arg0: i42) -> (i9001, i1, i64) {
   %c0_i9001 = hw.constant 0 : i9001
+  %c0_i1 = hw.constant 0 : i1
   %c0_i64 = hw.constant 0 : i64
-  arc.coroutine.halt %c0_i9001, %c0_i64 : i9001, i64
+  arc.coroutine.halt %c0_i9001, %c0_i1, %c0_i64 : i9001, i1, i64
 }
