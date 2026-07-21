@@ -1222,6 +1222,9 @@ struct TosaMatMulLowering : public mlir::OpRewritePattern<mlir::tosa::MatMulOp> 
       } else {
         // i32/f32 GEMV: per-output-channel vle+vmul+vredsum (dot product).
         // B layout assumed [N, K] (output-channel first, transposed weight).
+        // Derive base addresses from operands so chained ops work correctly.
+        int64_t aBase = resolveInputBaseAddr(op.getOperand(0));
+        int64_t bBase = resolveInputBaseAddr(op.getOperand(1));
         rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
         unsigned vCap = vregCapacity(SEW::E32); // 4 elements per vreg tile
         int64_t kTilesF = ceilDiv(K, (int64_t)vCap);
@@ -1229,15 +1232,15 @@ struct TosaMatMulLowering : public mlir::OpRewritePattern<mlir::tosa::MatMulOp> 
           mlir::Value acc = createI32Const(loc, 0, rewriter);
           for (int64_t kt = 0; kt < kTilesF; ++kt) {
             int64_t kElem = std::min((int64_t)vCap, K - kt * (int64_t)vCap);
-            // Load input tile a[0, kt*vCap .. kt*vCap+kElem-1] from slot 0.
-            int64_t aAddr = kTcmBase + 0 * kTcmSlot + kt * kTileBytes;
+            // Load input tile a[0, kt*vCap .. kt*vCap+kElem-1].
+            int64_t aAddr = aBase + kt * kTileBytes;
             auto aAddrV = createI32Const(loc, (int32_t)aAddr, rewriter);
             auto kElemV = createI32Const(loc, (int32_t)kElem, rewriter);
             auto aTile = rewriter.create<VLE32Op>(
                 loc, vregE32(loc.getContext()), aAddrV, kElemV);
-            // Load weight tile b[ni, kt*vCap .. kt*vCap+kElem-1] from slot 1.
-            // Assumes B stored row-major with output-channel as row (transposed).
-            int64_t bAddr = kTcmBase + 1 * kTcmSlot + (ni * K + kt * (int64_t)vCap) * 4;
+            // Load weight tile b[ni, kt*vCap .. kt*vCap+kElem-1].
+            // B stored [N, K] row-major (output-channel first).
+            int64_t bAddr = bBase + (ni * K + kt * (int64_t)vCap) * 4;
             auto bAddrV = createI32Const(loc, (int32_t)bAddr, rewriter);
             auto bTile = rewriter.create<VLE32Op>(
                 loc, vregE32(loc.getContext()), bAddrV, kElemV);
