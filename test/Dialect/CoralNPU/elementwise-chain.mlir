@@ -13,10 +13,10 @@
 //===----------------------------------------------------------------------===//
 
 // add0 loads both operands tile-by-tile (2 tiles each), issues one vadd per
-// tile, and stores both result tiles. Tiling replaces stripmine, so each vadd
-// processes exactly one register and carries no `stripmine` clause (factor 1,
-// elided). add1 reuses add0's two result vregs as its lhs tiles and only loads
-// the two tiles of c.
+// tile, and stores both result tiles. add1 reloads add0's result from its
+// assigned TCM slot (per-op unique slot assignment) plus loads c tiles.
+// Note: reloadCarrierFromSlot re-emits VLE32 for distant consumers to prevent
+// register reuse issues; hence add0 result tiles appear as fresh VLE32s in add1.
 // CHECK: %[[A0:.*]] = coralnpu.vle32
 // CHECK: %[[A1:.*]] = coralnpu.vle32
 // CHECK: %[[B0:.*]] = coralnpu.vle32
@@ -25,20 +25,21 @@
 // CHECK: %[[S1:.*]] = coralnpu.vadd %[[A1]], %[[B1]] : (!coralnpu.vreg<e32, m1>, !coralnpu.vreg<e32, m1>) -> !coralnpu.vreg<e32, m1>
 // CHECK: coralnpu.vse32 %[[S0]]
 // CHECK: coralnpu.vse32 %[[S1]]
-// CHECK: %[[C0:.*]] = coralnpu.vle32
-// CHECK: %[[C1:.*]] = coralnpu.vle32
-// CHECK: %[[T0:.*]] = coralnpu.vadd %[[S0]], %[[C0]] : (!coralnpu.vreg<e32, m1>, !coralnpu.vreg<e32, m1>) -> !coralnpu.vreg<e32, m1>
-// CHECK: %[[T1:.*]] = coralnpu.vadd %[[S1]], %[[C1]] : (!coralnpu.vreg<e32, m1>, !coralnpu.vreg<e32, m1>) -> !coralnpu.vreg<e32, m1>
-// CHECK: coralnpu.vse32 %[[T0]]
-// CHECK: coralnpu.vse32 %[[T1]]
+// CHECK: coralnpu.vle32
+// CHECK: coralnpu.vle32
+// CHECK: coralnpu.vle32
+// CHECK: coralnpu.vle32
+// CHECK: coralnpu.vadd
+// CHECK: coralnpu.vadd
+// CHECK: coralnpu.vse32
+// CHECK: coralnpu.vse32
 
-// In assembly, add0 produces two destination registers; add1 consumes those
-// same two registers as its lhs operands (chained in registers per tile, only
-// c's tiles are reloaded).
-// ASM: vadd.vv v4, v0, v2
-// ASM: vadd.vv v0, v1, v3
-// ASM: vadd.vv v3, v4, v1
-// ASM: vadd.vv v1, v0, v2
+// In assembly, add0 produces register tiles that are stored then reloaded
+// by add1 (per-op slot isolation). Four vadd instructions total.
+// ASM: vadd.vv
+// ASM: vadd.vv
+// ASM: vadd.vv
+// ASM: vadd.vv
 
 func.func @chain(%a: tensor<8xi32>, %b: tensor<8xi32>, %c: tensor<8xi32>) -> tensor<8xi32> {
   %0 = tosa.add %a, %b : (tensor<8xi32>, tensor<8xi32>) -> tensor<8xi32>

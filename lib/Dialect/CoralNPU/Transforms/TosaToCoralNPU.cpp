@@ -259,23 +259,27 @@ static int64_t tileElems(int64_t i, int64_t k, int64_t nElems, SEW sew) {
 static llvm::SmallVector<mlir::Value>
 getTiles(mlir::Value operand, SEW sew, mlir::PatternRewriter &rewriter,
          mlir::Location loc) {
-  // tensor.from_elements: each element is a VLE32 result. Re-emit the VLE32
-  // instructions from the same addresses rather than returning the original
-  // SSA values, which may have had their physical registers reused by the time
-  // the consumer executes (register liveness issue for long-lived carriers).
+  // tensor.from_elements: each element is a VLE32 or compute (VMul/VAdd) result.
+  // For "reload carriers" (VLE32 with constant ScalarLiOp address — produced by
+  // carrierForOp/reloadCarrierFromSlot), re-emit a fresh VLE32 so that the
+  // consumer gets a live register, not one that was reused by intervening ops.
+  // For "register chain carriers" (VLE32 from BlockArg slot, or VMul/VAdd SSA
+  // values produced within the same computation), return as-is.
   if (auto fe = operand.getDefiningOp<mlir::tensor::FromElementsOp>()) {
-    llvm::SmallVector<mlir::Value> freshTiles;
+    llvm::SmallVector<mlir::Value> tiles;
     for (auto elem : fe.getElements()) {
       if (auto vle = elem.getDefiningOp<VLE32Op>()) {
-        // Re-emit VLE32 with the same address and n operands.
-        freshTiles.push_back(rewriter.create<VLE32Op>(
-            loc, vle.getType(), vle.getOperand(0), vle.getOperand(1)));
-      } else {
-        // Not a VLE32 (e.g. VMul/VAdd result): return as-is (short-lived).
-        freshTiles.push_back(elem);
+        // Re-emit only if address is a ScalarLiOp constant (= reload from slot).
+        // BlockArg-derived VLE32s use a computed address (lui+addi), not LiOp.
+        if (vle.getOperand(0).getDefiningOp<ScalarLiOp>()) {
+          tiles.push_back(rewriter.create<VLE32Op>(
+              loc, vle.getType(), vle.getOperand(0), vle.getOperand(1)));
+          continue;
+        }
       }
+      tiles.push_back(elem); // compute result or BlockArg VLE32: return as-is
     }
-    return freshTiles;
+    return tiles;
   }
 
   // tensor.splat(scalar) is the single-tile carrier produced by scalar
