@@ -2916,6 +2916,53 @@ func.func @gemv_int8(%a: tensor<1x1x8xi8>, %b: tensor<1x8x8xi8>,
         if elf_path.exists(): elf_path.unlink()
 
 
+# ── TEST 43: Broadcast mul — tosa.mul(tensor<Nxi32>, tensor<1xi32>) ───────────
+
+def test_broadcast_mul_e2e():
+    print("\n=== TEST 43: Broadcast mul x[4] * scalar[1] = x*2 (RMSNorm norm step) ===")
+    # x=[1,2,3,4], scalar=2 → [2,4,6,8]
+    # Tests the scalar-broadcast path in TosaMulLowering, which handles
+    # the RMSNorm pattern: x_norm = x * rsqrt_scalar.
+    mlir = """\
+func.func @broadcast_mul(%x: tensor<4xi32>, %scalar: tensor<1xi32>) -> tensor<4xi32> {
+  %shift  = "tosa.const"() <{values = dense<0> : tensor<1xi8>}> : () -> tensor<1xi8>
+  %out = tosa.mul %x, %scalar, %shift : (tensor<4xi32>, tensor<1xi32>, tensor<1xi8>) -> tensor<4xi32>
+  func.return %out : tensor<4xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+              "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+    circt_out = run_circt_opt(mlir, passes)
+    insns = extract_asm_instructions(circt_out)
+
+    x_data = [1, 2, 3, 4] + [0]*12
+    s_data = [2] + [0]*15
+    expected = [2, 4, 6, 8]
+
+    prologue = [
+        ".section .text", ".globl _start", "_start:",
+        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    or    t0, t0, t1", "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(x_data, TCM_BASE + 0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(s_data, TCM_BASE + 1 * TCM_SLOT)
+
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 16)
+        actual = list(struct.unpack("<4i", raw))
+        check_result("broadcast_mul: [1,2,3,4] * scalar(2) → [2,4,6,8]",
+                     actual, expected)
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
+
 if __name__ == "__main__":
     print("CoralNPU E2E Validation")
     print(f"  circt-opt : {CIRCT_OPT}")
@@ -2970,6 +3017,7 @@ if __name__ == "__main__":
     test_transformer_decode_block_e2e()
     test_decode_block_full_e2e()
     test_int8_gemv_mac_e2e()
+    test_broadcast_mul_e2e()
 
     print(f"\n{'='*50}")
     print(f"Results: {COUNTS['pass']} passed, {COUNTS['fail']} failed")

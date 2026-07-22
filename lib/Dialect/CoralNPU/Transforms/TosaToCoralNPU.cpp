@@ -458,6 +458,43 @@ struct TosaMulLowering : public mlir::OpRewritePattern<mlir::tosa::MulOp> {
     int64_t n = numElements(op.getResult());
     auto lhsTiles = getTiles(op.getOperand(0), sew, rewriter, loc);
     auto rhsTiles = getTiles(op.getOperand(1), sew, rewriter, loc);
+
+    // Detect scalar broadcast by inspecting the VLE32 tile's n-parameter.
+    // This is robust to carrier type-changes (operand type may be vreg carrier
+    // after greedy lowering, but VLE32.n reflects true element count).
+    int64_t nRhsTileElems = n; // default: same as lhs (no broadcast)
+    if (!rhsTiles.empty()) {
+      if (auto vle = rhsTiles[0].getDefiningOp<VLE32Op>()) {
+        if (auto li = vle.getOperand(1).getDefiningOp<ScalarLiOp>())
+          nRhsTileElems = li.getValue();
+      }
+    }
+
+    // Broadcast: rhs tile holds 1 element, lhs holds N>1 — expand rhs.
+    // Handles: x[N] * rsqrt_scalar[1]  (RMSNorm norm step).
+    if (nRhsTileElems == 1 && n > 1 && !rhsTiles.empty()) {
+      // Extract scalar from rhs tile via VRedSum.
+      auto scalarVal = rewriter.create<VRedSumOp>(loc, rhsTiles[0]).getResult();
+      // Write scalar to 4 consecutive i32 slots in the result scratch area,
+      // then VLE32-load the 4 copies as a broadcast tile.
+      unsigned vCap = vregCapacity(sew);
+      int64_t scratchBase = kTcmBase + getResultSlot(op) * kTcmSlot;
+      for (unsigned idx = 0; idx < vCap; ++idx) {
+        auto addrV = createI32Const(loc, (int32_t)(scratchBase + idx * 4), rewriter);
+        rewriter.create<ScalarSwOp>(loc, scalarVal, addrV);
+      }
+      // Reload as one vregCap-element tile (broadcast tile).
+      auto addrV = createI32Const(loc, (int32_t)scratchBase, rewriter);
+      auto nCapV = createI32Const(loc, (int32_t)vCap, rewriter);
+      auto broadTile = rewriter.create<VLE32Op>(
+          loc, vregE32(loc.getContext()), addrV, nCapV);
+      // Replace rhs tiles with the broadcast tile (repeated for all lhs tiles).
+      rhsTiles.assign(lhsTiles.size(), broadTile.getResult());
+    } else if (!rhsTiles.empty() && rhsTiles.size() < lhsTiles.size()) {
+      // Tile-level broadcast: repeat rhs[0] tile.
+      rhsTiles.resize(lhsTiles.size(), rhsTiles[0]);
+    }
+
     llvm::SmallVector<mlir::Value> res;
     for (auto [l, r] : llvm::zip(lhsTiles, rhsTiles))
       res.push_back(rewriter.create<VMulOp>(loc, vregE32(loc.getContext()), l, r, /*stripmine=*/1));
