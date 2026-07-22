@@ -1261,17 +1261,25 @@ struct TosaMatMulLowering : public mlir::OpRewritePattern<mlir::tosa::MatMulOp> 
                                       mlir::PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
 
-    // Derive matmul dimensions from the operand/result shapes.
-    //   A: [.., M, K]   B: [.., K, N]   C: [.., M, N]
-    auto aTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getOperand(0).getType());
-    auto bTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getOperand(1).getType());
+    // Derive matmul dimensions: C[..,M,N] = A[..,M,K] × B[..,K,N].
+    // M and N come from the TOSA result type — it is stable throughout
+    // matchAndRewrite (greedy rewriter does not touch result types until
+    // replaceOp returns). This is critical when A has already been lowered
+    // to a tileCarrier (rank=1 tensor<k×vreg>) by an upstream pattern, which
+    // would make aTy.getRank() < 2 and cause M to default to 8.
+    auto resTy = mlir::dyn_cast<mlir::RankedTensorType>(op.getResult().getType());
+    auto aTy   = mlir::dyn_cast<mlir::RankedTensorType>(op.getOperand(0).getType());
+    auto bTy   = mlir::dyn_cast<mlir::RankedTensorType>(op.getOperand(1).getType());
     int64_t M = 8, K = 8, N = 8;
-    if (aTy && aTy.getRank() >= 2) {
-      M = aTy.getDimSize(aTy.getRank() - 2);
-      K = aTy.getDimSize(aTy.getRank() - 1);
+    if (resTy && resTy.getRank() >= 2) {
+      M = resTy.getDimSize(resTy.getRank() - 2);
+      N = resTy.getDimSize(resTy.getRank() - 1);
     }
-    if (bTy && bTy.getRank() >= 2)
-      N = bTy.getDimSize(bTy.getRank() - 1);
+    // K: prefer A operand; fall back to B when A is a carrier (rank < 2).
+    if (aTy && aTy.getRank() >= 2)
+      K = aTy.getDimSize(aTy.getRank() - 1);
+    else if (bTy && bTy.getRank() >= 2)
+      K = bTy.getDimSize(bTy.getRank() - 2);
     auto ceilDiv = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
     int64_t nT = ceilDiv(N, kTile), kT = ceilDiv(K, kTile);
     mlir::Value last;
