@@ -50,6 +50,9 @@ target_link_libraries(circt-opt
   MLIRArithTransforms
   MLIRTensorTransforms
   MLIRSCFTransforms
+  MLIRTosaToLinalg
+  MLIRLinalgDialect
+  MLIRLinalgTransforms
 )
 
 export_executable_symbols_for_plugins(circt-opt)

@@ -13,6 +13,7 @@
 
 #include "circt/InitAllDialects.h"
 #include "circt/InitAllPasses.h"
+#include "circt/Dialect/CoralNPU/CoralNPUPasses.h"
 #include "circt/Support/LoweringOptions.h"
 #include "circt/Support/Version.h"
 #include "mlir/Conversion/Passes.h"
@@ -35,6 +36,10 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
+#include "mlir/Conversion/TosaToLinalg/TosaToLinalg.h"
+#include "mlir/Conversion/Passes.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
@@ -77,16 +82,22 @@ int main(int argc, char **argv) {
   registry.insert<mlir::tensor::TensorDialect>();
   registry.insert<mlir::bufferization::BufferizationDialect>();
   registry.insert<mlir::affine::AffineDialect>();
+  registry.insert<mlir::linalg::LinalgDialect>();
   registry.insert<mlir::memref::MemRefDialect>();
 
   circt::registerAllDialects(registry);
   circt::registerAllPasses();
   mlir::bufferization::registerBufferizationPasses();
+  mlir::registerTosaToLinalg();
+  mlir::registerTosaToLinalgNamed();
+  mlir::linalg::registerBufferizableOpInterfaceExternalModels(registry);
   // Register external bufferizable interface implementations.
   mlir::bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::tensor::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::scf::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::arith::registerBufferizableOpInterfaceExternalModels(registry);
+  // Register TOSA ops as bufferizable (out-of-place, no aliasing).
+  circt::coralnpu::registerTosaBufferizableOpInterfaceExternalModels(registry);
 
   mlir::func::registerInlinerExtension(registry);
   mlir::LLVM::registerInlinerInterface(registry);
