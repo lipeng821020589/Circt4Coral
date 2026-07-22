@@ -184,8 +184,15 @@ static constexpr int64_t kTcmBase = 0x10000;
 static constexpr int64_t kTcmSlot = 0x1000;
 static constexpr int64_t kResultSlot = 8;
 
-/// TCM result slot for op output. Bumped past arg count to avoid collision.
+/// Attribute name used to store the per-op unique TCM result slot.
+static constexpr llvm::StringLiteral kSlotAttr("coralnpu.slot");
+
+/// TCM result slot for op output.
+/// Reads the "coralnpu.slot" integer attribute if present (set by the pre-pass
+/// in runOnOperation). Falls back to bumping past arg count for backward compat.
 static int64_t getResultSlot(mlir::Operation *op) {
+  if (auto slotAttr = op->getAttrOfType<mlir::IntegerAttr>(kSlotAttr))
+    return slotAttr.getInt();
   if (auto funcOp = op->getParentOfType<mlir::func::FuncOp>()) {
     int64_t numArgs = (int64_t)funcOp.getNumArguments();
     if (numArgs > kResultSlot)
@@ -316,9 +323,9 @@ getTiles(mlir::Value operand, SEW sew, mlir::PatternRewriter &rewriter,
 /// phases (the anchoring principle, applied per tile).
 static void storeTiles(llvm::ArrayRef<mlir::Value> vregs, SEW sew,
                        int64_t nElems, mlir::PatternRewriter &rewriter,
-                       mlir::Location loc) {
+                       mlir::Location loc, int64_t slot = kResultSlot) {
   int64_t k = (int64_t)vregs.size();
-  int64_t base = kTcmBase + kResultSlot * kTcmSlot;
+  int64_t base = kTcmBase + slot * kTcmSlot;
   for (int64_t i = 0; i < k; ++i) {
     auto addrV = createI32Const(loc, (int32_t)(base + i * kTileBytes), rewriter);
     auto nV = createI32Const(loc, (int32_t)tileElems(i, k, nElems, sew), rewriter);
@@ -363,13 +370,20 @@ static mlir::Value loadTile(mlir::Value tensorVal, int64_t elemOffset,
   return rewriter.create<VLE32Op>(loc, vregE32(loc.getContext()), addrV, nV);
 }
 
-/// Store an `nElems` tile to the result slot at `elemOffset`.
-static void storeTile(mlir::Value vreg, int64_t elemOffset, int64_t nElems,
-                      mlir::PatternRewriter &rewriter, mlir::Location loc) {
-  int64_t addr = kTcmBase + kResultSlot * kTcmSlot + elemOffset * 4;
+/// Store an `nElems` tile to a specific slot at `elemOffset`.
+static void storeTileToSlot(mlir::Value vreg, int64_t slot, int64_t elemOffset,
+                            int64_t nElems, mlir::PatternRewriter &rewriter,
+                            mlir::Location loc) {
+  int64_t addr = kTcmBase + slot * kTcmSlot + elemOffset * 4;
   auto addrV = createI32Const(loc, (int32_t)addr, rewriter);
   auto nV = createI32Const(loc, (int32_t)nElems, rewriter);
   rewriter.create<VSE32Op>(loc, vreg, addrV, nV);
+}
+
+/// Store an `nElems` tile to the result slot at `elemOffset`.
+static void storeTile(mlir::Value vreg, int64_t elemOffset, int64_t nElems,
+                      mlir::PatternRewriter &rewriter, mlir::Location loc) {
+  storeTileToSlot(vreg, kResultSlot, elemOffset, nElems, rewriter, loc);
 }
 
 /// Store a computed vector register back to the result TCM slot via vse32.
@@ -1169,11 +1183,79 @@ struct TosaDepthwiseConv2DLowering
 };
 
 //===----------------------------------------------------------------------===//
+// Helper: determine if a matmul's result feeds another matmul (chained GEMV)
+//===----------------------------------------------------------------------===//
+
+/// Returns true if the result of `op` flows into another tosa.matmul through
+/// zero or more reshape ops.  Used to decide whether to use an intermediate
+/// (high) result slot so the next matmul can read the correct value.
+/// Returns true if the result of `op` eventually feeds another tosa.matmul
+/// through any sequence of element-wise or reshape TOSA ops.
+static bool isIntermediateMatMul(mlir::tosa::MatMulOp op) {
+  // BFS forward through use-def: skip any TOSA op that is not matmul itself,
+  // because element-wise ops (add/mul/reshape) act as transparent conduits.
+  llvm::SmallVector<mlir::Value, 8> worklist = {op.getResult()};
+  llvm::SmallPtrSet<mlir::Value, 16> visited;
+  while (!worklist.empty()) {
+    mlir::Value v = worklist.pop_back_val();
+    if (!visited.insert(v).second) continue;
+    for (auto &use : v.getUses()) {
+      mlir::Operation *user = use.getOwner();
+      if (mlir::isa<mlir::tosa::MatMulOp>(user))
+        return true;
+      // Propagate through any TOSA op that produces results (excluding MatMul
+      // itself, which would be a different chain). This covers reshape, add,
+      // mul, cast, clamp, etc.
+      if (user->getDialect() &&
+          user->getDialect()->getNamespace() == "tosa" &&
+          !mlir::isa<mlir::tosa::MatMulOp>(user)) {
+        for (auto res : user->getResults())
+          worklist.push_back(res);
+      }
+    }
+  }
+  return false;
+}
+
+/// Compute the intermediate slot for a matmul op. Uses the op's position in
+/// the function to pick a slot above the arg/const region and above kLutSlot.
+/// Two matmuls will never share a slot because each calls this once and the
+/// slot is derived from a stable property (arg count + const count + index).
+static int64_t intermediateSlotFor(mlir::tosa::MatMulOp op) {
+  auto funcOp = op->getParentOfType<mlir::func::FuncOp>();
+  if (!funcOp) return kResultSlot;
+  int64_t numArgs   = (int64_t)funcOp.getNumArguments();
+  int64_t nConsts   = 0;
+  funcOp.walk([&](mlir::tosa::ConstOp) { ++nConsts; });
+  // Count how many intermediate matmuls precede this one.
+  int64_t idx = 0;
+  funcOp.walk([&](mlir::tosa::MatMulOp mm) {
+    if (mm == op) return mlir::WalkResult::interrupt();
+    if (isIntermediateMatMul(mm)) ++idx;
+    return mlir::WalkResult::advance();
+  });
+  // Slots 0-15 are arg/const/result slots (0x10000-0x1FFFF).
+  // Slot 16 (0x20000) is the code base — skip it!
+  // Use slots starting at 32 (0x30000) for intermediate matmul results.
+  constexpr int64_t kGemvBase = 32;
+  return std::max(numArgs + nConsts, kGemvBase) + idx;
+}
+
+//===----------------------------------------------------------------------===//
 // tosa.matmul → outer_product × N (stripmine=4)
 //===----------------------------------------------------------------------===//
 
 struct TosaMatMulLowering : public mlir::OpRewritePattern<mlir::tosa::MatMulOp> {
-  using mlir::OpRewritePattern<mlir::tosa::MatMulOp>::OpRewritePattern;
+  const llvm::DenseSet<mlir::Operation *> *intermediateOps;
+
+  TosaMatMulLowering(mlir::MLIRContext *ctx,
+                     const llvm::DenseSet<mlir::Operation *> *intOps)
+      : mlir::OpRewritePattern<mlir::tosa::MatMulOp>(ctx),
+        intermediateOps(intOps) {}
+
+  bool isIntermediate(mlir::tosa::MatMulOp op) const {
+    return intermediateOps && intermediateOps->count(op.getOperation());
+  }
 
   mlir::LogicalResult matchAndRewrite(mlir::tosa::MatMulOp op,
                                       mlir::PatternRewriter &rewriter) const override {
@@ -1215,10 +1297,33 @@ struct TosaMatMulLowering : public mlir::OpRewritePattern<mlir::tosa::MatMulOp> 
           }
           auto accRead = rewriter.create<AccReadOp>(loc, acc, col0);
           rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
-          storeTile(accRead.getResult(), ni * kTile, kTile, rewriter, loc);
+          {
+            int64_t s8slot = isIntermediate(op)
+                ? intermediateSlotFor(op) : getResultSlot(op);
+            storeTileToSlot(accRead.getResult(), s8slot, ni * kTile, kTile, rewriter, loc);
+          }
           rewriter.create<VSetVLOp>(loc, SEW::E8, LMUL::M1);
           last = accRead.getResult();
         }
+        // Reload result as tileCarrier so resolveInputBaseAddr works downstream.
+        {
+          rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
+          int64_t resSlot8 = isIntermediate(op)
+              ? intermediateSlotFor(op) : getResultSlot(op);
+          int64_t resBase = kTcmBase + resSlot8 * kTcmSlot;
+          unsigned vCap = vregCapacity(SEW::E32);
+          int64_t nTiles = ceilDiv(N, (int64_t)vCap);
+          llvm::SmallVector<mlir::Value> resTiles;
+          for (int64_t ti = 0; ti < nTiles; ++ti) {
+            int64_t nElem = std::min((int64_t)vCap, N - ti * (int64_t)vCap);
+            auto addrV = createI32Const(loc, (int32_t)(resBase + ti * kTileBytes), rewriter);
+            auto nV    = createI32Const(loc, (int32_t)nElem, rewriter);
+            resTiles.push_back(rewriter.create<VLE32Op>(
+                loc, vregE32(loc.getContext()), addrV, nV));
+          }
+          rewriter.replaceOp(op, tileCarrier(op, resTiles, rewriter));
+        }
+        return mlir::success();
       } else {
         // i32/f32 GEMV: per-output-channel vle+vmul+vredsum (dot product).
         // B layout assumed [N, K] (output-channel first, transposed weight).
@@ -1252,8 +1357,12 @@ struct TosaMatMulLowering : public mlir::OpRewritePattern<mlir::tosa::MatMulOp> 
                 loc, prod.getResult()).getResult();
             acc = rewriter.create<ScalarAddOp>(loc, acc, tileSum).getResult();
           }
-          // Store scalar result ni to result slot.
-          int64_t resAddr = kTcmBase + kResultSlot * kTcmSlot + ni * 4;
+          // Store scalar result ni to this op's result slot.
+          // Intermediate matmuls (result feeds another matmul) use a unique
+          // high slot so that chained GEMVs don't overwrite each other.
+          int64_t resSlot = isIntermediate(op)
+              ? intermediateSlotFor(op) : getResultSlot(op);
+          int64_t resAddr = kTcmBase + resSlot * kTcmSlot + ni * 4;
           auto resAddrV = createI32Const(loc, (int32_t)resAddr, rewriter);
           rewriter.create<ScalarSwOp>(loc, acc, resAddrV);
           last = acc;
@@ -1261,8 +1370,27 @@ struct TosaMatMulLowering : public mlir::OpRewritePattern<mlir::tosa::MatMulOp> 
       }
       if (!last)
         last = createI32Const(loc, 0, rewriter);
+      // Emit a tileCarrier (from_elements of VLE32 tiles) so that
+      // resolveInputBaseAddr can recover the result base address for
+      // downstream ops (e.g. chained GEMV, residual add).
       rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
-      rewriter.replaceOp(op, carrier(op, rewriter, last));
+      {
+        int64_t resSlotFinal = isIntermediate(op)
+            ? intermediateSlotFor(op) : getResultSlot(op);
+        int64_t resBase = kTcmBase + resSlotFinal * kTcmSlot;
+        unsigned vCap = vregCapacity(SEW::E32);
+        int64_t nTiles = ceilDiv(N, (int64_t)vCap);
+        llvm::SmallVector<mlir::Value> resTiles;
+        for (int64_t ti = 0; ti < nTiles; ++ti) {
+          int64_t nElem = std::min((int64_t)vCap, N - ti * (int64_t)vCap);
+          int64_t tileAddr = resBase + ti * kTileBytes;
+          auto addrV = createI32Const(loc, (int32_t)tileAddr, rewriter);
+          auto nV    = createI32Const(loc, (int32_t)nElem, rewriter);
+          resTiles.push_back(rewriter.create<VLE32Op>(
+              loc, vregE32(loc.getContext()), addrV, nV));
+        }
+        rewriter.replaceOp(op, tileCarrier(op, resTiles, rewriter));
+      }
       return mlir::success();
     }
 
@@ -1961,7 +2089,9 @@ struct TosaConstLowering : public mlir::OpRewritePattern<mlir::tosa::ConstOp> {
       auto ne = createI32Const(loc, (int32_t)tileElems(ti, k, n, sew), rewriter);
       tiles.push_back(rewriter.create<VLE32Op>(loc, vregE32(loc.getContext()), addrV, ne));
     }
-    storeTiles(tiles, sew, n, rewriter, loc);
+    // const data is already in its const slot; the storeTiles here is redundant
+    // but kept for the side-effect that anchors the VLE32 chain alive.
+    storeTiles(tiles, sew, n, rewriter, loc, slot);
     rewriter.replaceOp(op, tileCarrier(op, tiles, rewriter));
     return mlir::success();
   }
@@ -1977,6 +2107,19 @@ struct TosaToCoralNPUPass
   }
   void runOnOperation() override {
     auto *ctx = &getContext();
+
+    // Pre-pass: collect all intermediate matmul ops (those whose result feeds
+    // another matmul through optional reshapes). This must be done BEFORE the
+    // greedy rewriter runs, because the rewriter changes the use-def graph as
+    // it lowers ops (a lowered matmul is no longer a tosa.matmul, so dynamic
+    // isIntermediateMatMul checks fail for already-lowered ops).
+    llvm::DenseSet<mlir::Operation *> intermediateMatMuls;
+    getOperation()->walk([&](mlir::func::FuncOp funcOp) {
+      funcOp.walk([&](mlir::tosa::MatMulOp mm) {
+        if (isIntermediateMatMul(mm))
+          intermediateMatMuls.insert(mm.getOperation());
+      });
+    });
 
     // The greedy driver erases an op as "trivially dead" *before* trying any
     // pattern. TOSA ops are Pure, so if func.return is lowered first the TOSA
@@ -2002,7 +2145,7 @@ struct TosaToCoralNPUPass
     tosaPatterns.add<TosaReshapeLowering, TosaTransposeLowering>(ctx);
     tosaPatterns.add<TosaConcatLowering, TosaSliceLowering>(ctx);
     tosaPatterns.add<TosaConv2DLowering, TosaDepthwiseConv2DLowering>(ctx);
-    tosaPatterns.add<TosaMatMulLowering>(ctx);
+    tosaPatterns.add<TosaMatMulLowering>(ctx, &intermediateMatMuls);
     tosaPatterns.add<TosaPadLowering, TosaAvgPool2dLowering,
                      TosaMaxPool2dLowering>(ctx);
     tosaPatterns.add<TosaNegateVXLowering, TosaAbsLowering>(ctx);

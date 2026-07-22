@@ -2716,24 +2716,28 @@ func.func @rmsnorm_scalar(%x: tensor<1xi32>, %g: tensor<1xi32>) -> tensor<1xi32>
 # ── TEST 40: Transformer Decode Block (d=4, identity weights, int32) ──────────
 
 def test_transformer_decode_block_e2e():
-    print("\n=== TEST 40: Transformer Decode Block Partial E2E (single GEMV + residual) ===")
-    # Tests: x + GEMV(x, W) = x + x@I = [1,1,1,1]+[1,1,1,1] = [2,2,2,2]
-    # This validates GEMV→residual chain with direct BlockArg operands.
-    # KNOWN-ISSUE: chained GEMV (GEMV output as next GEMV input) requires
-    #   dynamic TCM slot management; tracked as future work (P2).
+    print("\n=== TEST 40: Chained GEMV + Residual Add (V-proj → Attn-proj → h1) ===")
+    # Tests: h1 = x + (x@Wv)@Wo = x + v@Wo
+    # With identity weights: v=x@I=[1,1,1,1], att=v@I=[1,1,1,1], h1=x+att=[2,2,2,2]
+    # This validates 2-GEMV chain (v→attn) + residual add with dynamic slot fix.
     mlir = """\
-func.func @decode_partial(%x: tensor<4xi32>, %w: tensor<4x4xi32>) -> tensor<4xi32> {
+func.func @chain2(%x: tensor<4xi32>, %wv: tensor<4x4xi32>, %wo: tensor<4x4xi32>) -> tensor<4xi32> {
   %zero  = "tosa.const"() <{values = dense<0> : tensor<1xi32>}> : () -> tensor<1xi32>
   %sh114 = tosa.const_shape {values = dense<[1,1,4]> : tensor<3xindex>} : () -> !tosa.shape<3>
   %sh44  = tosa.const_shape {values = dense<[1,4,4]> : tensor<3xindex>} : () -> !tosa.shape<3>
   %sh4   = tosa.const_shape {values = dense<[4]>     : tensor<1xindex>} : () -> !tosa.shape<1>
-  %x4    = tosa.reshape %x, %sh114 : (tensor<4xi32>, !tosa.shape<3>) -> tensor<1x1x4xi32>
-  %w4    = tosa.reshape %w, %sh44  : (tensor<4x4xi32>, !tosa.shape<3>) -> tensor<1x4x4xi32>
-  %y     = tosa.matmul %x4, %w4, %zero, %zero
+  %x4  = tosa.reshape %x,  %sh114 : (tensor<4xi32>, !tosa.shape<3>) -> tensor<1x1x4xi32>
+  %wv4 = tosa.reshape %wv, %sh44  : (tensor<4x4xi32>, !tosa.shape<3>) -> tensor<1x4x4xi32>
+  %wo4 = tosa.reshape %wo, %sh44  : (tensor<4x4xi32>, !tosa.shape<3>) -> tensor<1x4x4xi32>
+  %v   = tosa.matmul %x4, %wv4, %zero, %zero
     : (tensor<1x1x4xi32>, tensor<1x4x4xi32>, tensor<1xi32>, tensor<1xi32>) -> tensor<1x1x4xi32>
-  %yf    = tosa.reshape %y, %sh4 : (tensor<1x1x4xi32>, !tosa.shape<1>) -> tensor<4xi32>
-  %out   = tosa.add %x, %yf : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi32>
-  func.return %out : tensor<4xi32>
+  %vf  = tosa.reshape %v,  %sh4   : (tensor<1x1x4xi32>, !tosa.shape<1>) -> tensor<4xi32>
+  %vr4 = tosa.reshape %vf, %sh114 : (tensor<4xi32>, !tosa.shape<3>) -> tensor<1x1x4xi32>
+  %att = tosa.matmul %vr4, %wo4, %zero, %zero
+    : (tensor<1x1x4xi32>, tensor<1x4x4xi32>, tensor<1xi32>, tensor<1xi32>) -> tensor<1x1x4xi32>
+  %af  = tosa.reshape %att, %sh4 : (tensor<1x1x4xi32>, !tosa.shape<1>) -> tensor<4xi32>
+  %h1  = tosa.add %x, %af : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi32>
+  func.return %h1 : tensor<4xi32>
 }
 """
     passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
@@ -2743,7 +2747,7 @@ func.func @decode_partial(%x: tensor<4xi32>, %w: tensor<4x4xi32>) -> tensor<4xi3
 
     x_data = [1, 1, 1, 1] + [0]*12
     eye4   = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1] + [0]*48
-    expected = [2, 2, 2, 2]  # x + x@I = [1,1,1,1]+[1,1,1,1]
+    expected = [2, 2, 2, 2]  # h1 = x + (x@I)@I = [1,1,1,1]+[1,1,1,1]
 
     prologue = [
         ".section .text", ".globl _start", "_start:",
@@ -2752,6 +2756,7 @@ func.func @decode_partial(%x: tensor<4xi32>, %w: tensor<4x4xi32>) -> tensor<4xi3
     ]
     prologue += write_int32_to_asm_init(x_data, TCM_BASE + 0 * TCM_SLOT)
     prologue += write_int32_to_asm_init(eye4,   TCM_BASE + 1 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(eye4,   TCM_BASE + 2 * TCM_SLOT)
 
     full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
 
@@ -2761,7 +2766,7 @@ func.func @decode_partial(%x: tensor<4xi32>, %w: tensor<4x4xi32>) -> tensor<4xi3
         build_elf(full_asm, elf_path)
         raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 16)
         actual = list(struct.unpack("<4i", raw))
-        check_result("decode_partial: x=[1]*4 + x@I → [2,2,2,2]", actual, expected)
+        check_result("chained-GEMV: h1=x+(x@Wv)@Wo → [2,2,2,2]", actual, expected)
     except Exception as e:
         print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
     finally:
