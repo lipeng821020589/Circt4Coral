@@ -23,6 +23,11 @@ namespace coralnpu {
 /// Register the export-coralnpu translation.
 void registerExportCoralNPUTranslation();
 
+/// Register BufferizableOpInterface external models for TOSA dialect ops.
+/// Call this before running --one-shot-bufferize on TOSA IR.
+void registerTosaBufferizableOpInterfaceExternalModels(
+    mlir::DialectRegistry &registry);
+
 } // namespace coralnpu
 } // namespace circt
 

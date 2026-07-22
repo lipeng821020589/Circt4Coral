@@ -2,6 +2,7 @@
 
 add_circt_dialect_library(CIRCTCoralNPUTransforms
   TosaToCoralNPU.cpp
+  TosaBufferizableOpInterfaceImpl.cpp
   CoralNPUStripmine.cpp
   CoralNPULegalize.cpp
   CoralNPURegAlloc.cpp
@@ -33,6 +34,7 @@ add_circt_dialect_library(CIRCTCoralNPUTransforms
   MLIRPass
   MLIRTosaDialect
   MLIRBufferizationDialect
+  MLIRBufferizationTransforms
   MLIRTranslateLib
   MLIRTransforms
   MLIRSupport
