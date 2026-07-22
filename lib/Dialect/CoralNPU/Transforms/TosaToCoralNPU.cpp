@@ -32,6 +32,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -326,6 +327,13 @@ getTiles(mlir::Value operand, SEW sew, mlir::PatternRewriter &rewriter,
   int64_t base = kTcmBase;
   if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(operand))
     base = kTcmBase + barg.getArgNumber() * kTcmSlot;
+  // bufferization.to_tensor(memref_barg): treats the underlying memref
+  // argument the same as a BlockArgument tensor for slot layout purposes.
+  // Enables --one-shot-bufferize | --tosa-to-coralnpu pipelines.
+  if (auto toTensor = operand.getDefiningOp<mlir::bufferization::ToTensorOp>()) {
+    if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(toTensor.getBuffer()))
+      base = kTcmBase + barg.getArgNumber() * kTcmSlot;
+  }
 
   llvm::SmallVector<mlir::Value> tiles;
   tiles.reserve(k);

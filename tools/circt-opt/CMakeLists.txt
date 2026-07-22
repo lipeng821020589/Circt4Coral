@@ -44,6 +44,12 @@ target_link_libraries(circt-opt
   MLIRDLTIDialect
   MLIRTosaDialect
   MLIRTensorDialect
+  MLIRBufferizationDialect
+  MLIRBufferizationTransforms
+  MLIRAffineDialect
+  MLIRArithTransforms
+  MLIRTensorTransforms
+  MLIRSCFTransforms
 )
 
 export_executable_symbols_for_plugins(circt-opt)

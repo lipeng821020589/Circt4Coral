@@ -32,6 +32,7 @@ add_circt_dialect_library(CIRCTCoralNPUTransforms
   MLIRIR
   MLIRPass
   MLIRTosaDialect
+  MLIRBufferizationDialect
   MLIRTranslateLib
   MLIRTransforms
   MLIRSupport
