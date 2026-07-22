@@ -12,9 +12,10 @@ func.func @axi_dma_test(%awvalid: i32, %awready: i32) -> i32 {
   %addr = coralnpu.li 0x1000 : i32
   %size = coralnpu.li 256 : i32
   coralnpu.dma_load %addr, %addr, %size
-  %data = coralnpu.vle32 %addr, %size : i32
-  %result = coralnpu.vadd %data, %data : i32
-  coralnpu.vse32 %result, %addr, %size : i32
+  %data = coralnpu.vle32 %addr, %size : !coralnpu.vreg<e32, m1>
+  %result = coralnpu.vadd %data, %data : (!coralnpu.vreg<e32, m1>, !coralnpu.vreg<e32, m1>) -> !coralnpu.vreg<e32, m1>
+  coralnpu.vse32 %result, %addr, %size : !coralnpu.vreg<e32, m1>
   coralnpu.dma_store %addr, %addr, %size
-  coralnpu.return %result : i32
+  %ret = coralnpu.vredsum %result : (!coralnpu.vreg<e32, m1>) -> i32
+  coralnpu.return %ret : i32
 }

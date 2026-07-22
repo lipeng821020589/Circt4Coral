@@ -30,24 +30,24 @@ module {
     coralnpu.vsetvl e32, m1
 
     // --- Load inputs ---
-    %in1 = coralnpu.vle32 %addr, %n : i32
+    %in1 = coralnpu.vle32 %addr, %n : !coralnpu.vreg<e32, m1>
 
     %off1  = coralnpu.li 32 : i32
     %addr2 = coralnpu.add %addr, %off1 : i32
-    %in2   = coralnpu.vle32 %addr2, %n : i32
+    %in2   = coralnpu.vle32 %addr2, %n : !coralnpu.vreg<e32, m1>
 
     %off2  = coralnpu.li 64 : i32
     %addr3 = coralnpu.add %addr, %off2 : i32
-    %in3   = coralnpu.vle32 %addr3, %n : i32
+    %in3   = coralnpu.vle32 %addr3, %n : !coralnpu.vreg<e32, m1>
 
     // --- Compute: out = (in1 * in2) + in3 ---
-    %mul_result = coralnpu.vmul %in1, %in2 : i32
-    %add_result = coralnpu.vadd %mul_result, %in3 : i32
+    %mul_result = coralnpu.vmul %in1, %in2 : (!coralnpu.vreg<e32, m1>, !coralnpu.vreg<e32, m1>) -> !coralnpu.vreg<e32, m1>
+    %add_result = coralnpu.vadd %mul_result, %in3 : (!coralnpu.vreg<e32, m1>, !coralnpu.vreg<e32, m1>) -> !coralnpu.vreg<e32, m1>
 
     // --- Store result ---
     %off3     = coralnpu.li 96 : i32
     %addr_out = coralnpu.add %addr, %off3 : i32
-    coralnpu.vse32 %add_result, %addr_out, %n : i32
+    coralnpu.vse32 %add_result, %addr_out, %n : !coralnpu.vreg<e32, m1>
 
     // --- Return success ---
     %zero = coralnpu.li 0 : i32
