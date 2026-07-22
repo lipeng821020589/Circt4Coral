@@ -475,21 +475,29 @@ struct TosaMulLowering : public mlir::OpRewritePattern<mlir::tosa::MulOp> {
     if (nRhsTileElems == 1 && n > 1 && !rhsTiles.empty()) {
       // Extract scalar from rhs tile via VRedSum.
       auto scalarVal = rewriter.create<VRedSumOp>(loc, rhsTiles[0]).getResult();
-      // Write scalar to 4 consecutive i32 slots in the result scratch area,
-      // then VLE32-load the 4 copies as a broadcast tile.
+      // Write scalar to a scratch area; load it back as tiles matching lhs.
+      // Use getResultSlot scratch area; write enough copies for vregCap.
       unsigned vCap = vregCapacity(sew);
       int64_t scratchBase = kTcmBase + getResultSlot(op) * kTcmSlot;
       for (unsigned idx = 0; idx < vCap; ++idx) {
         auto addrV = createI32Const(loc, (int32_t)(scratchBase + idx * 4), rewriter);
         rewriter.create<ScalarSwOp>(loc, scalarVal, addrV);
       }
-      // Reload as one vregCap-element tile (broadcast tile).
-      auto addrV = createI32Const(loc, (int32_t)scratchBase, rewriter);
-      auto nCapV = createI32Const(loc, (int32_t)vCap, rewriter);
-      auto broadTile = rewriter.create<VLE32Op>(
-          loc, vregE32(loc.getContext()), addrV, nCapV);
-      // Replace rhs tiles with the broadcast tile (repeated for all lhs tiles).
-      rhsTiles.assign(lhsTiles.size(), broadTile.getResult());
+      // For each lhs tile, reload with the same element count as that tile
+      // (not vCap) so VMul sees matching vector lengths.
+      rhsTiles.clear();
+      for (auto lhsTile : lhsTiles) {
+        // Determine how many elements the lhs tile carries.
+        int64_t tileN = (int64_t)vCap; // default
+        if (auto vle = lhsTile.getDefiningOp<VLE32Op>()) {
+          if (auto li = vle.getOperand(1).getDefiningOp<ScalarLiOp>())
+            tileN = li.getValue();
+        }
+        auto addrV = createI32Const(loc, (int32_t)scratchBase, rewriter);
+        auto nV    = createI32Const(loc, (int32_t)tileN, rewriter);
+        rhsTiles.push_back(rewriter.create<VLE32Op>(
+            loc, vregE32(loc.getContext()), addrV, nV).getResult());
+      }
     } else if (!rhsTiles.empty() && rhsTiles.size() < lhsTiles.size()) {
       // Tile-level broadcast: repeat rhs[0] tile.
       rhsTiles.resize(lhsTiles.size(), rhsTiles[0]);
