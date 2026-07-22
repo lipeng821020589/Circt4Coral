@@ -2773,6 +2773,89 @@ func.func @chain2(%x: tensor<4xi32>, %wv: tensor<4x4xi32>, %wo: tensor<4x4xi32>)
         if elf_path.exists(): elf_path.unlink()
 
 
+# ── TEST 41: Full 6-GEMV Transformer Decode Block (d=4, identity weights) ─────
+
+def test_decode_block_full_e2e():
+    print("\n=== TEST 41: Full Transformer Decode Block E2E (6 GEMV, d=4, identity) ===")
+    # Complete Transformer decode block: x=[1,1,1,1], all weights = identity.
+    # Forward pass:
+    #   v=x@Wv=[1,1,1,1]; att=v@Wo=[1,1,1,1]; h1=x+att=[2,2,2,2]
+    #   gate=h1@W1=[2,2,2,2]; up=h1@W2=[2,2,2,2]; act=gate*up=[4,4,4,4]
+    #   dn=act@W3=[4,4,4,4]; out=h1+dn=[6,6,6,6]
+    mlir = """\
+func.func @decode_block(%x:  tensor<4xi32>,
+                        %wq: tensor<4x4xi32>,
+                        %wv: tensor<4x4xi32>,
+                        %wo: tensor<4x4xi32>,
+                        %w1: tensor<4x4xi32>,
+                        %w2: tensor<4x4xi32>,
+                        %w3: tensor<4x4xi32>) -> tensor<4xi32> {
+  %shift   = "tosa.const"() <{values = dense<0> : tensor<1xi8>}> : () -> tensor<1xi8>
+  %zero    = "tosa.const"() <{values = dense<0> : tensor<1xi32>}> : () -> tensor<1xi32>
+  %sh114   = tosa.const_shape {values = dense<[1,1,4]> : tensor<3xindex>} : () -> !tosa.shape<3>
+  %sh44    = tosa.const_shape {values = dense<[1,4,4]> : tensor<3xindex>} : () -> !tosa.shape<3>
+  %sh4     = tosa.const_shape {values = dense<[4]>     : tensor<1xindex>} : () -> !tosa.shape<1>
+  %x4      = tosa.reshape %x,  %sh114 : (tensor<4xi32>, !tosa.shape<3>) -> tensor<1x1x4xi32>
+  %wq4     = tosa.reshape %wq, %sh44  : (tensor<4x4xi32>, !tosa.shape<3>) -> tensor<1x4x4xi32>
+  %wv4     = tosa.reshape %wv, %sh44  : (tensor<4x4xi32>, !tosa.shape<3>) -> tensor<1x4x4xi32>
+  %wo4     = tosa.reshape %wo, %sh44  : (tensor<4x4xi32>, !tosa.shape<3>) -> tensor<1x4x4xi32>
+  %q       = tosa.matmul %x4, %wq4, %zero, %zero : (tensor<1x1x4xi32>, tensor<1x4x4xi32>, tensor<1xi32>, tensor<1xi32>) -> tensor<1x1x4xi32>
+  %v       = tosa.matmul %x4, %wv4, %zero, %zero : (tensor<1x1x4xi32>, tensor<1x4x4xi32>, tensor<1xi32>, tensor<1xi32>) -> tensor<1x1x4xi32>
+  %vf      = tosa.reshape %v,  %sh4   : (tensor<1x1x4xi32>, !tosa.shape<1>) -> tensor<4xi32>
+  %vr4     = tosa.reshape %vf, %sh114 : (tensor<4xi32>, !tosa.shape<3>) -> tensor<1x1x4xi32>
+  %attn    = tosa.matmul %vr4, %wo4, %zero, %zero : (tensor<1x1x4xi32>, tensor<1x4x4xi32>, tensor<1xi32>, tensor<1xi32>) -> tensor<1x1x4xi32>
+  %af      = tosa.reshape %attn, %sh4 : (tensor<1x1x4xi32>, !tosa.shape<1>) -> tensor<4xi32>
+  %h1      = tosa.add %x, %af : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi32>
+  %h14     = tosa.reshape %h1, %sh114 : (tensor<4xi32>, !tosa.shape<3>) -> tensor<1x1x4xi32>
+  %w14     = tosa.reshape %w1, %sh44  : (tensor<4x4xi32>, !tosa.shape<3>) -> tensor<1x4x4xi32>
+  %w24     = tosa.reshape %w2, %sh44  : (tensor<4x4xi32>, !tosa.shape<3>) -> tensor<1x4x4xi32>
+  %w34     = tosa.reshape %w3, %sh44  : (tensor<4x4xi32>, !tosa.shape<3>) -> tensor<1x4x4xi32>
+  %gate    = tosa.matmul %h14, %w14, %zero, %zero : (tensor<1x1x4xi32>, tensor<1x4x4xi32>, tensor<1xi32>, tensor<1xi32>) -> tensor<1x1x4xi32>
+  %up      = tosa.matmul %h14, %w24, %zero, %zero : (tensor<1x1x4xi32>, tensor<1x4x4xi32>, tensor<1xi32>, tensor<1xi32>) -> tensor<1x1x4xi32>
+  %gf      = tosa.reshape %gate, %sh4 : (tensor<1x1x4xi32>, !tosa.shape<1>) -> tensor<4xi32>
+  %uf      = tosa.reshape %up,   %sh4 : (tensor<1x1x4xi32>, !tosa.shape<1>) -> tensor<4xi32>
+  %act     = tosa.mul %gf, %uf, %shift : (tensor<4xi32>, tensor<4xi32>, tensor<1xi8>) -> tensor<4xi32>
+  %ai4     = tosa.reshape %act, %sh114 : (tensor<4xi32>, !tosa.shape<3>) -> tensor<1x1x4xi32>
+  %dn      = tosa.matmul %ai4, %w34, %zero, %zero : (tensor<1x1x4xi32>, tensor<1x4x4xi32>, tensor<1xi32>, tensor<1xi32>) -> tensor<1x1x4xi32>
+  %dnf     = tosa.reshape %dn, %sh4 : (tensor<1x1x4xi32>, !tosa.shape<1>) -> tensor<4xi32>
+  %out     = tosa.add %h1, %dnf : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi32>
+  func.return %out : tensor<4xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+              "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+    circt_out = run_circt_opt(mlir, passes)
+    insns = extract_asm_instructions(circt_out)
+
+    x_data  = [1, 1, 1, 1] + [0]*12
+    eye4    = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1] + [0]*48
+    expected = [6, 6, 6, 6]
+
+    prologue = [
+        ".section .text", ".globl _start", "_start:",
+        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    or    t0, t0, t1", "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(x_data, TCM_BASE + 0 * TCM_SLOT)
+    for i in range(1, 8):
+        prologue += write_int32_to_asm_init(eye4, TCM_BASE + i * TCM_SLOT)
+
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 16)
+        actual = list(struct.unpack("<4i", raw))
+        check_result("decode_block_full: x=[1]*4 identity_weights → [6,6,6,6]",
+                     actual, expected)
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
+
 if __name__ == "__main__":
     print("CoralNPU E2E Validation")
     print(f"  circt-opt : {CIRCT_OPT}")
@@ -2825,6 +2908,7 @@ if __name__ == "__main__":
     test_gemv_i32_e2e()
     test_rmsnorm_e2e()
     test_transformer_decode_block_e2e()
+    test_decode_block_full_e2e()
 
     print(f"\n{'='*50}")
     print(f"Results: {COUNTS['pass']} passed, {COUNTS['fail']} failed")
