@@ -352,6 +352,40 @@ static mlir::Value tileCarrier(mlir::Operation *op,
   return rewriter.create<mlir::tensor::FromElementsOp>(loc, carrierTy, vregs);
 }
 
+/// Build a tileCarrier by reloading from a TCM slot using VLE32 tiles.
+/// Unlike tileCarrier(op, res, ...) which wraps compute SSA values directly,
+/// this reloads from the written slot so resolveInputBaseAddr can track back
+/// to the correct address when this op's result feeds a downstream GEMV.
+static mlir::Value reloadCarrierFromSlot(mlir::Operation *op, int64_t slot,
+                                          int64_t nElems, SEW sew,
+                                          mlir::PatternRewriter &rewriter) {
+  auto loc = op->getLoc();
+  unsigned vCap = vregCapacity(sew);
+  int64_t k = (nElems + vCap - 1) / vCap;
+  int64_t base = kTcmBase + slot * kTcmSlot;
+  llvm::SmallVector<mlir::Value> tiles;
+  tiles.reserve(k);
+  for (int64_t i = 0; i < k; ++i) {
+    auto addrV = rewriter.create<ScalarLiOp>(loc, rewriter.getI32IntegerAttr(
+        (int32_t)(base + i * kTileBytes)));
+    int64_t ne = (i < k - 1) ? (int64_t)vCap :
+                 (nElems - (k - 1) * (int64_t)vCap);
+    auto nV = rewriter.create<ScalarLiOp>(loc, rewriter.getI32IntegerAttr((int32_t)ne));
+    tiles.push_back(rewriter.create<VLE32Op>(
+        loc, VRegType::get(loc.getContext(), sew, LMUL::M1), addrV, nV));
+  }
+  return tileCarrier(op, tiles, rewriter);
+}
+
+/// Build a tileCarrier for `op` by reloading from its assigned result slot.
+/// Always produces from_elements(VLE32, ...) so resolveInputBaseAddr can
+/// trace downstream operands back to the correct TCM address, regardless
+/// of whether the op has a dynamic slot (kSlotAttr) or uses the natural slot.
+static mlir::Value carrierForOp(mlir::Operation *op, int64_t nElems, SEW sew,
+                                 mlir::PatternRewriter &rewriter) {
+  return reloadCarrierFromSlot(op, getResultSlot(op), nElems, sew, rewriter);
+}
+
 // Matrix-engine tile size: the 8x8 accumulator processes 8x8 element tiles.
 static constexpr int64_t kTile = 8;
 
@@ -421,8 +455,8 @@ struct TosaAddLowering : public mlir::OpRewritePattern<mlir::tosa::AddOp> {
     llvm::SmallVector<mlir::Value> res;
     for (auto [l, r] : llvm::zip(lhsTiles, rhsTiles))
       res.push_back(rewriter.create<VAddOp>(loc, vregE32(loc.getContext()), l, r, /*stripmine=*/1));
-    storeTiles(res, sew, n, rewriter, loc);
-    rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
+    storeTiles(res, sew, n, rewriter, loc, getResultSlot(op));
+    rewriter.replaceOp(op, carrierForOp(op, n, sew, rewriter));
     return mlir::success();
   }
 };
@@ -441,8 +475,8 @@ struct TosaSubLowering : public mlir::OpRewritePattern<mlir::tosa::SubOp> {
     llvm::SmallVector<mlir::Value> res;
     for (auto [l, r] : llvm::zip(lhsTiles, rhsTiles))
       res.push_back(rewriter.create<VSubOp>(loc, vregE32(loc.getContext()), l, r, /*stripmine=*/1));
-    storeTiles(res, sew, n, rewriter, loc);
-    rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
+    storeTiles(res, sew, n, rewriter, loc, getResultSlot(op));
+    rewriter.replaceOp(op, carrierForOp(op, n, sew, rewriter));
     return mlir::success();
   }
 };
@@ -506,8 +540,8 @@ struct TosaMulLowering : public mlir::OpRewritePattern<mlir::tosa::MulOp> {
     llvm::SmallVector<mlir::Value> res;
     for (auto [l, r] : llvm::zip(lhsTiles, rhsTiles))
       res.push_back(rewriter.create<VMulOp>(loc, vregE32(loc.getContext()), l, r, /*stripmine=*/1));
-    storeTiles(res, sew, n, rewriter, loc);
-    rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
+    storeTiles(res, sew, n, rewriter, loc, getResultSlot(op));
+    rewriter.replaceOp(op, carrierForOp(op, n, sew, rewriter));
     return mlir::success();
   }
 };
@@ -565,8 +599,8 @@ struct TosaCastLowering : public mlir::OpRewritePattern<mlir::tosa::CastOp> {
 
     if (dstBits >= srcBits) {
       // Widening or same-width: passthrough — vle already sign-extends to i32.
-      storeTiles(tiles, sew, n, rewriter, loc);
-      rewriter.replaceOp(op, tileCarrier(op, tiles, rewriter));
+      storeTiles(tiles, sew, n, rewriter, loc, getResultSlot(op));
+      rewriter.replaceOp(op, carrierForOp(op, n, sew, rewriter));
     } else {
       // Narrowing: mask each tile to dst width.
       // For i32→i8: mask = 0xFF; for i32→i16: mask = 0xFFFF.
@@ -784,7 +818,7 @@ struct TosaRescaleLowering : public mlir::OpRewritePattern<mlir::tosa::RescaleOp
       auto nV    = createI32Const(loc, (int32_t)tileElems(t, k_out, nElems, SEW::E32), rewriter);
       outTiles.push_back(rewriter.create<VLE32Op>(loc, vregE32(loc.getContext()), addrV, nV).getResult());
     }
-    rewriter.replaceOp(op, tileCarrier(op, outTiles, rewriter));
+    rewriter.replaceOp(op, carrierForOp(op, nElems, SEW::E32, rewriter));
     return mlir::success();
   }
 };
@@ -831,8 +865,8 @@ struct TosaTableLowering : public mlir::OpRewritePattern<mlir::tosa::TableOp> {
 
     // Store results and create carrier.
     int64_t n = numElements(op.getResult());
-    storeTiles(results, SEW::E32, n, rewriter, loc);
-    rewriter.replaceOp(op, tileCarrier(op, results, rewriter));
+    storeTiles(results, SEW::E32, n, rewriter, loc, getResultSlot(op));
+    rewriter.replaceOp(op, carrierForOp(op, n, SEW::E32, rewriter));
     return mlir::success();
   }
 };
@@ -867,8 +901,8 @@ struct TosaSigmoidLowering : public mlir::OpRewritePattern<mlir::tosa::SigmoidOp
     }
 
     int64_t n = numElements(op.getResult());
-    storeTiles(results, SEW::E32, n, rewriter, loc);
-    rewriter.replaceOp(op, tileCarrier(op, results, rewriter));
+    storeTiles(results, SEW::E32, n, rewriter, loc, getResultSlot(op));
+    rewriter.replaceOp(op, carrierForOp(op, n, SEW::E32, rewriter));
     return mlir::success();
   }
 };
@@ -898,8 +932,8 @@ struct TosaClampLowering : public mlir::OpRewritePattern<mlir::tosa::ClampOp> {
     llvm::SmallVector<mlir::Value> res;
     for (auto tile : tiles)
       res.push_back(rewriter.create<VMaxVXOp>(loc, vregE32(loc.getContext()), tile).getResult());
-    storeTiles(res, sew, n, rewriter, loc);
-    rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
+    storeTiles(res, sew, n, rewriter, loc, getResultSlot(op));
+    rewriter.replaceOp(op, carrierForOp(op, n, sew, rewriter));
     return mlir::success();
   }
 };
@@ -967,8 +1001,8 @@ struct TosaConcatLowering : public mlir::OpRewritePattern<mlir::tosa::ConcatOp> 
 
     // storeTiles writes to the result slot at kResultSlot using progressive
     // addresses; the whole concatenated output lands there as a flat array.
-    storeTiles(allTiles, sew, totalElems, rewriter, loc);
-    rewriter.replaceOp(op, tileCarrier(op, allTiles, rewriter));
+    storeTiles(allTiles, sew, totalElems, rewriter, loc, getResultSlot(op));
+    rewriter.replaceOp(op, carrierForOp(op, totalElems, sew, rewriter));
     return mlir::success();
   }
 };
@@ -1038,8 +1072,8 @@ struct TosaSliceLowering : public mlir::OpRewritePattern<mlir::tosa::SliceOp> {
       auto nV    = createI32Const(loc, (int32_t)elems, rewriter);
       res.push_back(rewriter.create<VLE32Op>(loc, vregE32(loc.getContext()), addrV, nV).getResult());
     }
-    storeTiles(res, sew, sliceElems, rewriter, loc);
-    rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
+    storeTiles(res, sew, sliceElems, rewriter, loc, getResultSlot(op));
+    rewriter.replaceOp(op, carrierForOp(op, sliceElems, sew, rewriter));
     return mlir::success();
   }
 };
@@ -1122,7 +1156,8 @@ struct TosaConv2DLowering : public mlir::OpRewritePattern<mlir::tosa::Conv2DOp> 
       auto nV    = createI32Const(loc, (int32_t)tileElems(t, k_oc, nOC, SEW::E32), rewriter);
       ocTiles.push_back(rewriter.create<VLE32Op>(loc, vregE32(loc.getContext()), addrV, nV).getResult());
     }
-    rewriter.replaceOp(op, tileCarrier(op, ocTiles, rewriter));
+    // Conv2d uses OC as element count; SEW is always E32.
+    rewriter.replaceOp(op, carrierForOp(op, nOC, SEW::E32, rewriter));
     return mlir::success();
   }
 };
@@ -1222,7 +1257,8 @@ struct TosaDepthwiseConv2DLowering
       auto nV    = createI32Const(loc, (int32_t)tileElems(t, k_c, nC, SEW::E32), rewriter);
       ocTiles.push_back(rewriter.create<VLE32Op>(loc, vregE32(loc.getContext()), addrV, nV).getResult());
     }
-    rewriter.replaceOp(op, tileCarrier(op, ocTiles, rewriter));
+    // Depthwise conv uses nC (channel count); SEW is E32.
+    rewriter.replaceOp(op, carrierForOp(op, nC, SEW::E32, rewriter));
     return mlir::success();
   }
 };
@@ -1720,8 +1756,8 @@ struct TosaMaximumLowering : public mlir::OpRewritePattern<mlir::tosa::MaximumOp
     llvm::SmallVector<mlir::Value> res;
     for (auto [l, r] : llvm::zip(lhsTiles, rhsTiles))
       res.push_back(rewriter.create<VMaxVVOp>(loc, vregE32(loc.getContext()), l, r).getResult());
-    storeTiles(res, sew, n, rewriter, loc);
-    rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
+    storeTiles(res, sew, n, rewriter, loc, getResultSlot(op));
+    rewriter.replaceOp(op, carrierForOp(op, n, sew, rewriter));
     return mlir::success();
   }
 };
@@ -1742,8 +1778,8 @@ struct TosaMinimumLowering : public mlir::OpRewritePattern<mlir::tosa::MinimumOp
     llvm::SmallVector<mlir::Value> res;
     for (auto [l, r] : llvm::zip(lhsTiles, rhsTiles))
       res.push_back(rewriter.create<VMinVVOp>(loc, vregE32(loc.getContext()), l, r).getResult());
-    storeTiles(res, sew, n, rewriter, loc);
-    rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
+    storeTiles(res, sew, n, rewriter, loc, getResultSlot(op));
+    rewriter.replaceOp(op, carrierForOp(op, n, sew, rewriter));
     return mlir::success();
   }
 };
@@ -2029,8 +2065,8 @@ struct TosaNegateVXLowering
       auto zero = createI32Const(loc, 0, rewriter);
       res.push_back(rewriter.create<VSubVXOp>(loc, vregE32(loc.getContext()), zero, t).getResult());
     }
-    storeTiles(res, sew, n, rewriter, loc);
-    rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
+    storeTiles(res, sew, n, rewriter, loc, getResultSlot(op));
+    rewriter.replaceOp(op, carrierForOp(op, n, sew, rewriter));
     return mlir::success();
   }
 };
@@ -2061,8 +2097,8 @@ struct TosaAbsLowering
       // abs(x) = pos_part + neg_part  (only one is nonzero for any given i)
       res.push_back(rewriter.create<VAddOp>(loc, vregE32(loc.getContext()), pos, neg_part, 1).getResult());
     }
-    storeTiles(res, sew, n, rewriter, loc);
-    rewriter.replaceOp(op, tileCarrier(op, res, rewriter));
+    storeTiles(res, sew, n, rewriter, loc, getResultSlot(op));
+    rewriter.replaceOp(op, carrierForOp(op, n, sew, rewriter));
     return mlir::success();
   }
 };
@@ -2151,6 +2187,8 @@ struct TosaConstLowering : public mlir::OpRewritePattern<mlir::tosa::ConstOp> {
     }
     // const data is already in its const slot; the storeTiles here is redundant
     // but kept for the side-effect that anchors the VLE32 chain alive.
+    // Use the const slot (not getResultSlot) for the carrier — const data lives
+    // in its own slot, not the intermediate result slot.
     storeTiles(tiles, sew, n, rewriter, loc, slot);
     rewriter.replaceOp(op, tileCarrier(op, tiles, rewriter));
     return mlir::success();
@@ -2168,16 +2206,67 @@ struct TosaToCoralNPUPass
   void runOnOperation() override {
     auto *ctx = &getContext();
 
-    // Pre-pass: collect all intermediate matmul ops (those whose result feeds
-    // another matmul through optional reshapes). This must be done BEFORE the
-    // greedy rewriter runs, because the rewriter changes the use-def graph as
-    // it lowers ops (a lowered matmul is no longer a tosa.matmul, so dynamic
-    // isIntermediateMatMul checks fail for already-lowered ops).
+    // Pre-pass A: collect intermediate matmul ops (matmul-specific logic).
     llvm::DenseSet<mlir::Operation *> intermediateMatMuls;
     getOperation()->walk([&](mlir::func::FuncOp funcOp) {
       funcOp.walk([&](mlir::tosa::MatMulOp mm) {
         if (isIntermediateMatMul(mm))
           intermediateMatMuls.insert(mm.getOperation());
+      });
+    });
+
+    // Pre-pass B: assign unique TCM result slots to ALL intermediate TOSA
+    // compute ops so chained element-wise ops (e.g. RMSNorm: xsq→sum→rsq→norm)
+    // do not overwrite each other's results in slot 8.
+    //
+    // Strategy: trace func.return back through reshape/passthrough to find
+    // the "last compute op" (keeps its natural slot = getResultSlot(op) via
+    // numArgs logic for e2e compatibility). All other compute ops get unique
+    // slots starting at max(numArgs+nConsts, kGemvBase)+offset.
+    //
+    // Metadata ops (reshape/transpose/const/const_shape/return) are excluded.
+    getOperation()->walk([&](mlir::func::FuncOp funcOp) {
+      // Find the last compute op in the def-use chain from func.return.
+      mlir::Operation *returnOp = nullptr;
+      funcOp.walk([&](mlir::func::ReturnOp ret) { returnOp = ret; });
+      mlir::Operation *lastComputeOp = nullptr;
+      if (returnOp && !returnOp->getOperands().empty()) {
+        mlir::Value v = returnOp->getOperand(0);
+        while (v && v.getDefiningOp()) {
+          auto *def = v.getDefiningOp();
+          if (mlir::isa<mlir::tosa::ReshapeOp>(def) &&
+              def->getNumOperands() >= 1) {
+            v = def->getOperand(0);
+          } else {
+            lastComputeOp = def;
+            break;
+          }
+        }
+      }
+
+      int64_t numArgs = (int64_t)funcOp.getNumArguments();
+      int64_t nConsts = 0;
+      funcOp.walk([&](mlir::tosa::ConstOp) { ++nConsts; });
+      // Start intermediate slots above CODE_BASE (slot 16 = 0x20000).
+      constexpr int64_t kIntermediateBase = 32; // 0x30000
+      int64_t nextSlot = std::max(numArgs + nConsts, kIntermediateBase);
+
+      funcOp.walk([&](mlir::Operation *op) {
+        // Skip metadata and control-flow ops.
+        if (mlir::isa<mlir::tosa::ReshapeOp, mlir::tosa::TransposeOp,
+                       mlir::tosa::ConstOp, mlir::tosa::ConstShapeOp,
+                       mlir::func::ReturnOp>(op))
+          return;
+        // Only TOSA dialect ops produce TCM results.
+        if (!op->getDialect() ||
+            op->getDialect()->getNamespace() != "tosa")
+          return;
+        if (op == lastComputeOp)
+          return; // last op keeps natural slot (e2e reads that fixed address)
+        // Assign a unique slot.
+        op->setAttr(kSlotAttr,
+            mlir::IntegerAttr::get(mlir::IntegerType::get(ctx, 64), nextSlot));
+        ++nextSlot;
       });
     });
 
