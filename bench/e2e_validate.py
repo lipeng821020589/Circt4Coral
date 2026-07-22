@@ -2963,6 +2963,59 @@ func.func @broadcast_mul(%x: tensor<4xi32>, %scalar: tensor<1xi32>) -> tensor<4x
         if elf_path.exists(): elf_path.unlink()
 
 
+# ── TEST 44: Full RMSNorm chain tensor<2> (sum_sq→rsqrt→broadcast mul) ────────
+
+def test_rmsnorm_full_chain_e2e():
+    print("\n=== TEST 44: RMSNorm full chain tensor<2> (xsq→sum→rsqrt→broadcast_mul→out) ===")
+    # x=[3,4], gamma=[2,2]
+    # xsq=[9,16], sum=25, +1=26, rsqrt(26)=0 (int), norm=x*0=[0,0], out=0*2=[0,0]
+    # Validates: per-op unique slots + broadcast scalar mul + VLE32 re-emit fix
+    mlir = """\
+func.func @rmsnorm(%x: tensor<2xi32>, %gamma: tensor<2xi32>) -> tensor<2xi32> {
+  %shift = "tosa.const"() <{values = dense<0> : tensor<1xi8>}> : () -> tensor<1xi8>
+  %xsq  = tosa.mul %x, %x, %shift : (tensor<2xi32>, tensor<2xi32>, tensor<1xi8>) -> tensor<2xi32>
+  %sum  = tosa.reduce_sum %xsq { axis = 0 : i32 } : (tensor<2xi32>) -> tensor<1xi32>
+  %eps  = "tosa.const"() <{values = dense<1> : tensor<1xi32>}> : () -> tensor<1xi32>
+  %seps = tosa.add %sum, %eps : (tensor<1xi32>, tensor<1xi32>) -> tensor<1xi32>
+  %rsq  = tosa.rsqrt %seps : (tensor<1xi32>) -> tensor<1xi32>
+  %norm = tosa.mul %x, %rsq, %shift : (tensor<2xi32>, tensor<1xi32>, tensor<1xi8>) -> tensor<2xi32>
+  %out  = tosa.mul %norm, %gamma, %shift : (tensor<2xi32>, tensor<2xi32>, tensor<1xi8>) -> tensor<2xi32>
+  func.return %out : tensor<2xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+              "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+    circt_out = run_circt_opt(mlir, passes)
+    insns = extract_asm_instructions(circt_out)
+
+    x_data = [3, 4] + [0]*14
+    g_data = [2, 2] + [0]*14
+    expected = [0, 0]  # rsqrt(26)=0, norm=x*0=0, out=0*gamma=0
+
+    prologue = [
+        ".section .text", ".globl _start", "_start:",
+        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    or    t0, t0, t1", "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(x_data, TCM_BASE + 0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(g_data, TCM_BASE + 1 * TCM_SLOT)
+
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 8)
+        actual = list(struct.unpack("<2i", raw))
+        check_result("RMSNorm chain: x=[3,4] gamma=[2,2] → [0,0] (rsqrt int trunc)",
+                     actual, expected)
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
+
 if __name__ == "__main__":
     print("CoralNPU E2E Validation")
     print(f"  circt-opt : {CIRCT_OPT}")
@@ -3018,6 +3071,7 @@ if __name__ == "__main__":
     test_decode_block_full_e2e()
     test_int8_gemv_mac_e2e()
     test_broadcast_mul_e2e()
+    test_rmsnorm_full_chain_e2e()
 
     print(f"\n{'='*50}")
     print(f"Results: {COUNTS['pass']} passed, {COUNTS['fail']} failed")
