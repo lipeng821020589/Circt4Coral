@@ -1290,16 +1290,20 @@ struct TosaMatMulLowering : public mlir::OpRewritePattern<mlir::tosa::MatMulOp> 
       auto elemTy = aTy ? aTy.getElementType() : rewriter.getI32Type();
       if (elemTy.isInteger(8)) {
         // int8 GEMV: use 8x8 MAC engine via OuterProductOp (CSR path).
+        // VLE32 loads pack 4 int8 per i32: a tile of kTile×kTile int8s
+        // occupies kTile*kTile/4 i32 elements. loadTile uses i32 elemOffset.
+        constexpr int64_t kInt8Pack = 4; // int8 elements per i32
         rewriter.create<VSetVLOp>(loc, SEW::E8, LMUL::M1);
         unsigned sm = stripmineFor(kTile * kTile, SEW::E8);
         auto col0 = createI32Const(loc, 0, rewriter);
         for (int64_t ni = 0; ni < nT; ++ni) {
           mlir::Value acc = createI32Const(loc, 0, rewriter);
           for (int64_t ki = 0; ki < kT; ++ki) {
-            auto aTile = loadTile(op.getOperand(0), ki * kTile * kTile,
-                                  kTile * kTile, rewriter, loc);
-            auto bTile = loadTile(op.getOperand(1), (ki * nT + ni) * kTile * kTile,
-                                  kTile * kTile, rewriter, loc);
+            int64_t tileI32 = (kTile * kTile) / kInt8Pack; // 16 i32s per tile
+            auto aTile = loadTile(op.getOperand(0), ki * tileI32,
+                                  tileI32, rewriter, loc);
+            auto bTile = loadTile(op.getOperand(1), (ki * nT + ni) * tileI32,
+                                  tileI32, rewriter, loc);
             acc = rewriter.create<OuterProductOp>(loc, aTile, bTile, acc, sm)
                       .getAccNew();
           }
@@ -1403,6 +1407,9 @@ struct TosaMatMulLowering : public mlir::OpRewritePattern<mlir::tosa::MatMulOp> 
     }
 
     // General GEMM path (M>1): tile through 8x8 outer-product MAC.
+    // VLE32 packs 4 int8 per i32; one kTile×kTile int8 tile = kTile²/4 i32s.
+    constexpr int64_t kInt8Pack = 4;
+    int64_t tileI32 = (kTile * kTile) / kInt8Pack; // 16 i32s per tile
     int64_t mT = ceilDiv(M, kTile);
     rewriter.create<VSetVLOp>(loc, SEW::E8, LMUL::M1);
     unsigned sm = stripmineFor(kTile * kTile, SEW::E8);
@@ -1412,10 +1419,10 @@ struct TosaMatMulLowering : public mlir::OpRewritePattern<mlir::tosa::MatMulOp> 
       for (int64_t ni = 0; ni < nT; ++ni) {
         mlir::Value acc = createI32Const(loc, 0, rewriter);
         for (int64_t ki = 0; ki < kT; ++ki) {
-          auto aTile = loadTile(op.getOperand(0), (mi * kT + ki) * kTile * kTile,
-                                kTile * kTile, rewriter, loc);
-          auto bTile = loadTile(op.getOperand(1), (ki * nT + ni) * kTile * kTile,
-                                kTile * kTile, rewriter, loc);
+          auto aTile = loadTile(op.getOperand(0), (mi * kT + ki) * tileI32,
+                                tileI32, rewriter, loc);
+          auto bTile = loadTile(op.getOperand(1), (ki * nT + ni) * tileI32,
+                                tileI32, rewriter, loc);
           acc = rewriter.create<OuterProductOp>(loc, aTile, bTile, acc, sm)
                     .getAccNew();
         }

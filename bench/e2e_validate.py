@@ -2856,6 +2856,66 @@ func.func @decode_block(%x:  tensor<4xi32>,
         if elf_path.exists(): elf_path.unlink()
 
 
+# ── TEST 42: int8 GEMV via MAC CSR (OuterProductOp E2E) ───────────────────────
+
+def test_int8_gemv_mac_e2e():
+    print("\n=== TEST 42: int8 GEMV MAC CSR — OuterProductOp Spike E2E ===")
+    # a = [1,0,0,0,0,0,0,0] (int8, 1×8)
+    # W = diag([1,2,3,4,5,6,7,8]) (int8, 8×8)
+    # result = a @ W = [1,0,0,0,0,0,0,0] (int32)
+    # Validates MAC CSR path: csrw KSCM0, csrw KSCM1, csrw KISA, csrr MCONTEXT
+    mlir = """\
+func.func @gemv_int8(%a: tensor<1x1x8xi8>, %b: tensor<1x8x8xi8>,
+                     %az: tensor<1xi8>, %bz: tensor<1xi8>) -> tensor<1x1x8xi32> {
+  %0 = tosa.matmul %a, %b, %az, %bz
+    : (tensor<1x1x8xi8>, tensor<1x8x8xi8>, tensor<1xi8>, tensor<1xi8>) -> tensor<1x1x8xi32>
+  func.return %0 : tensor<1x1x8xi32>
+}
+"""
+    passes = ["--tosa-to-coralnpu", "--coralnpu-legalize",
+              "--coralnpu-regalloc", "--emit-coralnpu-assembly"]
+    circt_out = run_circt_opt(mlir, passes)
+    insns = extract_asm_instructions(circt_out)
+
+    # a = [1, 0, 0, 0, 0, 0, 0, 0]: 8 int8 packed LE into 2 i32
+    a_words = [0x00000001, 0x00000000]
+    # W = diag([1..8]) row-major, each row = 8 int8 packed into 2 i32
+    W_words = [
+        0x00000001, 0x00000000,   # row 0: [1,0,0,0,0,0,0,0]
+        0x00000200, 0x00000000,   # row 1: [0,2,0,0,0,0,0,0]
+        0x00030000, 0x00000000,   # row 2: [0,0,3,0,0,0,0,0]
+        0x04000000, 0x00000000,   # row 3: [0,0,0,4,0,0,0,0]
+        0x00000000, 0x00000005,   # row 4: [0,0,0,0,5,0,0,0]
+        0x00000000, 0x00000600,   # row 5: [0,0,0,0,0,6,0,0]
+        0x00000000, 0x00070000,   # row 6: [0,0,0,0,0,0,7,0]
+        0x00000000, 0x08000000,   # row 7: [0,0,0,0,0,0,0,8]
+    ]
+    expected = [1, 0, 0, 0, 0, 0, 0, 0]
+
+    prologue = [
+        ".section .text", ".globl _start", "_start:",
+        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    or    t0, t0, t1", "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(a_words + [0]*14, TCM_BASE + 0*TCM_SLOT)
+    prologue += write_int32_to_asm_init(W_words + [0]*48, TCM_BASE + 1*TCM_SLOT)
+
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR, 32)
+        actual = list(struct.unpack("<8i", raw))
+        check_result("int8 GEMV MAC CSR: a=[1,0..0] × diag([1..8]) → [1,0..0]",
+                     actual, expected)
+    except Exception as e:
+        print(f"  [ERROR] {e}"); COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists(): elf_path.unlink()
+
+
 if __name__ == "__main__":
     print("CoralNPU E2E Validation")
     print(f"  circt-opt : {CIRCT_OPT}")
@@ -2909,6 +2969,7 @@ if __name__ == "__main__":
     test_rmsnorm_e2e()
     test_transformer_decode_block_e2e()
     test_decode_block_full_e2e()
+    test_int8_gemv_mac_e2e()
 
     print(f"\n{'='*50}")
     print(f"Results: {COUNTS['pass']} passed, {COUNTS['fail']} failed")
