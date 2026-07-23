@@ -53,6 +53,7 @@ target_link_libraries(circt-opt
   MLIRTosaToLinalg
   MLIRLinalgDialect
   MLIRLinalgTransforms
+  MLIRTosaTransforms
 )
 
 export_executable_symbols_for_plugins(circt-opt)

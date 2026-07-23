@@ -38,6 +38,7 @@
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Conversion/TosaToLinalg/TosaToLinalg.h"
 #include "mlir/Conversion/Passes.h"
+#include "mlir/Dialect/Tosa/Transforms/Passes.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
@@ -90,6 +91,7 @@ int main(int argc, char **argv) {
   mlir::bufferization::registerBufferizationPasses();
   mlir::registerTosaToLinalg();
   mlir::registerTosaToLinalgNamed();
+  mlir::tosa::registerTosaPasses();
   mlir::linalg::registerBufferizableOpInterfaceExternalModels(registry);
   // Register external bufferizable interface implementations.
   mlir::bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry);
