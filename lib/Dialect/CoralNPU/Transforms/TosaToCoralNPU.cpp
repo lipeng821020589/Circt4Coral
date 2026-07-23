@@ -1704,10 +1704,11 @@ struct TosaReduceSumLowering : public mlir::OpRewritePattern<mlir::tosa::ReduceS
 };
 
 //===----------------------------------------------------------------------===//
-// tosa.rsqrt → vredsum to get scalar, then scalar integer inverse sqrt approx
-// For integer inputs: rsqrt(x) = 1 / x (integer division, truncates).
-// This is an integer approximation sufficient for lowering chain validation;
-// float-accurate rsqrt requires a Newton-Raphson pass (future work).
+// tosa.rsqrt → float path: fcvt.s.w → fsqrt.s → fdiv.s(1.0/sqrt) → fcvt.w.s
+// Returns floor(1 / sqrt(x)) as an integer (truncates toward zero).
+// For integer-domain RMSNorm this equals 0 when x > 1; for the iSQRT
+// use-case (just compute floor(sqrt(x))), use ScalarFCvtWSRtzOp on fsqrt.s.
+// Requires mstatus.FS to be enabled in the firmware prologue.
 //===----------------------------------------------------------------------===//
 struct TosaRsqrtLowering : public mlir::OpRewritePattern<mlir::tosa::RsqrtOp> {
   using mlir::OpRewritePattern<mlir::tosa::RsqrtOp>::OpRewritePattern;
@@ -1715,19 +1716,30 @@ struct TosaRsqrtLowering : public mlir::OpRewritePattern<mlir::tosa::RsqrtOp> {
                                       mlir::PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     rewriter.create<VSetVLOp>(loc, SEW::E32, LMUL::M1);
-    // Reduce input to scalar sum (for 1-element tensor, this IS the value).
+    // Reduce input to scalar (handles tensor<1xi32> as well as scalar).
     auto tiles = getTiles(op.getInput1(), SEW::E32, rewriter, loc);
     mlir::Value acc = createI32Const(loc, 0, rewriter);
     for (auto tile : tiles) {
       auto partial = rewriter.create<VRedSumOp>(loc, tile).getResult();
       acc = rewriter.create<ScalarAddOp>(loc, acc, partial).getResult();
     }
-    // Integer rsqrt: 1 / x (truncating division). Sufficient for int32 chain tests.
-    auto one = createI32Const(loc, 1, rewriter);
-    auto inv = rewriter.create<ScalarDivOp>(loc, one, acc);
+    // Float path: 1.0f / sqrt((float)x).
+    //   fcvt.s.w  f_x,   x            # (float)x
+    //   fsqrt.s   f_sq,  f_x          # sqrt(x)
+    //   fmv.w.x   f_one, x1           # 1.0 (bit pattern 0x3F800000)
+    //   fdiv.s    f_inv, f_one, f_sq  # 1.0 / sqrt(x)
+    //   fcvt.w.s  x_res, f_inv, rtz   # (int)(1/sqrt(x)) truncated
+    auto fX   = rewriter.create<ScalarFCvtSWOp>(loc, rewriter.getI32Type(), acc);
+    auto fSq  = rewriter.create<ScalarFSqrtOp>(loc, rewriter.getI32Type(), fX.getResult());
+    // Load 1.0f as bit-pattern 0x3F800000.
+    auto one_bits = createI32Const(loc, (int32_t)0x3F800000, rewriter);
+    auto fOne = rewriter.create<ScalarFMvWXOp>(loc, rewriter.getI32Type(), one_bits);
+    auto fInv = rewriter.create<ScalarFDivOp>(loc, rewriter.getI32Type(),
+                                               fOne.getResult(), fSq.getResult());
+    auto xRes = rewriter.create<ScalarFCvtWSRtzOp>(loc, rewriter.getI32Type(), fInv.getResult());
     auto ra = createI32Const(loc, (int32_t)(kTcmBase + getResultSlot(op)*kTcmSlot), rewriter);
-    rewriter.create<ScalarSwOp>(loc, inv.getResult(), ra);
-    rewriter.replaceOp(op, carrier(op, rewriter, inv.getResult()));
+    rewriter.create<ScalarSwOp>(loc, xRes.getResult(), ra);
+    rewriter.replaceOp(op, carrier(op, rewriter, xRes.getResult()));
     return mlir::success();
   }
 };

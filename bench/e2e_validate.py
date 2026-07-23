@@ -276,7 +276,7 @@ func.func @test_add(%arg0: tensor<4xi32>, %arg1: tensor<4xi32>) -> tensor<4xi32>
         ".globl _start",
         "_start:",
         "    csrr  t0, mstatus",
-        "    li    t1, 0x600",
+        "    li    t1, 0x2600",
         "    or    t0, t0, t1",
         "    csrw  mstatus, t0",
     ]
@@ -326,7 +326,7 @@ func.func @test_add8(%arg0: tensor<8xi32>, %arg1: tensor<8xi32>) -> tensor<8xi32
         ".globl _start",
         "_start:",
         "    csrr  t0, mstatus",
-        "    li    t1, 0x600",
+        "    li    t1, 0x2600",
         "    or    t0, t0, t1",
         "    csrw  mstatus, t0",
     ]
@@ -387,7 +387,7 @@ def test_avgpool():
         ".globl _start",
         "_start:",
         "    csrr  t0, mstatus",
-        "    li    t1, 0x600",
+        "    li    t1, 0x2600",
         "    or    t0, t0, t1",
         "    csrw  mstatus, t0",
     ]
@@ -436,7 +436,7 @@ func.func @relu(%arg0: tensor<4xi32>) -> tensor<4xi32> {
         ".globl _start",
         "_start:",
         "    csrr  t0, mstatus",
-        "    li    t1, 0x600",
+        "    li    t1, 0x2600",
         "    or    t0, t0, t1",
         "    csrw  mstatus, t0",
     ]
@@ -483,7 +483,7 @@ func.func @mp(%in: tensor<1x2x2x1xi32>) -> tensor<1x1x1x1xi32> {
         ".globl _start",
         "_start:",
         "    csrr  t0, mstatus",
-        "    li    t1, 0x600",
+        "    li    t1, 0x2600",
         "    or    t0, t0, t1",
         "    csrw  mstatus, t0",
     ]
@@ -543,7 +543,7 @@ func.func @dw(%in: tensor<1x1x1x1xi8>, %wt: tensor<1x1x1x1xi8>,
         ".globl _start",
         "_start:",
         "    csrr  t0, mstatus",
-        "    li    t1, 0x600",
+        "    li    t1, 0x2600",
         "    or    t0, t0, t1",
         "    csrw  mstatus, t0",
     ]
@@ -712,7 +712,7 @@ func.func @rescale_test(%in: tensor<1xi32>, %mult: tensor<1xi32>, %shift: tensor
         ".globl _start",
         "_start:",
         "    csrr  t0, mstatus",
-        "    li    t1, 0x600",
+        "    li    t1, 0x2600",
         "    or    t0, t0, t1",
         "    csrw  mstatus, t0",
     ]
@@ -810,7 +810,7 @@ func.func @dw_rescale(%in: tensor<1x1x1x4xi8>, %wt: tensor<1x1x4x1xi8>,
         ".globl _start",
         "_start:",
         "    csrr  t0, mstatus",
-        "    li    t1, 0x600",
+        "    li    t1, 0x2600",
         "    or    t0, t0, t1",
         "    csrw  mstatus, t0",
     ]
@@ -880,7 +880,7 @@ func.func @sigmoid_lut(%in: tensor<1xi8>) -> tensor<1xi8> {
         ".globl _start",
         "_start:",
         "    csrr  t0, mstatus",
-        "    li    t1, 0x600",
+        "    li    t1, 0x2600",
         "    or    t0, t0, t1",
         "    csrw  mstatus, t0",
     ]
@@ -1048,7 +1048,7 @@ func.func @mobilenet_dw_block(
         ".globl _start",
         "_start:",
         "    csrr  t0, mstatus",
-        "    li    t1, 0x600",
+        "    li    t1, 0x2600",
         "    or    t0, t0, t1",
         "    csrw  mstatus, t0",
     ]
@@ -1102,7 +1102,7 @@ func.func @concat_e2e(%a: tensor<4xi32>, %b: tensor<4xi32>) -> tensor<8xi32> {
 
     prologue = [
         ".section .text", ".globl _start", "_start:",
-        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    csrr  t0, mstatus", "    li    t1, 0x2600",
         "    or    t0, t0, t1", "    csrw  mstatus, t0",
     ]
     prologue += write_int32_to_asm_init(a, TCM_BASE + 0 * TCM_SLOT)
@@ -1149,7 +1149,7 @@ func.func @slice_e2e(%a: tensor<8xi32>) -> tensor<4xi32> {
 
     prologue = [
         ".section .text", ".globl _start", "_start:",
-        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    csrr  t0, mstatus", "    li    t1, 0x2600",
         "    or    t0, t0, t1", "    csrw  mstatus, t0",
     ]
     prologue += write_int32_to_asm_init(a, TCM_BASE + 0 * TCM_SLOT)
@@ -1185,7 +1185,7 @@ func.func @reduce_sum(%a: tensor<4xi32>) -> tensor<1xi32> {
     a = [3, 1, 4, 1] + [0]*12
     RESULT_ADDR = TCM_BASE + 8 * TCM_SLOT
     prologue = [".section .text",".globl _start","_start:",
-                "    csrr  t0, mstatus","    li    t1, 0x600",
+                "    csrr  t0, mstatus","    li    t1, 0x2600",
                 "    or    t0, t0, t1","    csrw  mstatus, t0"]
     prologue += write_int32_to_asm_init(a, TCM_BASE + 0 * TCM_SLOT)
     full_asm = "\n".join(prologue)+"\n"+"\n".join(insns)+"\n.Lexit:\n    ebreak\n"
@@ -1214,7 +1214,7 @@ func.func @reduce_max(%a: tensor<4xi32>) -> tensor<1xi32> {
     a = [3, 7, 1, 5] + [0]*12
     RESULT_ADDR = TCM_BASE + 8 * TCM_SLOT
     prologue = [".section .text",".globl _start","_start:",
-                "    csrr  t0, mstatus","    li    t1, 0x600",
+                "    csrr  t0, mstatus","    li    t1, 0x2600",
                 "    or    t0, t0, t1","    csrw  mstatus, t0"]
     prologue += write_int32_to_asm_init(a, TCM_BASE + 0 * TCM_SLOT)
     full_asm = "\n".join(prologue)+"\n"+"\n".join(insns)+"\n.Lexit:\n    ebreak\n"
@@ -1244,7 +1244,7 @@ func.func @maximum(%a: tensor<4xi32>, %b: tensor<4xi32>) -> tensor<4xi32> {
     b = [4, 2, 6, 0] + [0]*12
     RESULT_ADDR = TCM_BASE + 8 * TCM_SLOT
     prologue = [".section .text",".globl _start","_start:",
-                "    csrr  t0, mstatus","    li    t1, 0x600",
+                "    csrr  t0, mstatus","    li    t1, 0x2600",
                 "    or    t0, t0, t1","    csrw  mstatus, t0"]
     prologue += write_int32_to_asm_init(a, TCM_BASE + 0 * TCM_SLOT)
     prologue += write_int32_to_asm_init(b, TCM_BASE + 1 * TCM_SLOT)
@@ -1276,7 +1276,7 @@ func.func @minimum(%a: tensor<4xi32>, %b: tensor<4xi32>) -> tensor<4xi32> {
     b = [4, 2, 6, 0] + [0]*12
     RESULT_ADDR = TCM_BASE + 8 * TCM_SLOT
     prologue = [".section .text",".globl _start","_start:",
-                "    csrr  t0, mstatus","    li    t1, 0x600",
+                "    csrr  t0, mstatus","    li    t1, 0x2600",
                 "    or    t0, t0, t1","    csrw  mstatus, t0"]
     prologue += write_int32_to_asm_init(a, TCM_BASE + 0 * TCM_SLOT)
     prologue += write_int32_to_asm_init(b, TCM_BASE + 1 * TCM_SLOT)
@@ -1309,7 +1309,7 @@ func.func @cast_widen(%a: tensor<4xi8>) -> tensor<4xi32> {
     a = [1, -2, 3, -4] + [0]*12
     RESULT_ADDR = TCM_BASE + 8 * TCM_SLOT
     prologue = [".section .text",".globl _start","_start:",
-                "    csrr  t0, mstatus","    li    t1, 0x600",
+                "    csrr  t0, mstatus","    li    t1, 0x2600",
                 "    or    t0, t0, t1","    csrw  mstatus, t0"]
     prologue += write_int32_to_asm_init(a, TCM_BASE + 0 * TCM_SLOT)
     full_asm = "\n".join(prologue)+"\n"+"\n".join(insns)+"\n.Lexit:\n    ebreak\n"
@@ -1341,7 +1341,7 @@ func.func @ars(%a: tensor<1xi32>, %b: tensor<1xi32>) -> tensor<1xi32> {
     a = [16] + [0]*15; b = [2] + [0]*15
     RESULT_ADDR = TCM_BASE + 8 * TCM_SLOT
     prologue = [".section .text",".globl _start","_start:",
-                "    csrr  t0, mstatus","    li    t1, 0x600",
+                "    csrr  t0, mstatus","    li    t1, 0x2600",
                 "    or    t0, t0, t1","    csrw  mstatus, t0"]
     prologue += write_int32_to_asm_init(a, TCM_BASE + 0 * TCM_SLOT)
     prologue += write_int32_to_asm_init(b, TCM_BASE + 1 * TCM_SLOT)
@@ -1373,7 +1373,7 @@ func.func @eq(%a: tensor<1xi32>, %b: tensor<1xi32>) -> tensor<1xi1> {
     RESULT_ADDR = TCM_BASE + 8 * TCM_SLOT
     def run_eq(av, bv, expect):
         prologue = [".section .text",".globl _start","_start:",
-                    "    csrr  t0, mstatus","    li    t1, 0x600",
+                    "    csrr  t0, mstatus","    li    t1, 0x2600",
                     "    or    t0, t0, t1","    csrw  mstatus, t0"]
         prologue += write_int32_to_asm_init(av, TCM_BASE + 0 * TCM_SLOT)
         prologue += write_int32_to_asm_init(bv, TCM_BASE + 1 * TCM_SLOT)
@@ -1408,7 +1408,7 @@ func.func @sel(%cond: tensor<1xi1>, %a: tensor<1xi32>, %b: tensor<1xi32>) -> ten
     def run_sel(cond_val, expect):
         cond=[cond_val]+[0]*15
         prologue = [".section .text",".globl _start","_start:",
-                    "    csrr  t0, mstatus","    li    t1, 0x600",
+                    "    csrr  t0, mstatus","    li    t1, 0x2600",
                     "    or    t0, t0, t1","    csrw  mstatus, t0"]
         prologue += write_int32_to_asm_init(cond, TCM_BASE + 0 * TCM_SLOT)
         prologue += write_int32_to_asm_init(va,   TCM_BASE + 1 * TCM_SLOT)
@@ -1446,7 +1446,7 @@ def test_const_add_e2e():
     bias = [1, 2, 3, 4]     + [0]*12
     RESULT_ADDR = TCM_BASE + 8 * TCM_SLOT
     prologue = [".section .text", ".globl _start", "_start:",
-                "    csrr  t0, mstatus", "    li    t1, 0x600",
+                "    csrr  t0, mstatus", "    li    t1, 0x2600",
                 "    or    t0, t0, t1", "    csrw  mstatus, t0"]
     prologue += write_int32_to_asm_init(a,    TCM_BASE + 0 * TCM_SLOT)
     prologue += write_int32_to_asm_init(bias, TCM_BASE + 1 * TCM_SLOT)
@@ -1479,7 +1479,7 @@ def test_const_tiled_e2e():
     bias = [1,2,3,4,5,6,7,8]        + [0]*8
     RESULT_ADDR = TCM_BASE + 8 * TCM_SLOT
     prologue = [".section .text", ".globl _start", "_start:",
-                "    csrr  t0, mstatus", "    li    t1, 0x600",
+                "    csrr  t0, mstatus", "    li    t1, 0x2600",
                 "    or    t0, t0, t1", "    csrw  mstatus, t0"]
     prologue += write_int32_to_asm_init(a,    TCM_BASE + 0 * TCM_SLOT)
     prologue += write_int32_to_asm_init(bias, TCM_BASE + 1 * TCM_SLOT)
@@ -1525,7 +1525,7 @@ func.func @pw_conv(
     wzp_vals  = [0]*16
     prologue = [
         ".section .text", ".globl _start", "_start:",
-        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    csrr  t0, mstatus", "    li    t1, 0x2600",
         "    or    t0, t0, t1",  "    csrw  mstatus, t0",
     ]
     prologue += write_int32_to_asm_init(in_vals,   TCM_BASE + 0 * TCM_SLOT)
@@ -1588,7 +1588,7 @@ func.func @pw_conv_rescale(
     ozp_vals   = [0]*16
     prologue = [
         ".section .text", ".globl _start", "_start:",
-        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    csrr  t0, mstatus", "    li    t1, 0x2600",
         "    or    t0, t0, t1",  "    csrw  mstatus, t0",
     ]
     prologue += write_int32_to_asm_init(in_vals,    TCM_BASE + 0 * TCM_SLOT)
@@ -1682,7 +1682,7 @@ def test_mobilenet_dw_pw_block_e2e():
 
     prologue = [
         ".section .text", ".globl _start", "_start:",
-        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    csrr  t0, mstatus", "    li    t1, 0x2600",
         "    or    t0, t0, t1",  "    csrw  mstatus, t0",
     ]
     prologue += write_int32_to_asm_init(in_vals,     TCM_BASE +  0 * TCM_SLOT)
@@ -1747,7 +1747,7 @@ def test_conv2d_oc2_e2e():
 
     prologue = [
         ".section .text", ".globl _start", "_start:",
-        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    csrr  t0, mstatus", "    li    t1, 0x2600",
         "    or    t0, t0, t1",  "    csrw  mstatus, t0",
     ]
     prologue += write_int32_to_asm_init(in_vals,   TCM_BASE + 0 * TCM_SLOT)
@@ -1815,7 +1815,7 @@ def test_conv2d_oc2_rescale_relu_e2e():
 
     prologue = [
         ".section .text", ".globl _start", "_start:",
-        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    csrr  t0, mstatus", "    li    t1, 0x2600",
         "    or    t0, t0, t1",  "    csrw  mstatus, t0",
     ]
     prologue += write_int32_to_asm_init(in_vals,    TCM_BASE + 0 * TCM_SLOT)
@@ -1920,7 +1920,7 @@ def test_mobilenet_full_oc2_e2e():
 
     prologue = [
         ".section .text", ".globl _start", "_start:",
-        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    csrr  t0, mstatus", "    li    t1, 0x2600",
         "    or    t0, t0, t1",  "    csrw  mstatus, t0",
     ]
     prologue += write_int32_to_asm_init(in_vals,     TCM_BASE +  0 * TCM_SLOT)
@@ -2090,7 +2090,7 @@ def test_two_mobilenet_blocks_e2e():
 
     prologue = [
         ".section .text", ".globl _start", "_start:",
-        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    csrr  t0, mstatus", "    li    t1, 0x2600",
         "    or    t0, t0, t1",  "    csrw  mstatus, t0",
     ]
     prologue += write_int32_to_asm_init(in_vals,   TCM_BASE +  0 * TCM_SLOT)
@@ -2195,7 +2195,7 @@ def test_weight_injection_e2e():
     bias_vals = [0]*16
     prologue_std = [
         ".section .text", ".globl _start", "_start:",
-        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    csrr  t0, mstatus", "    li    t1, 0x2600",
         "    or    t0, t0, t1",  "    csrw  mstatus, t0",
     ]
     prologue_std += write_int32_to_asm_init(in_vals,   TCM_BASE + 0 * TCM_SLOT)
@@ -2216,7 +2216,7 @@ def test_weight_injection_e2e():
     # Build ELF with empty prologue (mstatus enable only), then patch .data
     prologue_bare = [
         ".section .text", ".globl _start", "_start:",
-        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    csrr  t0, mstatus", "    li    t1, 0x2600",
         "    or    t0, t0, t1",  "    csrw  mstatus, t0",
     ]
     # Append .data section (9 zero slots) to the same .S file so linker
@@ -2336,7 +2336,7 @@ def test_tflite_weight_e2e():
         # ── 3. 构建 ELF（.data@0x10000 , .text@0x20000）──────────────────────
         prologue_hdr = [
             ".section .text", ".globl _start", "_start:",
-            "    csrr  t0, mstatus", "    li    t1, 0x600",
+            "    csrr  t0, mstatus", "    li    t1, 0x2600",
             "    or    t0, t0, t1",  "    csrw  mstatus, t0",
         ]
         data_section = "\n.section .data\n.balign 4\n.zero 36864\n"
@@ -2422,7 +2422,7 @@ def test_conv2d_ic8_oc1_e2e():
     bias_vals = [0]*16
     prologue = [
         ".section .text", ".globl _start", "_start:",
-        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    csrr  t0, mstatus", "    li    t1, 0x2600",
         "    or    t0, t0, t1",  "    csrw  mstatus, t0",
     ]
     prologue += write_int32_to_asm_init(in_vals,   TCM_BASE + 0 * TCM_SLOT)
@@ -2473,7 +2473,7 @@ def test_conv2d_ic8_oc4_e2e():
     bias_vals = [0]*16
     prologue = [
         ".section .text", ".globl _start", "_start:",
-        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    csrr  t0, mstatus", "    li    t1, 0x2600",
         "    or    t0, t0, t1",  "    csrw  mstatus, t0",
     ]
     prologue += write_int32_to_asm_init(in_vals,   TCM_BASE + 0 * TCM_SLOT)
@@ -2524,7 +2524,7 @@ def test_conv2d_ic16_oc2_e2e():
     bias_vals = [0]*16
     prologue = [
         ".section .text", ".globl _start", "_start:",
-        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    csrr  t0, mstatus", "    li    t1, 0x2600",
         "    or    t0, t0, t1",  "    csrw  mstatus, t0",
     ]
     prologue += write_int32_to_asm_init(in_vals,   TCM_BASE + 0 * TCM_SLOT)
@@ -2581,7 +2581,7 @@ def test_dw33_e2e():
 
     prologue = [
         ".section .text", ".globl _start", "_start:",
-        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    csrr  t0, mstatus", "    li    t1, 0x2600",
         "    or    t0, t0, t1",  "    csrw  mstatus, t0",
     ]
     prologue += write_int32_to_asm_init(in_vals,   TCM_BASE + 0 * TCM_SLOT)
@@ -2635,7 +2635,7 @@ func.func @gemv(%a: tensor<1x1x4xi32>, %b: tensor<1x4x4xi32>,
         ".globl _start",
         "_start:",
         "    csrr  t0, mstatus",
-        "    li    t1, 0x600",
+        "    li    t1, 0x2600",
         "    or    t0, t0, t1",
         "    csrw  mstatus, t0",
     ]
@@ -2691,7 +2691,7 @@ func.func @rmsnorm_scalar(%x: tensor<1xi32>, %g: tensor<1xi32>) -> tensor<1xi32>
         ".globl _start",
         "_start:",
         "    csrr  t0, mstatus",
-        "    li    t1, 0x600",
+        "    li    t1, 0x2600",
         "    or    t0, t0, t1",
         "    csrw  mstatus, t0",
     ]
@@ -2751,7 +2751,7 @@ func.func @chain2(%x: tensor<4xi32>, %wv: tensor<4x4xi32>, %wo: tensor<4x4xi32>)
 
     prologue = [
         ".section .text", ".globl _start", "_start:",
-        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    csrr  t0, mstatus", "    li    t1, 0x2600",
         "    or    t0, t0, t1", "    csrw  mstatus, t0",
     ]
     prologue += write_int32_to_asm_init(x_data, TCM_BASE + 0 * TCM_SLOT)
@@ -2833,7 +2833,7 @@ func.func @decode_block(%x:  tensor<4xi32>,
 
     prologue = [
         ".section .text", ".globl _start", "_start:",
-        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    csrr  t0, mstatus", "    li    t1, 0x2600",
         "    or    t0, t0, t1", "    csrw  mstatus, t0",
     ]
     prologue += write_int32_to_asm_init(x_data, TCM_BASE + 0 * TCM_SLOT)
@@ -2894,7 +2894,7 @@ func.func @gemv_int8(%a: tensor<1x1x8xi8>, %b: tensor<1x8x8xi8>,
 
     prologue = [
         ".section .text", ".globl _start", "_start:",
-        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    csrr  t0, mstatus", "    li    t1, 0x2600",
         "    or    t0, t0, t1", "    csrw  mstatus, t0",
     ]
     prologue += write_int32_to_asm_init(a_words + [0]*14, TCM_BASE + 0*TCM_SLOT)
@@ -2941,7 +2941,7 @@ func.func @broadcast_mul(%x: tensor<4xi32>, %scalar: tensor<1xi32>) -> tensor<4x
 
     prologue = [
         ".section .text", ".globl _start", "_start:",
-        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    csrr  t0, mstatus", "    li    t1, 0x2600",
         "    or    t0, t0, t1", "    csrw  mstatus, t0",
     ]
     prologue += write_int32_to_asm_init(x_data, TCM_BASE + 0 * TCM_SLOT)
@@ -2994,7 +2994,7 @@ func.func @rmsnorm(%x: tensor<2xi32>, %gamma: tensor<2xi32>) -> tensor<2xi32> {
 
     prologue = [
         ".section .text", ".globl _start", "_start:",
-        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    csrr  t0, mstatus", "    li    t1, 0x2600",
         "    or    t0, t0, t1", "    csrw  mstatus, t0",
     ]
     prologue += write_int32_to_asm_init(x_data, TCM_BASE + 0 * TCM_SLOT)
@@ -3075,7 +3075,7 @@ func.func @gemv(%a: tensor<1x1x4xi32>, %b: tensor<1x4x4xi32>) -> tensor<1x1x4xi3
 
     prologue = [
         ".section .text", ".globl _start", "_start:",
-        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    csrr  t0, mstatus", "    li    t1, 0x2600",
         "    or    t0, t0, t1", "    csrw  mstatus, t0",
     ]
     prologue += write_int32_to_asm_init(a_data, TCM_BASE + 0 * TCM_SLOT)
@@ -3090,6 +3090,86 @@ func.func @gemv(%a: tensor<1x1x4xi32>, %b: tensor<1x4x4xi32>) -> tensor<1x1x4xi3
         raw = run_spike_and_read_mem(elf_path, LINALG_RESULT_ADDR, 16)
         actual = list(struct.unpack("<4i", raw))
         check_result("GEMV via linalg bufferize: A=[1,1,1,1] B=identity-row -> [1,1,1,1]",
+                     actual, expected)
+    except Exception as e:
+        print("  [ERROR] " + str(e))
+        COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists():
+            elf_path.unlink()
+
+
+
+
+# --- TEST 46: isqrt via fsqrt.s (float sqrt -> int truncation) ---
+# Validates the new fcvt.s.w -> fsqrt.s -> fcvt.w.s.rtz path used by
+# TosaRsqrtLowering. Tests that the FP path is correctly assembled and
+# executes correctly on Spike with mstatus.FS enabled.
+
+def test_isqrt_fp_e2e():
+    print("\n=== TEST 46: isqrt via fsqrt.s float path (FP unit validation) ===")
+    # Hand-written assembly: compute floor(sqrt(x)) for x in [2, 25, 49, 100].
+    # Using fcvt.s.w + fsqrt.s + fcvt.w.s rtz.
+    # Results written to 0x30000: [1, 5, 7, 10]
+    import tempfile, struct
+    from pathlib import Path
+
+    asm_body = """
+    # x=2: isqrt = 1
+    li    x5, 2
+    fcvt.s.w  f0, x5
+    fsqrt.s   f1, f0
+    fcvt.w.s  x6, f1, rtz
+    lui   x2, 48
+    sw    x6, 0(x2)
+
+    # x=25: isqrt = 5
+    li    x5, 25
+    fcvt.s.w  f0, x5
+    fsqrt.s   f1, f0
+    fcvt.w.s  x6, f1, rtz
+    lui   x2, 48
+    addi  x2, x2, 4
+    sw    x6, 0(x2)
+
+    # x=49: isqrt = 7
+    li    x5, 49
+    fcvt.s.w  f0, x5
+    fsqrt.s   f1, f0
+    fcvt.w.s  x6, f1, rtz
+    lui   x2, 48
+    addi  x2, x2, 8
+    sw    x6, 0(x2)
+
+    # x=100: isqrt = 10
+    li    x5, 100
+    fcvt.s.w  f0, x5
+    fsqrt.s   f1, f0
+    fcvt.w.s  x6, f1, rtz
+    lui   x2, 48
+    addi  x2, x2, 12
+    sw    x6, 0(x2)
+
+    nop
+"""
+
+    RESULT_ADDR_46 = 0x30000  # lui x2, 48 in asm = 0x30000
+
+    prologue = [
+        ".section .text", ".globl _start", "_start:",
+        "    csrr  t0, mstatus", "    li    t1, 0x2600",
+        "    or    t0, t0, t1", "    csrw  mstatus, t0",
+    ]
+    full_asm = "\n".join(prologue) + asm_body + "\n    ebreak\n.Lexit:\n    ebreak\n"
+
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, RESULT_ADDR_46, 16)
+        actual = list(struct.unpack("<4i", raw))
+        expected = [1, 5, 7, 10]
+        check_result("isqrt via fsqrt.s: sqrt(2,25,49,100) = [1,5,7,10]",
                      actual, expected)
     except Exception as e:
         print("  [ERROR] " + str(e))
@@ -3156,6 +3236,7 @@ if __name__ == "__main__":
     test_broadcast_mul_e2e()
     test_rmsnorm_full_chain_e2e()
     test_linalg_gemv_e2e()
+    test_isqrt_fp_e2e()
 
     print(f"\n{'='*50}")
     print(f"Results: {COUNTS['pass']} passed, {COUNTS['fail']} failed")

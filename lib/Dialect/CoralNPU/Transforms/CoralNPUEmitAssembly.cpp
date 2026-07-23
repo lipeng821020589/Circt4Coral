@@ -97,6 +97,16 @@ static std::string getVReg(mlir::Operation *op, llvm::StringRef attrName) {
   return "v0"; // default v0
 }
 
+
+/// Read x-register annotation as an f-register string (e.g. "f5").
+/// Used for float ops that store their values in integer register slots but
+/// the assembler needs f-register names.
+static std::string getFReg(mlir::Operation *op, llvm::StringRef attrName) {
+  if (auto attr = op->getDiscardableAttr(attrName))
+    return "f" + std::to_string(mlir::cast<mlir::IntegerAttr>(attr).getInt());
+  return "f5"; // default
+}
+
 /// Read x-register annotation as a number (0 if missing)
 static uint8_t getXRegNum(mlir::Operation *op, llvm::StringRef attrName) {
   if (auto attr = op->getDiscardableAttr(attrName))
@@ -378,6 +388,32 @@ static void emitInstruction(mlir::Operation *op, llvm::raw_ostream &os) {
                             << "(t0)  # DMA.ctrl = start+store\n";
   }
 
+  // ---- Scalar floating-point (RISC-V F extension) ----
+  else if (mlir::isa<ScalarFCvtSWOp>(op))
+    // fcvt.s.w fd, xs  (int->float)
+    os << "fcvt.s.w  " << getFReg(op, "xreg_out_0") << ", "
+       << getXReg(op, "xreg_0") << "\n";
+  else if (mlir::isa<ScalarFSqrtOp>(op))
+    // fsqrt.s fd, fs
+    os << "fsqrt.s   " << getFReg(op, "xreg_out_0") << ", "
+       << getFReg(op, "xreg_0") << "\n";
+  else if (mlir::isa<ScalarFDivOp>(op))
+    // fdiv.s fd, fs1, fs2
+    os << "fdiv.s    " << getFReg(op, "xreg_out_0") << ", "
+       << getFReg(op, "xreg_0") << ", " << getFReg(op, "xreg_1") << "\n";
+  else if (mlir::isa<ScalarFMvXWOp>(op))
+    // fmv.x.w xd, fs  (float bits -> int, no conversion)
+    os << "fmv.x.w   " << getXReg(op, "xreg_out_0") << ", "
+       << getFReg(op, "xreg_0") << "\n";
+  else if (mlir::isa<ScalarFCvtWSRtzOp>(op))
+    // fcvt.w.s xd, fs, rtz  (float->int, truncate)
+    os << "fcvt.w.s  " << getXReg(op, "xreg_out_0") << ", "
+       << getFReg(op, "xreg_0") << ", rtz\n";
+  else if (mlir::isa<ScalarFMvWXOp>(op))
+    // fmv.w.x fd, xs  (int bits -> float, no conversion)
+    os << "fmv.w.x   " << getFReg(op, "xreg_out_0") << ", "
+       << getXReg(op, "xreg_0") << "\n";
+
   // ---- Scalar memory (RISC-V standard) ----
   else if (mlir::isa<ScalarLwOp>(op))
     os << "lw     " << getXReg(op, "xreg_out_0") << ", 0("
@@ -438,6 +474,12 @@ static uint32_t encodeBinary(mlir::Operation *op) {
   auto rd = [op] { return getXRegNum(op, "xreg_out_0"); };
   auto rs1 = [op] { return getXRegNum(op, "xreg_0"); };
   auto rs2 = [op] { return getXRegNum(op, "xreg_1"); };
+
+  // Floating-point ops: full encoding is complex; emit NOP placeholder
+  // (0x00000013 = addi x0, x0, 0). Real assembler handles these correctly.
+  if (mlir::isa<ScalarFCvtSWOp, ScalarFSqrtOp, ScalarFDivOp,
+                ScalarFMvXWOp, ScalarFCvtWSRtzOp, ScalarFMvWXOp>(op))
+    return 0x00000013; // nop placeholder
 
   // Scalar R-type (standard RV32I/M)
   if (mlir::isa<ScalarAddOp>(op))

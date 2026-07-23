@@ -506,4 +506,54 @@ def ReturnOp : CoralNPU_Op<"return", [Terminator]> {
   let assemblyFormat = "($value^ `:` type($value))? attr-dict";
 }
 
+
+//===----------------------------------------------------------------------===//
+// Scalar floating-point ops (RISC-V F extension, rv32imf)
+// These ops use integer SSA values to carry float bits (reinterpret as i32).
+// Register allocation assigns them to integer register slots; the assembly
+// emitter maps those slots to floating-point register names (f0..f31).
+//===----------------------------------------------------------------------===//
+
+def ScalarFCvtSWOp : CoralNPU_Op<"fcvt_s_w", [Pure]> {
+  let summary = "Convert signed int32 to float32: fd = (float)xs";
+  let arguments = (ins I32:$src);
+  let results = (outs I32:$result);
+  let assemblyFormat = "$src attr-dict `:` type($result)";
+}
+
+def ScalarFSqrtOp : CoralNPU_Op<"fsqrt_s", [Pure]> {
+  let summary = "Float32 square root: fd = sqrt(fs)";
+  let arguments = (ins I32:$src);
+  let results = (outs I32:$result);
+  let assemblyFormat = "$src attr-dict `:` type($result)";
+}
+
+def ScalarFDivOp : CoralNPU_Op<"fdiv_s", [Pure]> {
+  let summary = "Float32 division: fd = fa / fb";
+  let arguments = (ins I32:$lhs, I32:$rhs);
+  let results = (outs I32:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($result)";
+}
+
+def ScalarFMvXWOp : CoralNPU_Op<"fmv_x_w", [Pure]> {
+  let summary = "Move float32 bits to int32 register (no conversion): xd = bits(fs)";
+  let arguments = (ins I32:$src);
+  let results = (outs I32:$result);
+  let assemblyFormat = "$src attr-dict `:` type($result)";
+}
+
+def ScalarFCvtWSRtzOp : CoralNPU_Op<"fcvt_w_s_rtz", [Pure]> {
+  let summary = "Convert float32 to signed int32 (truncate toward zero): xd = (int)fs";
+  let arguments = (ins I32:$src);
+  let results = (outs I32:$result);
+  let assemblyFormat = "$src attr-dict `:` type($result)";
+}
+
+def ScalarFMvWXOp : CoralNPU_Op<"fmv_w_x", [Pure]> {
+  let summary = "Move int32 bits to float32 register (no conversion): fd = bits(xs)";
+  let arguments = (ins I32:$src);
+  let results = (outs I32:$result);
+  let assemblyFormat = "$src attr-dict `:` type($result)";
+}
+
 #endif // CORALNPU_OPS_TD

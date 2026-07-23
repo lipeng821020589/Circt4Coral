@@ -99,7 +99,9 @@ struct AllocResult {
 static bool isScalarConsumer(mlir::Operation *op) {
   return mlir::isa<ScalarAddOp, ScalarSubOp, ScalarMulOp, ScalarDivOp,
                    ScalarAndOp, ScalarOrOp, ScalarXorOp, ScalarSllOp,
-                   ScalarSrlOp, ScalarSraOp, ScalarSltOp, ScalarSltuOp, ScalarSwOp>(op);
+                   ScalarSrlOp, ScalarSraOp, ScalarSltOp, ScalarSltuOp, ScalarSwOp,
+                   ScalarFCvtSWOp, ScalarFSqrtOp, ScalarFDivOp,
+                   ScalarFMvXWOp, ScalarFCvtWSRtzOp, ScalarFMvWXOp>(op);
 }
 
 static AllocResult linearScan(llvm::MutableArrayRef<LiveRange> intervals) {
