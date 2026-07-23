@@ -3016,6 +3016,89 @@ func.func @rmsnorm(%x: tensor<2xi32>, %gamma: tensor<2xi32>) -> tensor<2xi32> {
         if elf_path.exists(): elf_path.unlink()
 
 
+
+
+# --- TEST 45: linalg->CoralNPU GEMV via standard MLIR bufferize pipeline ---
+
+def test_linalg_gemv_e2e():
+    print("\n=== TEST 45: GEMV via linalg-to-coralnpu (standard MLIR bufferize path) ===")
+    mlir = """\
+func.func @gemv(%a: tensor<1x1x4xi32>, %b: tensor<1x4x4xi32>) -> tensor<1x1x4xi32> {
+  %az = "tosa.const"() <{values = dense<0> : tensor<1xi32>}> : () -> tensor<1xi32>
+  %bz = "tosa.const"() <{values = dense<0> : tensor<1xi32>}> : () -> tensor<1xi32>
+  %0 = tosa.matmul %a, %b, %az, %bz
+    : (tensor<1x1x4xi32>, tensor<1x4x4xi32>, tensor<1xi32>, tensor<1xi32>) -> tensor<1x1x4xi32>
+  func.return %0 : tensor<1x1x4xi32>
+}
+"""
+    import tempfile, os, subprocess
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".mlir", delete=False) as f:
+        f.write(mlir)
+        mlir_file = f.name
+    try:
+        r1 = subprocess.run(
+            [str(CIRCT_OPT),
+             "--pass-pipeline=builtin.module(func.func(tosa-layerwise-constant-fold,tosa-to-linalg-named,tosa-to-linalg),one-shot-bufferize{bufferize-function-boundaries})",
+             mlir_file],
+            capture_output=True, text=True)
+        if r1.returncode != 0:
+            raise RuntimeError("Step-1 failed: " + r1.stderr)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".mlir", delete=False) as f2:
+            f2.write(r1.stdout)
+            bufferized_file = f2.name
+        try:
+            r2 = subprocess.run(
+                [str(CIRCT_OPT),
+                 "--linalg-to-coralnpu",
+                 "--coralnpu-legalize",
+                 "--coralnpu-regalloc",
+                 "--emit-coralnpu-assembly",
+                 bufferized_file],
+                capture_output=True, text=True)
+            if r2.returncode != 0:
+                raise RuntimeError("Step-2 failed: " + r2.stderr)
+            circt_out = r2.stdout
+        finally:
+            os.unlink(bufferized_file)
+    finally:
+        os.unlink(mlir_file)
+
+    insns = extract_asm_instructions(circt_out)
+
+    # A=[1,1,1,1], B is [N=4,K=4] identity-row: row_i=[1,0,0,0] -> dot=1 for all ni.
+    a_data = [1, 1, 1, 1] + [0]*12
+    b_data = [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0]
+    expected = [1, 1, 1, 1]
+
+    # linalg-to-coralnpu writes to first memref.alloc = slot 32 = 0x30000
+    LINALG_RESULT_ADDR = TCM_BASE + 32 * TCM_SLOT
+
+    prologue = [
+        ".section .text", ".globl _start", "_start:",
+        "    csrr  t0, mstatus", "    li    t1, 0x600",
+        "    or    t0, t0, t1", "    csrw  mstatus, t0",
+    ]
+    prologue += write_int32_to_asm_init(a_data, TCM_BASE + 0 * TCM_SLOT)
+    prologue += write_int32_to_asm_init(b_data, TCM_BASE + 1 * TCM_SLOT)
+
+    full_asm = "\n".join(prologue) + "\n" + "\n".join(insns) + "\n.Lexit:\n    ebreak\n"
+
+    with tempfile.NamedTemporaryFile(suffix=".elf", delete=False) as ef:
+        elf_path = Path(ef.name)
+    try:
+        build_elf(full_asm, elf_path)
+        raw = run_spike_and_read_mem(elf_path, LINALG_RESULT_ADDR, 16)
+        actual = list(struct.unpack("<4i", raw))
+        check_result("GEMV via linalg bufferize: A=[1,1,1,1] B=identity-row -> [1,1,1,1]",
+                     actual, expected)
+    except Exception as e:
+        print("  [ERROR] " + str(e))
+        COUNTS["fail"] += 1
+    finally:
+        if elf_path.exists():
+            elf_path.unlink()
+
+
 if __name__ == "__main__":
     print("CoralNPU E2E Validation")
     print(f"  circt-opt : {CIRCT_OPT}")
@@ -3072,6 +3155,7 @@ if __name__ == "__main__":
     test_int8_gemv_mac_e2e()
     test_broadcast_mul_e2e()
     test_rmsnorm_full_chain_e2e()
+    test_linalg_gemv_e2e()
 
     print(f"\n{'='*50}")
     print(f"Results: {COUNTS['pass']} passed, {COUNTS['fail']} failed")

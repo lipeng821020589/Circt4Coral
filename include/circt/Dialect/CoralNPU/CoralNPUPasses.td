@@ -92,4 +92,19 @@ def CoralNPUEmitAssembly : Pass<"emit-coralnpu-assembly"> {
   let dependentDialects = ["circt::coralnpu::CoralNPUDialect"];
 }
 
+
+def LinalgToCoralNPU : Pass<"linalg-to-coralnpu"> {
+  let summary = "Lower linalg.batch_matmul over memref to CoralNPU dialect";
+  let description = [{
+    Converts linalg.batch_matmul operations produced by the standard
+    TOSA to linalg to one-shot-bufferize pipeline into CoralNPU scalar,
+    vector, and matrix operations.
+
+    This bridges the standard MLIR bufferization path to the CoralNPU
+    backend, enabling the full pipeline:
+      TOSA to linalg to bufferize to linalg-to-coralnpu to emit-asm
+  }];
+  let dependentDialects = ["circt::coralnpu::CoralNPUDialect"];
+}
+
 #endif // CORALNPU_PASSES_TD

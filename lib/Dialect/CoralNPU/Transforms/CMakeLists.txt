@@ -11,6 +11,7 @@ add_circt_dialect_library(CIRCTCoralNPUTransforms
   CheckCoralNPUHW.cpp
   CoralNPUFormalVerify.cpp
   LoopToCoralNPU.cpp
+  LinalgToCoralNPU.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${CIRCT_MAIN_INCLUDE_DIR}/circt/Dialect/CoralNPU
@@ -35,6 +36,7 @@ add_circt_dialect_library(CIRCTCoralNPUTransforms
   MLIRTosaDialect
   MLIRBufferizationDialect
   MLIRBufferizationTransforms
+  MLIRLinalgDialect
   MLIRTranslateLib
   MLIRTransforms
   MLIRSupport
